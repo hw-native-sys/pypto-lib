@@ -1234,7 +1234,7 @@ def build_tensor_specs():
             init_value = _route_bias(N_EXPERTS).repeat(EP_SIZE, WEIGHT_BANK_SIZE)
         elif name.endswith("_scale"):
             init_value = 1.0
-        specs.append(forward_routed_weight_spec(name, shape, dtype, init_value, PACK_ROUTED_WEIGHTS))
+        specs.append(forward_routed_weight_spec(name, shape, dtype, init_value, PACK_ROUTED_WEIGHTS, local_experts=N_LOCAL_EXPERTS))
     return specs
 
 

@@ -128,10 +128,16 @@ shards, and return results to the row owners.
 | Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
 | Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, `lm_head.py`, and `sample.py` |
 
-The standalone decode MoE and direct DSpark entries can pack routed FP4
-weights before resident upload. For DSpark, use
-`--no-packed-routed-weights` to compile with the ordinary layout.
-`--runtime-dir` replays the weight layout recorded in the compiled artifact.
+MegaMoE uploads routed FP4 weights in ZN order with per-expert DN scales.
+The upload adds six to finite supported weight exponents to compensate the
+FP4-to-FP8 expansion; 255 is preserved and codes 249–254 are rejected.
+Shared FP8 weights use NZ with MX_B_NN scales. The split expert kernels keep
+their existing input layout. Native checkpoint loading converts directly from
+the checkpoint bytes before execution.
+
+The DSpark `--packed-routed-weights` switch selects the compiled parameter
+shape. Both parameter shapes use the same resident MegaMoE weight bytes.
+Recompile old MegaMoE artifacts before replaying them with this upload path.
 
 Set `--active-requests` to populate between one request (the default) and
 the configured per-rank capacity in the DSpark fixture. Each request uses

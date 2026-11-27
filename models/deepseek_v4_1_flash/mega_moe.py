@@ -29,7 +29,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str, default=None)
     parser.add_argument("--ep", type=int, choices=[2, 4, 8], default=2)
     parser.add_argument("--experts-per-rank", type=int, default=4)
-    parser.add_argument("--case", choices=["all", "bounds", "tails", "zero", "full", "balanced"], default="all")
+    parser.add_argument("--case", choices=["all", "bounds", "tails", "zero", "full", "balanced", "shared"], default="all")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -67,23 +67,43 @@ MOE_INTER = M.moe_intermediate_size
 FP4_PANEL_ROWS = 256
 
 
-def _resident_gate_up_half(tensors, half, prefix=""):
-    """Zip corresponding gate/up halves in the N32-major order consumed by Cube."""
-    import torch
-
-    gate = tensors[prefix + "routed_w1"]
-    result = torch.empty_like(gate, memory_format=torch.contiguous_format)
-    dst = result.reshape(-1, 8, 256, 16)
-    for lane, name in enumerate(("routed_w1", "routed_w3")):
-        source = tensors[prefix + name].reshape(-1, 256, 8, 16)
-        dst[:, 4 * lane:4 * (lane + 1)].copy_(source[:, :, 4 * half:4 * (half + 1)].transpose(1, 2))
-    return result.reshape(*gate.shape[:-2], -1, FP4_PANEL_ROWS * MX_PACKED_LANE_COLS)
+def prepare_routed_scale(value):
+    """Compensate the fused kernel's FP4/64 expansion in E8M0 exponent space."""
+    codes = value.contiguous().view(torch.uint8)
+    if not ((codes <= 248) | (codes == 255)).all().item():
+        raise ValueError("MegaMoE routed weight scale exponent must be 0..248 or 255")
+    return torch.where(codes == 255, codes, codes + 6).view(value.dtype)
 
 
-def _resident_down_weight(tensors, prefix=""):
-    weight = tensors[prefix + "routed_w2"]
-    panels = weight.reshape(-1, 256, 8, 16).transpose(1, 2).contiguous()
-    return panels.reshape(*weight.shape[:-2], -1, FP4_PANEL_ROWS * MX_PACKED_LANE_COLS)
+def pack_checkpoint_zn(weight):
+    """Pack checkpoint [..., N, K/2] nibble pairs as [..., K/32, N, 16]."""
+    return weight.view(torch.uint8).unflatten(-1, (-1, 16)).transpose(-3, -2).contiguous()
+
+
+def _resident_weight(tensors, name, projection, local_experts, upload_shape):
+    from quant import pack_fp8_nz, unpack_mx_b_scale
+
+    value = tensors[name]
+    k, n = (MOE_INTER, D) if projection.startswith(("routed_w2", "shared_w2")) else (D, MOE_INTER)
+    if projection.startswith("shared_"):
+        return pack_fp8_nz(value.reshape(-1, k, n)).reshape(upload_shape)
+    if projection.endswith("_scale"):
+        logical = unpack_mx_b_scale(value.reshape(-1, local_experts * (k // MX_GROUP), n))
+        dn = logical.reshape(-1, k // MX_GROUP, n).transpose(-1, -2)
+        return prepare_routed_scale(dn).reshape(upload_shape)
+
+    # The split fixture stores each pair of output columns in a byte. Recover
+    # checkpoint nibble pairs along K, one expert at a time to bound host memory.
+    tiles = value.reshape(-1, n // 256, k // 256, 128, 2, 128)
+    result = torch.empty_like(value, memory_format=torch.contiguous_format).reshape(-1, k // 32, n, 16)
+    for i, tile in enumerate(tiles):
+        lo, hi = tile.unbind(-2)
+        even = (lo & 15) | ((hi & 15) << 4)
+        odd = (lo >> 4) | (hi & 240)
+        raw = torch.stack((even, odd), dim=-1).reshape(n // 256, k // 256, 128, 256)
+        raw = raw.permute(0, 3, 1, 2).reshape(n, k // 2)
+        result[i].copy_(pack_checkpoint_zn(raw))
+    return result.reshape(upload_shape)
 
 
 def use_packed_decode_weights(capacity, local_experts, topk):
@@ -95,24 +115,44 @@ def use_packed_decode_weights(capacity, local_experts, topk):
     return capacity in (192, 384) and capacity * topk <= 96 * local_experts
 
 
-def forward_routed_weight_spec(name, device_shape, dtype, init_value, packed, prefix=""):
-    """Keep checkpoint shapes on the host and pack only the compiled resident FP4 payloads."""
+def forward_routed_weight_spec(name, device_shape, dtype, init_value, packed, prefix="", *, local_experts):
+    """Keep the host/split fixture ABI; convert only MegaMoE's resident upload."""
     from functools import partial
     from golden import TensorSpec
 
-    projection = name.removeprefix(prefix)
-    if not packed or not name.startswith(prefix) or projection not in ("routed_w1", "routed_w2", "routed_w3"):
+    projection = name.removeprefix(prefix).removesuffix("_packed")
+    routed = projection in ("routed_w1", "routed_w2", "routed_w3")
+    scales = projection in ("routed_w1_scale", "routed_w2_scale", "routed_w3_scale")
+    shared = projection in ("shared_w1", "shared_w2", "shared_w3")
+    if not name.startswith(prefix) or not (routed or scales or shared):
         return TensorSpec(name, device_shape, dtype, init_value=init_value)
-    rows, columns = device_shape[-2:]
-    if columns != FP4_PANEL_ROWS * MX_PACKED_LANE_COLS:
-        raise ValueError(f"{name}: invalid packed FP4 device panel width {columns}")
-    logical_shape = [*device_shape[:-2], rows * FP4_PANEL_ROWS, MX_PACKED_LANE_COLS]
-    if projection == "routed_w2":
-        pack = partial(_resident_down_weight, prefix=prefix)
-    else:
-        pack = partial(_resident_gate_up_half, half=int(projection == "routed_w3"), prefix=prefix)
-    return TensorSpec(name, logical_shape, dtype, init_value=init_value, resident="stacked",
+    host_shape = device_shape
+    if routed and packed:
+        rows, columns = device_shape[-2:]
+        if columns != FP4_PANEL_ROWS * MX_PACKED_LANE_COLS:
+            raise ValueError(f"{name}: invalid packed FP4 panel width {columns}")
+        host_shape = [*device_shape[:-2], rows * FP4_PANEL_ROWS, MX_PACKED_LANE_COLS]
+    if host_shape == device_shape:
+        # Retain the host's N-block axis so the harness can distinguish this
+        # layout from resident ZN/DN even when both contain the same byte count.
+        host_shape = [*device_shape[:-1], device_shape[-1] // 16, 16]
+        if isinstance(init_value, torch.Tensor):
+            init_value = init_value.reshape(host_shape)
+        elif callable(init_value):
+            original = init_value
+            def init_value():
+                return original().reshape(host_shape)
+    pack = partial(_resident_weight, name=name, projection=projection,
+                   local_experts=local_experts, upload_shape=device_shape)
+    return TensorSpec(name, host_shape, dtype, init_value=init_value, resident="stacked",
                       pack_for_upload=pack, upload_shape=device_shape)
+
+
+def golden_weight_views(tensors):
+    """Give the unchanged split Torch reference its original matrix views."""
+    return {name: value.flatten(-2) if name.startswith(("routed_w", "shared_w")) and value.shape[-1] == 16
+            and (not name.startswith("shared_") or not name.endswith("_scale")) else value
+            for name, value in tensors.items()}
 
 
 def workspace_bytes(ep, local_experts, tokens, topk, hidden, intermediate):
@@ -194,7 +234,8 @@ def _fused_external_kernel(local_experts, topk, packed_routed_weights=False):
     elif wrapper.read_text() != text:
         raise RuntimeError("Fused MoE source cache mismatch")
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/latest"))
-    include_dirs = [kernels]
+    from pypto.runtime import pto_isa_include_dir
+    include_dirs = [kernels, pto_isa_include_dir()]
     for base in (cann / "compiler", cann, cann / (os.uname().machine + "-linux")):
         for relative in ("asc", "asc/include", "include"):
             path = (base / relative).resolve()
@@ -367,11 +408,26 @@ def golden_distributed_compute(tensors):
     from quant import pack_mx_a_scale, quantize_mxfp8_upward_e8m0
 
     for rank in range(EP_WORLD_SIZE):
-        local = {name: value[rank] for name, value in tensors.items()}
+        local = golden_weight_views({name: value[rank] for name, value in tensors.items()})
         payload, codes = quantize_mxfp8_upward_e8m0(local["normalized"].reshape(-1, D).float())
         local["recv_x"] = payload.reshape(N_LOCAL_EXPERTS, RECV_MAX, D)
         local["recv_mx_scale"] = pack_mx_a_scale(codes).reshape(1, -1)
         golden_local_compute(local)
+
+
+def golden_shared_compute(tensors):
+    """Isolate the shared projections on one token per rank with no routed contribution."""
+    from expert_shared import golden_expert_shared
+    from quant import pack_mx_a_scale, quantize_mxfp8_upward_e8m0
+
+    for rank in range(EP_WORLD_SIZE):
+        local = golden_weight_views({name: value[rank] for name, value in tensors.items()})
+        x = local["normalized"][0, :MOE_TOKENS].float()
+        local["x_local"], scale = quantize_mxfp8_upward_e8m0(x)
+        local["x_local_scale"] = pack_mx_a_scale(scale)
+        local["sh"] = torch.empty_like(x, dtype=torch.bfloat16)
+        golden_expert_shared(local)
+        local["routed_y"][0] = local["sh"][0]
 
 
 def compare_distributed_compute(actual, expected, *, inputs, **kwargs):
@@ -388,8 +444,11 @@ def build_distributed_tensor_specs(case="bounds", *, tail_offset=0):
     """Build independent peer inputs, replicated expert weights, and neutral shared weights."""
     from golden import TensorSpec
 
+    from quant import pack_mx_b_scale
+
+    shared_only = case == "shared"
     local_specs = [
-        build_tensor_specs(case, tail_offset=tail_offset + rank, seed=20261028 + rank, local_experts=N_LOCAL_EXPERTS)
+        build_tensor_specs("zero" if shared_only else case, tail_offset=tail_offset + rank, seed=20261028 + rank, local_experts=N_LOCAL_EXPERTS)
         for rank in range(EP_WORLD_SIZE)
     ]
 
@@ -405,7 +464,7 @@ def build_distributed_tensor_specs(case="bounds", *, tail_offset=0):
         return torch.stack(rows)
 
     specs = [TensorSpec("normalized", [EP_WORLD_SIZE, N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16,
-                        init_value=normalized)]
+                        init_value=1 if shared_only else normalized)]
     for index, local in enumerate(local_specs[0][:-1]):
         if local.name in ("recv_x", "recv_mx_scale"):
             continue
@@ -418,15 +477,35 @@ def build_distributed_tensor_specs(case="bounds", *, tail_offset=0):
         def initialize(values=initializers):
             return torch.stack([value() if callable(value) else value for value in values])
 
-        specs.append(TensorSpec(local.name, shape, local.dtype, init_value=initialize, resident=resident))
+        init = initialize
+        if shared_only:
+            if local.name == "recv_expert_count":
+                init = torch.zeros(shape, dtype=local.dtype)
+                init[:, 0, 0] = 1
+            else:
+                init = 1 if local.name.endswith("_scale") else 0
+        if local.name.startswith("routed_"):
+            specs.append(forward_routed_weight_spec(local.name, shape, local.dtype, init, False,
+                                                    local_experts=N_LOCAL_EXPERTS))
+        else:
+            specs.append(TensorSpec(local.name, shape, local.dtype, init_value=init, resident=resident))
     for layer, rows, columns in (("w1", D, MOE_INTER), ("w3", D, MOE_INTER), ("w2", MOE_INTER, D)):
         shape = [EP_WORLD_SIZE, rows, columns]
         scale_shape = [EP_WORLD_SIZE, rows // MX_GROUP, columns]
 
         def unit_scale(shape=scale_shape):
-            return torch.full(shape, 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+            codes = torch.full(shape, 127, dtype=torch.uint8)
+            if shared_only:
+                codes[:, 2, :] = 128
+            return pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
 
-        specs.append(TensorSpec("shared_" + layer, shape, torch.float8_e4m3fn, init_value=0, resident="stacked"))
+        def shared_weight(shape=shape):
+            weight = torch.zeros(shape, dtype=torch.float8_e4m3fn)
+            weight[:, 2 * MX_GROUP, :] = 1
+            return weight
+
+        specs.append(forward_routed_weight_spec("shared_" + layer, shape, torch.float8_e4m3fn, shared_weight if shared_only else 0, False,
+                                                local_experts=N_LOCAL_EXPERTS))
         specs.append(TensorSpec("shared_" + layer + "_scale", scale_shape, torch.float8_e8m0fnu, init_value=unit_scale, resident="stacked"))
     specs.append(TensorSpec("routed_y", [EP_WORLD_SIZE, N_LOCAL_EXPERTS * RECV_MAX, D], torch.bfloat16, init_value=OUTPUT_SENTINEL))
     return specs
@@ -444,7 +523,7 @@ if __name__ == "__main__":
                 a5_default_runtime="host_build_graph",
                 fn=distributed_compute_test,
                 specs=build_distributed_tensor_specs(case, tail_offset=tail_round * N_LOCAL_EXPERTS),
-                golden_fn=golden_distributed_compute,
+                golden_fn=golden_shared_compute if case == "shared" else golden_distributed_compute,
                 golden_data=args.golden_data,
                 save_data=args.save_data,
                 compile_only=args.compile_only,

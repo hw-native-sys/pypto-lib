@@ -692,7 +692,7 @@ def build_drafter_specs():
             shape = [size if isinstance(size, int) else dynamic_sizes[size.name] for size in annotation.shape]
             dtype = dtypes[str(annotation.dtype)]
             init = initial_value(parameter.name, shape, dtype)
-            specs.append(forward_routed_weight_spec(parameter.name, shape, dtype, init, PACK_ROUTED_WEIGHTS))
+            specs.append(forward_routed_weight_spec(parameter.name, shape, dtype, init, PACK_ROUTED_WEIGHTS, local_experts=N_LOCAL_EXPERTS))
         else:
             specs.append(ScalarSpec(parameter.name, torch.int32, 1, compile_runtime=True))
     return specs
