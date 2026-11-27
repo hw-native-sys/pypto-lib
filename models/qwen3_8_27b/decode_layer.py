@@ -30,6 +30,7 @@ import pypto.language as pl
 
 import a8w8_linear
 import act_quant
+import decode_attention
 import decode_delta_rule
 import decode_gated_attention
 import decode_gdn_block
@@ -39,7 +40,7 @@ import gate_up_swiglu
 import quant_x
 import rmsnorm
 from config import QWEN3_8_27B
-from decode_projection import M_FRACTAL, check_batch, padded_batch
+from decode_projection import CUBE_WORKERS, M_FRACTAL, check_batch, padded_batch
 
 # model config
 C = QWEN3_8_27B.hidden_size                 # the residual stream
@@ -73,12 +74,12 @@ NORM_K_TILE = rmsnorm.K_TILE
 # decode M over 109 configurations; `m_tile` is M and `m_group` is 1. Both land on the same
 # triple and both hold from M = 16 to M = 32, but for different reasons, which is why the
 # sweep had to cover both: `gate_up_swiglu` wants the largest operand tile the 512 KiB Mat
-# buffer allows and takes 68 blocks with it, while `down_proj` wants **20 blocks against 24
-# cube cores** and falls off a cliff below that -- 93.3 us at 20 blocks, 136.4 at 10, 243.3
-# at 5.
+# buffer allows and takes 68 patches with it, while `down_proj` wants **20 patches against
+# 24 cube cores** and falls off a cliff below that -- 93.3 us at 20 blocks, 136.4 at 10,
+# 243.3 at 5. `CUBE_WORKERS` blocks walk those patches; the two counts are not the same.
 MLP_TILES = {
-    "gate_up_swiglu": (128, 512, 2),        # 68 blocks, 164.0 us, 1087 GB/s at M = 16
-    "down_proj": (128, 512, 2),             # 20 blocks,  93.3 us,  955 GB/s at M = 16
+    "gate_up_swiglu": (128, 512, 2),        # 68 patches, 164.0 us, 1087 GB/s at M = 16
+    "down_proj": (128, 512, 2),             # 20 patches,  93.3 us,  955 GB/s at M = 16
 }
 
 # Each quantiser's own decode column fan-out.
@@ -135,12 +136,14 @@ def _build_mlp(batch: int, fanned: bool = True):
         act_q_op = act_quant.qwen3_act_quant
     op_gate_up = gate_up_swiglu.build_kernel(m=batch, k=C, n=INTER, inline=True,
                                              m_tile=batch, n_tile=up_n_tile, k_tile=up_k_tile,
-                                             m_group=1, n_group=up_n_group)
+                                             m_group=1, n_group=up_n_group,
+                                             workers=CUBE_WORKERS)
     # Two GM transport slots for the 16-row down projection.
     op_down = a8w8_linear.build_kernel(
         m=batch, k=INTER, n=C, name="down_proj", inline=True,
         m_tile=batch, n_tile=down_n_tile, k_tile=down_k_tile,
         m_group=1, n_group=down_n_group, ring_slots=2 if batch == 16 else 1,
+        workers=CUBE_WORKERS,
     )
 
     @pl.jit.inline
@@ -575,9 +578,13 @@ def compare_vs_floor(name: str):
 
 def compare_fns(kind: str) -> dict:
     """The gates: both layer outputs against the floor, and the mixer's pools in place."""
-    pools = ("conv_state", "state") if kind == "gdn" else ("k_pages", "v_pages")
     gates = {name: compare_vs_floor(name) for name in ("residual_out", "mlp_out")}
-    gates.update({name: decode_gdn_block.compare_pool(name) for name in pools})
+    if kind == "gdn":
+        gates.update({name: decode_gdn_block.compare_pool(name)
+                      for name in ("conv_state", "state")})
+    else:
+        gates.update({name: decode_attention.compare_pages(name)
+                      for name in ("k_pages", "v_pages")})
     return gates
 
 

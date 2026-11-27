@@ -65,7 +65,7 @@ DECODE_TILES = {
     "k_proj": (HIDDEN, ATTN_KV_WIDTH, 64, 1024, 2),     #  8 blocks,  28.0 us, 188 GB/s
     "v_proj": (HIDDEN, ATTN_KV_WIDTH, 64, 1024, 2),     #  8 blocks,  27.7 us, 189 GB/s
     # The three above as one matmul over one concatenated weight.
-    "qkv_proj": (HIDDEN, ATTN_QKV_WIDTH, 128, 512, 2),  # 56 blocks,  90.2 us, 814 GB/s
+    "qkv_proj": (HIDDEN, ATTN_QKV_WIDTH, 128, 512, 2),  # 56 patches,  90.2 us, 814 GB/s
 }
 
 
@@ -83,6 +83,12 @@ def padded_batch(batch: int) -> int:
 # `o_proj` is the same `K=6144 N=5120` matmul and one measured tile serves both, but the
 # checkpoint quantises the attention one and not the GDN one, so they are not the same bytes.
 BF16_MODULES = frozenset({"out_proj"})
+
+
+# Persistent cube blocks a decode launch takes: a2a3's AIC count. A decode projection has
+# one row tile, so its patches lie along N alone, and the widest of them ask for more
+# blocks than the allocation has cores. Re-sweep for other AIC counts; a5 exposes 32.
+CUBE_WORKERS = 24
 
 
 # a2a3's two on-chip buffers that a decode matmul grows into, because `m_tile` is the batch
@@ -173,10 +179,11 @@ def build_kernel(module: str, batch: int, inline: bool = False):
         # and at a decode batch this projection is bound by the weight it streams.
         return out_proj.build_kernel(m, k, n, name=module, inline=inline, m_tile=m,
                                         n_tile=n_tile, k_tile=k_tile, m_group=1,
-                                        n_group=n_group, k_stagger=0, ring_slots=1)
+                                        n_group=n_group, k_stagger=0, ring_slots=1,
+                                        workers=CUBE_WORKERS)
     return a8w8_linear.build_kernel(m, k, n, name=module, inline=inline, m_tile=m,
                                     n_tile=n_tile, k_tile=k_tile, m_group=1,
-                                    n_group=n_group)
+                                    n_group=n_group, workers=CUBE_WORKERS)
 
 
 def fuse_qkv_weight(q_w, k_w, v_w, q_scale, k_scale, v_scale):

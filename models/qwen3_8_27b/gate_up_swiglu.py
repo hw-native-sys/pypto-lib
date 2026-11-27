@@ -63,15 +63,19 @@ EARLY_RESOLVE = True
 AIV_LANES = 2
 
 
+
 def build_kernel(m: int = BENCH_SEQ, k: int = HIDDEN, n: int = INTER, name: str = "gate_up_swiglu",
                  inline: bool = False, m_tile: int = M_TILE, n_tile: int = N_TILE,
                  k_tile: int = K_TILE, m_group: int = M_GROUP, n_group: int = N_GROUP,
-                 act_dtype=pl.BF16, k_stagger: int = 0, ring_slots: int = 1):
+                 act_dtype=pl.BF16, k_stagger: int = 0, ring_slots: int = 1,
+                 workers: int = 0):
     """Both projections and the activation at one shape.
 
     `act_dtype` is `pl.BF16` for the shipping form and `pl.FP32` for the
     control: same fusion, no added rounding, and no storage saving, so a
     disagreement between the two is the rounding and nothing else.
+
+    `workers` splits the block count from the patch count; see `a8w8_linear.build_kernel`.
     """
     if m % m_tile or n % n_tile or k % k_tile:
         raise ValueError(f"m={m} must be a multiple of m_tile={m_tile}, "
@@ -80,7 +84,11 @@ def build_kernel(m: int = BENCH_SEQ, k: int = HIDDEN, n: int = INTER, name: str 
     if mb % m_group or nb % n_group:
         raise ValueError(f"the {mb}x{nb} output tiles must divide by the patch "
                          f"{m_group}x{n_group}")
+    if workers < 0:
+        raise ValueError(f"workers={workers} must be zero or a positive block count")
     mg, ng = mb // m_group, nb // n_group
+    patches = mg * ng
+    blocks = min(patches, workers) if workers else patches
     row_tile = m_tile // AIV_LANES
 
     jit = pl.jit.inline if inline else pl.jit
@@ -99,46 +107,47 @@ def build_kernel(m: int = BENCH_SEQ, k: int = HIDDEN, n: int = INTER, name: str 
         w_up_scale: pl.Tensor[[n], pl.FP32],
         act: pl.Out[pl.Tensor[[m, n], pl.BF16]],
     ):
-        for blk in pl.spmd(mg * ng, name_hint=name,
+        for blk in pl.spmd(blocks, name_hint=name,
                            optimizations=[pl.cross_core_slot(slot_num=ring_slots, local_slot_num=1)],
                            allow_early_resolve=EARLY_RESOLVE):
-            pm = (blk % mg) * m_group
-            pn = (blk // mg) * n_group
-            for gm in pl.range(m_group):
-                m0 = (pm + gm) * m_tile
-                for gn in pl.range(n_group):
-                    n0 = (pn + gn) * n_tile
-                    acc_gate = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
-                    acc_up = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
-                    for kb in pl.pipeline(0, k // k_tile, stage=2):
-                        # `k_stagger`: see `a8w8_linear`, same rotation and same reason
-                        k0 = ((kb + blk * k_stagger) % (k // k_tile)) * k_tile
-                        at = a_q[m0 : m0 + m_tile, k0 : k0 + k_tile]
-                        acc_gate = pl.matmul_acc(acc_gate, at,
-                                                 w_gate[n0 : n0 + n_tile, k0 : k0 + k_tile],
-                                                 b_trans=True, init_cond=(kb == 0))
-                        acc_up = pl.matmul_acc(acc_up, at,
-                                               w_up[n0 : n0 + n_tile, k0 : k0 + k_tile],
-                                               b_trans=True, init_cond=(kb == 0))
-                    for lane in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                        row = m0 + lane * row_tile
-                        xs = pl.reshape(a_scale[0:1, row : row + row_tile], [row_tile, 1])
-                        ws_gate = pl.reshape(w_gate_scale[n0 : n0 + n_tile], [1, n_tile])
-                        gate_f = pl.cast(pl.aiv_shard(acc_gate), target_type=pl.FP32)
-                        gate_scaled = pl.col_expand_mul(gate_f, ws_gate)
-                        deq_gate = pl.row_expand_mul(gate_scaled, xs)
-                        gate_bf16 = pl.cast(deq_gate, target_type=pl.BF16, mode="rint")
-                        gate_f = pl.cast(gate_bf16, target_type=pl.FP32)
-                        gate_act = pl.div(gate_f, pl.add(pl.exp(pl.neg(gate_f)), 1.0))
-                        ws_up = pl.reshape(w_up_scale[n0 : n0 + n_tile], [1, n_tile])
-                        up_f = pl.cast(pl.aiv_shard(acc_up), target_type=pl.FP32)
-                        up_scaled = pl.col_expand_mul(up_f, ws_up)
-                        deq_up = pl.row_expand_mul(up_scaled, xs)
-                        up_bf16 = pl.cast(deq_up, target_type=pl.BF16, mode="rint")
-                        up_f = pl.cast(up_bf16, target_type=pl.FP32)
-                        product = pl.mul(gate_act, up_f)
-                        product = pl.cast(product, target_type=pl.BF16, mode="rint")
-                        act[row : row + row_tile, n0 : n0 + n_tile] = product
+            for patch in pl.range(blk, patches, blocks):
+                pm = (patch % mg) * m_group
+                pn = (patch // mg) * n_group
+                for gm in pl.range(m_group):
+                    m0 = (pm + gm) * m_tile
+                    for gn in pl.range(n_group):
+                        n0 = (pn + gn) * n_tile
+                        acc_gate = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
+                        acc_up = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
+                        for kb in pl.pipeline(0, k // k_tile, stage=2):
+                            # `k_stagger`: see `a8w8_linear`, same rotation and same reason
+                            k0 = ((kb + patch * k_stagger) % (k // k_tile)) * k_tile
+                            at = a_q[m0 : m0 + m_tile, k0 : k0 + k_tile]
+                            acc_gate = pl.matmul_acc(acc_gate, at,
+                                                     w_gate[n0 : n0 + n_tile, k0 : k0 + k_tile],
+                                                     b_trans=True, init_cond=(kb == 0))
+                            acc_up = pl.matmul_acc(acc_up, at,
+                                                   w_up[n0 : n0 + n_tile, k0 : k0 + k_tile],
+                                                   b_trans=True, init_cond=(kb == 0))
+                        for lane in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                            row = m0 + lane * row_tile
+                            xs = pl.reshape(a_scale[0:1, row : row + row_tile], [row_tile, 1])
+                            ws_gate = pl.reshape(w_gate_scale[n0 : n0 + n_tile], [1, n_tile])
+                            gate_f = pl.cast(pl.aiv_shard(acc_gate), target_type=pl.FP32)
+                            gate_scaled = pl.col_expand_mul(gate_f, ws_gate)
+                            deq_gate = pl.row_expand_mul(gate_scaled, xs)
+                            gate_bf16 = pl.cast(deq_gate, target_type=pl.BF16, mode="rint")
+                            gate_f = pl.cast(gate_bf16, target_type=pl.FP32)
+                            gate_act = pl.div(gate_f, pl.add(pl.exp(pl.neg(gate_f)), 1.0))
+                            ws_up = pl.reshape(w_up_scale[n0 : n0 + n_tile], [1, n_tile])
+                            up_f = pl.cast(pl.aiv_shard(acc_up), target_type=pl.FP32)
+                            up_scaled = pl.col_expand_mul(up_f, ws_up)
+                            deq_up = pl.row_expand_mul(up_scaled, xs)
+                            up_bf16 = pl.cast(deq_up, target_type=pl.BF16, mode="rint")
+                            up_f = pl.cast(up_bf16, target_type=pl.FP32)
+                            product = pl.mul(gate_act, up_f)
+                            product = pl.cast(product, target_type=pl.BF16, mode="rint")
+                            act[row : row + row_tile, n0 : n0 + n_tile] = product
         return act
 
     @jit
@@ -151,45 +160,46 @@ def build_kernel(m: int = BENCH_SEQ, k: int = HIDDEN, n: int = INTER, name: str 
         w_up_scale: pl.Tensor[[n], pl.FP32],
         act: pl.Out[pl.Tensor[[m, n], pl.FP32]],
     ):
-        for blk in pl.spmd(mg * ng, name_hint=name,
+        for blk in pl.spmd(blocks, name_hint=name,
                            optimizations=[pl.cross_core_slot(slot_num=ring_slots, local_slot_num=1)],
                            allow_early_resolve=EARLY_RESOLVE):
-            pm = (blk % mg) * m_group
-            pn = (blk // mg) * n_group
-            for gm in pl.range(m_group):
-                m0 = (pm + gm) * m_tile
-                for gn in pl.range(n_group):
-                    n0 = (pn + gn) * n_tile
-                    acc_gate = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
-                    acc_up = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
-                    for kb in pl.pipeline(0, k // k_tile, stage=2):
-                        # `k_stagger`: see `a8w8_linear`, same rotation and same reason
-                        k0 = ((kb + blk * k_stagger) % (k // k_tile)) * k_tile
-                        at = a_q[m0 : m0 + m_tile, k0 : k0 + k_tile]
-                        acc_gate = pl.matmul_acc(acc_gate, at,
-                                                 w_gate[n0 : n0 + n_tile, k0 : k0 + k_tile],
-                                                 b_trans=True, init_cond=(kb == 0))
-                        acc_up = pl.matmul_acc(acc_up, at,
-                                               w_up[n0 : n0 + n_tile, k0 : k0 + k_tile],
-                                               b_trans=True, init_cond=(kb == 0))
-                    for lane in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                        row = m0 + lane * row_tile
-                        xs = pl.reshape(a_scale[0:1, row : row + row_tile], [row_tile, 1])
-                        ws_gate = pl.reshape(w_gate_scale[n0 : n0 + n_tile], [1, n_tile])
-                        gate_f = pl.cast(pl.aiv_shard(acc_gate), target_type=pl.FP32)
-                        gate_scaled = pl.col_expand_mul(gate_f, ws_gate)
-                        deq_gate = pl.row_expand_mul(gate_scaled, xs)
-                        gate_bf16 = pl.cast(deq_gate, target_type=pl.BF16, mode="rint")
-                        gate_f = pl.cast(gate_bf16, target_type=pl.FP32)
-                        gate_act = pl.div(gate_f, pl.add(pl.exp(pl.neg(gate_f)), 1.0))
-                        ws_up = pl.reshape(w_up_scale[n0 : n0 + n_tile], [1, n_tile])
-                        up_f = pl.cast(pl.aiv_shard(acc_up), target_type=pl.FP32)
-                        up_scaled = pl.col_expand_mul(up_f, ws_up)
-                        deq_up = pl.row_expand_mul(up_scaled, xs)
-                        up_bf16 = pl.cast(deq_up, target_type=pl.BF16, mode="rint")
-                        up_f = pl.cast(up_bf16, target_type=pl.FP32)
-                        product = pl.mul(gate_act, up_f)
-                        act[row : row + row_tile, n0 : n0 + n_tile] = product
+            for patch in pl.range(blk, patches, blocks):
+                pm = (patch % mg) * m_group
+                pn = (patch // mg) * n_group
+                for gm in pl.range(m_group):
+                    m0 = (pm + gm) * m_tile
+                    for gn in pl.range(n_group):
+                        n0 = (pn + gn) * n_tile
+                        acc_gate = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
+                        acc_up = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
+                        for kb in pl.pipeline(0, k // k_tile, stage=2):
+                            # `k_stagger`: see `a8w8_linear`, same rotation and same reason
+                            k0 = ((kb + patch * k_stagger) % (k // k_tile)) * k_tile
+                            at = a_q[m0 : m0 + m_tile, k0 : k0 + k_tile]
+                            acc_gate = pl.matmul_acc(acc_gate, at,
+                                                     w_gate[n0 : n0 + n_tile, k0 : k0 + k_tile],
+                                                     b_trans=True, init_cond=(kb == 0))
+                            acc_up = pl.matmul_acc(acc_up, at,
+                                                   w_up[n0 : n0 + n_tile, k0 : k0 + k_tile],
+                                                   b_trans=True, init_cond=(kb == 0))
+                        for lane in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                            row = m0 + lane * row_tile
+                            xs = pl.reshape(a_scale[0:1, row : row + row_tile], [row_tile, 1])
+                            ws_gate = pl.reshape(w_gate_scale[n0 : n0 + n_tile], [1, n_tile])
+                            gate_f = pl.cast(pl.aiv_shard(acc_gate), target_type=pl.FP32)
+                            gate_scaled = pl.col_expand_mul(gate_f, ws_gate)
+                            deq_gate = pl.row_expand_mul(gate_scaled, xs)
+                            gate_bf16 = pl.cast(deq_gate, target_type=pl.BF16, mode="rint")
+                            gate_f = pl.cast(gate_bf16, target_type=pl.FP32)
+                            gate_act = pl.div(gate_f, pl.add(pl.exp(pl.neg(gate_f)), 1.0))
+                            ws_up = pl.reshape(w_up_scale[n0 : n0 + n_tile], [1, n_tile])
+                            up_f = pl.cast(pl.aiv_shard(acc_up), target_type=pl.FP32)
+                            up_scaled = pl.col_expand_mul(up_f, ws_up)
+                            deq_up = pl.row_expand_mul(up_scaled, xs)
+                            up_bf16 = pl.cast(deq_up, target_type=pl.BF16, mode="rint")
+                            up_f = pl.cast(up_bf16, target_type=pl.FP32)
+                            product = pl.mul(gate_act, up_f)
+                            act[row : row + row_tile, n0 : n0 + n_tile] = product
         return act
 
     if act_dtype is pl.FP32:

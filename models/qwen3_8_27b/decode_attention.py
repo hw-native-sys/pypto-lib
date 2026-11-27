@@ -46,6 +46,7 @@ serial online-softmax chain against a merge pass. It is **1**: at every batch
 """
 import pypto.language as pl
 
+import utils
 from config import KV_PAGE_SIZE, QWEN3_8_27B
 
 # Dynamic shape variables.
@@ -332,6 +333,31 @@ def owned_mask(table, lens, pool_rows: int):
     return owned
 
 
+def appended_rows(table, lens, pool_rows: int):
+    """Which pool rows one decode step writes, as a `[pool_rows]` bool.
+
+    A step appends its token at position `lens[i] - 1`, the convention
+    `reference.append_kv_pages` and `reference.decode_gqa_attention` share. Lane `i` takes
+    its length from `lens[i % len(lens)]`, as `owned_mask` does.
+    """
+    import torch
+
+    written = torch.zeros(pool_rows, dtype=torch.bool)
+    n = len(lens)
+    for row in range(table.shape[0]):
+        pos = int(lens[row % n]) - 1
+        written[int(table[row, pos // PAGE]) * PAGE + pos % PAGE] = True
+    return written
+
+
+def compare_pages(name: str, threshold: float = 2e-2):
+    """The cache carries this step's row per lane and leaves every other row alone."""
+    def written(inputs, pool_rows: int):
+        return appended_rows(inputs["block_table"], inputs["seq_lens"], pool_rows)
+
+    return utils.in_place_pool(name, written, threshold)
+
+
 def page_layout(batch: int, context: int, max_pages: int, pool_pages: int | None = None):
     """Per-lane lengths, the block table for them, and the pool they need.
 
@@ -340,6 +366,9 @@ def page_layout(batch: int, context: int, max_pages: int, pool_pages: int | None
     positions -- the deepest page walk, a sequence's first token, both sides of a page
     edge, and a length that leaves the last page partial. Lengths differ per sequence, as
     they do in serving.
+
+    Every length stays inside `context`, which `max_pages` was derived from, so the
+    page-edge pair collapses below `PAGE + 1` and returns once the context spans two pages.
 
     **The pool holds what the lanes actually need, not `batch * max_pages`.** A real
     allocator gives a short sequence one page and a long one sixty-four, and sizing for the
@@ -352,7 +381,8 @@ def page_layout(batch: int, context: int, max_pages: int, pool_pages: int | None
     pages = (context + PAGE - 1) // PAGE
     if pages > max_pages:
         raise ValueError(f"context={context} needs {pages} pages, over max_pages={max_pages}")
-    pattern = [context, 1, PAGE, PAGE + 1, max(1, context - 1), min(2 * PAGE, context)]
+    pattern = [context, 1, min(PAGE, context), min(PAGE + 1, context),
+               max(1, context - 1), min(2 * PAGE, context)]
     lens = torch.tensor([pattern[i % len(pattern)] for i in range(batch)], dtype=torch.int32)
     lane_pages = [(int(n) + PAGE - 1) // PAGE for n in lens]
     pool = sum(lane_pages) if pool_pages is None else pool_pages

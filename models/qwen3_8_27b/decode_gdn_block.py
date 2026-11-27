@@ -49,6 +49,7 @@ import decode_projection
 import decode_short_conv
 import in_proj_ab
 import quant_x
+import utils
 from config import QWEN3_8_27B
 import gated_rmsnorm
 from decode_projection import check_batch, check_tile, padded_batch
@@ -410,17 +411,25 @@ def compare_out(batch: int, weights: str | None, active_rows: int = 0):
     return compare
 
 
-def compare_pool(name: str):
-    """A state pool must match the oracle exactly where it was written and elsewhere."""
-    def compare(actual, expected, **_kwargs):
-        a, e = actual.double(), expected.double()
-        num = (a - e).norm()
-        den = e.norm().clamp_min(1e-30)
-        rel = float(num / den)
-        ok = rel <= 2e-2
-        return ok, "" if ok else f"{name} rel {rel:.3e} exceeds 2e-2"
+def compare_pool(name: str, live: int = 0, threshold: float = 2e-2):
+    """A state pool matches the oracle where this step wrote and is untouched elsewhere.
 
-    return compare
+    `state_rows` names each sequence's row in both pools. `live` is the kernel's
+    `active_rows`, and the two pools do not take the same value: the convolution runs over
+    the padded batch and writes every named row of `conv_state`, while the delta rule takes
+    `state_rows[0:active_rows]` and leaves the padding lanes' rows of `state` alone. `live`
+    of zero means every named row, which is what `active_rows` of zero builds.
+    """
+    def written(inputs, pool_rows: int):
+        import torch
+
+        rows = inputs["state_rows"]
+        named = rows if live == 0 else rows[:live]
+        mask = torch.zeros(pool_rows, dtype=torch.bool)
+        mask[named.long()] = True
+        return mask
+
+    return utils.in_place_pool(name, written, threshold)
 
 
 if __name__ == "__main__":
@@ -452,7 +461,7 @@ if __name__ == "__main__":
             golden_fn=golden_decode_gdn_block(args.weights, active_rows=args.active_rows),
             compare_fn={"out": compare_out(batch, args.weights, active_rows=args.active_rows),
                         "conv_state": compare_pool("conv_state"),
-                        "state": compare_pool("state")},
+                        "state": compare_pool("state", live=args.active_rows)},
             config=run_config(args.backend_type, args.execution_mode, args.device,
                               args.enable_chip_swimlane),
             rtol=1e-2,

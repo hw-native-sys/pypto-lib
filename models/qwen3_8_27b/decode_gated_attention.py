@@ -338,17 +338,6 @@ def compare_out():
     return compare
 
 
-def compare_pages(name: str):
-    """The cache must carry this token's row and leave every other row alone."""
-    def compare(actual, expected, **_kwargs):
-        a, e = actual.double(), expected.double()
-        rel = float((a - e).norm() / e.norm().clamp_min(1e-30))
-        ok = rel <= 2e-2
-        return ok, "" if ok else f"{name} rel {rel:.3e} exceeds 2e-2"
-
-    return compare
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -382,8 +371,8 @@ if __name__ == "__main__":
                                      max_pages=max_pages, weights=args.weights),
             golden_fn=golden_decode_gated_attention,
             compare_fn={"out": compare_out(),
-                        "k_pages": compare_pages("k_pages"),
-                        "v_pages": compare_pages("v_pages")},
+                        "k_pages": decode_attention.compare_pages("k_pages"),
+                        "v_pages": decode_attention.compare_pages("v_pages")},
             config=run_config(args.backend_type, args.execution_mode, args.device,
                               args.enable_chip_swimlane),
             rtol=1e-2,

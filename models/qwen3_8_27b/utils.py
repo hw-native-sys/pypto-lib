@@ -27,6 +27,47 @@ def rel_frobenius(threshold: float, label: str):
     return compare
 
 
+def in_place_pool(name: str, written_rows, threshold: float = 2e-2):
+    """Two gates on a cache a launch updates in place: the rows it writes, and the rest.
+
+    `written_rows(inputs, pool_rows)` returns the `[pool_rows]` bool mask of the rows this
+    launch is expected to write; the caller owns that derivation because each pool is
+    addressed differently. The written rows are compared one relative Frobenius norm per
+    row, so the gate sees the worst row rather than an average. Every other row must come
+    back bit-identical, which is what a kernel that never writes them produces on both
+    sides.
+
+    **One norm over the whole pool cannot stand in for either.** It divides a destroyed row
+    by every row beside it: a cache holding 6149 rows moves by `sqrt(1/6149)`, 1.3%, when
+    one of them is zeroed, which passes a 2e-2 bound. Per row the same constant is about
+    78x stricter, so `threshold` stays where the pool gates had it.
+    """
+    import torch
+
+    def compare(actual, expected, *, inputs, **_kwargs):
+        written = written_rows(inputs, actual.shape[0])
+        kept = ~written
+        if not torch.equal(actual[kept], expected[kept]):
+            changed = (actual[kept] != expected[kept]).flatten(1).any(dim=-1)
+            first = int(kept.nonzero()[int(changed.nonzero()[0, 0]), 0])
+            return False, (f"{name}: {int(changed.sum())} of {int(kept.sum())} rows this "
+                           f"launch does not write came back changed, the first at row {first}")
+        count = int(written.sum())
+        if count == 0:
+            return False, f"{name}: no row is expected to change, so the gate checks nothing"
+        a = actual[written].double().reshape(count, -1)
+        e = expected[written].double().reshape(count, -1)
+        rel = (a - e).norm(dim=-1) / e.norm(dim=-1).clamp_min(1e-30)
+        worst = int(rel.argmax())
+        ok = float(rel[worst]) <= threshold
+        detail = (f"{name}: worst of {count} written rows is pool row "
+                  f"{int(written.nonzero()[worst, 0])} at rel {float(rel[worst]):.3e}, "
+                  f"over {threshold:.0e}")
+        return ok, "" if ok else detail
+
+    return compare
+
+
 def int8_step_and_exact(min_exact: float, label: str = "act_q"):
     """Two gates on an INT8 output: every element within one step, and most exact.
 
@@ -54,4 +95,4 @@ def int8_step_and_exact(min_exact: float, label: str = "act_q"):
     return compare
 
 
-__all__ = ["int8_step_and_exact", "rel_frobenius"]
+__all__ = ["in_place_pool", "int8_step_and_exact", "rel_frobenius"]
