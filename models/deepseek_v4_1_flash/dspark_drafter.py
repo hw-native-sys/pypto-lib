@@ -344,7 +344,7 @@ def dspark_proj(
                         b0: pl.Tile[
                             [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                             pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[0], pl.Mem.Mat,
-                        ] = pl.tile.load(main_proj_weight, [0, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        ] = pl.tile.load(main_proj_weight, [0, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0)
                         a1: pl.Tile[
                             [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
@@ -353,7 +353,7 @@ def dspark_proj(
                         b1: pl.Tile[
                             [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                             pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[1], pl.Mem.Mat,
-                        ] = pl.tile.load(main_proj_weight, [PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        ] = pl.tile.load(main_proj_weight, [PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 1)
                         a2: pl.Tile[
                             [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
@@ -362,7 +362,7 @@ def dspark_proj(
                         b2: pl.Tile[
                             [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                             pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[2], pl.Mem.Mat,
-                        ] = pl.tile.load(main_proj_weight, [2 * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        ] = pl.tile.load(main_proj_weight, [2 * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 2)
                         a3: pl.Tile[
                             [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
@@ -371,7 +371,7 @@ def dspark_proj(
                         b3: pl.Tile[
                             [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                             pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[3], pl.Mem.Mat,
-                        ] = pl.tile.load(main_proj_weight, [3 * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        ] = pl.tile.load(main_proj_weight, [3 * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 3)
                         acc = pl.tile.create([PROJ_M_TILE, PROJ_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
                         for group in pl.unroll(MAIN_IN // PROJ_K_TILE):
@@ -391,7 +391,7 @@ def dspark_proj(
                                 b3: pl.Tile[
                                     [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                                     pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[slot], pl.Mem.Mat,
-                                ] = pl.tile.load(main_proj_weight, [next_group * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                                ] = pl.tile.load(main_proj_weight, [next_group * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                                 pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
                         pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
                         pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
