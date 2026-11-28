@@ -50,6 +50,10 @@ TOPK_ROW_WIDTH_TILE = 640
 PROBE_WIDTH_TILE = SAMPLE_BLOCK_ROWS_TILE * TOPK_ROW_WIDTH_TILE
 FILTER_LANE_TILE = FILTER_WIDTH_TILE // SAMPLE_BLOCK_ROWS_TILE
 CATEGORICAL_WIDTH_TILE = 256
+# One aligned FP32 line stores five consecutive block masses; the rest is padding.
+PROPOSAL_BLOCKS_PER_PANEL = 5
+PROPOSAL_MASS_STRIDE = 8
+PROPOSAL_PANEL_WIDTH = PROPOSAL_BLOCKS_PER_PANEL * CATEGORICAL_WIDTH_TILE
 ARGMAX_BLOCK_TILE = ARGMAX_ROWS_TILE * ARGMAX_WIDTH_TILE
 
 # Boundary searches over FP32 bit patterns.
@@ -797,32 +801,73 @@ def _dspark_uniform(
 
 @pl.jit.inline
 def sample_markov_proposal_row(
-    logits: pl.Tensor,
     logits_grid: pl.Tensor,
-    filtered: pl.Tensor,
+    masses: pl.Tensor,
     weights: pl.Tensor,
     proposal_probs: pl.Tensor,
     temperatures: pl.Tensor,
-    top_ks: pl.Tensor,
-    top_ps: pl.Tensor,
     seeds: pl.Tensor,
     first_positions: pl.Tensor,
     request: pl.Scalar[pl.INDEX],
     step: pl.Scalar[pl.INDEX],
     rows_per_request: pl.constexpr,
 ):
+    """Draw using vocabulary-ordered masses; normalize in the original FP32 reduction order."""
     row = request * rows_per_request
     temperature = pl.read(temperatures, [row])
     position = pl.cast(pl.read(first_positions, [request]) + step, pl.INT32)
     if temperature >= SAMPLING_EPS:
-        row_max = _row_max(logits, request)
-        top_k = pl.read(top_ks, [row])
-        top_p = pl.read(top_ps, [row])
-        _filter_logits(logits, request, filtered, request, weights, row_max, temperature, top_k, top_p, True)
         seed = pl.read(seeds, [row])
         uniform = _dspark_uniform(seed, position, PROPOSAL_STREAM)
-        normalizer = _store_exp_weights(filtered, weights, request)
-        token = _categorical_sample(weights, request, uniform)
+        block_masses = masses[request : request + 1, 0 : VOCAB // PROPOSAL_PANEL_WIDTH * PROPOSAL_MASS_STRIDE]
+        total = pl.cast(0.0, pl.FP32)
+        for chunk in pl.range(VOCAB // PROPOSAL_PANEL_WIDTH):
+            for block in pl.range(PROPOSAL_BLOCKS_PER_PANEL):
+                total = total + pl.read(block_masses, [0, chunk * PROPOSAL_MASS_STRIDE + block])
+        threshold = uniform * total
+        cumulative = pl.cast(0.0, pl.FP32)
+        selected_tile = pl.cast(-1, pl.INDEX)
+        last_tile = pl.cast(0, pl.INDEX)
+        local_threshold = pl.cast(0.0, pl.FP32)
+        for chunk in pl.range(VOCAB // PROPOSAL_PANEL_WIDTH):
+            for block in pl.range(PROPOSAL_BLOCKS_PER_PANEL):
+                if selected_tile < 0:
+                    mass = pl.read(block_masses, [0, chunk * PROPOSAL_MASS_STRIDE + block])
+                    if mass > 0.0:
+                        start = (chunk * PROPOSAL_BLOCKS_PER_PANEL + block) * CATEGORICAL_WIDTH_TILE
+                        last_tile = start
+                        if threshold < cumulative + mass:
+                            selected_tile = start
+                            local_threshold = threshold - cumulative
+                    cumulative = cumulative + mass
+
+        start = last_tile
+        if selected_tile >= 0:
+            start = selected_tile
+        else:
+            local_threshold = total
+        tile = weights[request : request + 1, start : start + CATEGORICAL_WIDTH_TILE]
+        cumulative = pl.cast(0.0, pl.FP32)
+        selected = pl.cast(-1, pl.INT32)
+        last = pl.cast(start, pl.INT32)
+        for lane in pl.range(CATEGORICAL_WIDTH_TILE):
+            if selected < 0:
+                weight = pl.read(tile, [0, lane])
+                cumulative = cumulative + weight
+                if weight > 0.0:
+                    last = pl.cast(start + lane, pl.INT32)
+                    if local_threshold < cumulative:
+                        selected = last
+        token = pl.max(selected, last)
+
+        sums = pl.full([ARGMAX_ROWS_TILE, ARGMAX_WIDTH_TILE], dtype=pl.FP32, value=0.0)
+        for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
+            raw = weights[request : request + 1, start : start + ARGMAX_BLOCK_TILE]
+            sums = pl.add(sums, pl.reshape(raw, [ARGMAX_ROWS_TILE, ARGMAX_WIDTH_TILE]))
+        partial_sums = pl.row_sum(sums)
+        normalizer = pl.cast(0.0, pl.FP32)
+        for lane in pl.range(ARGMAX_ROWS_TILE):
+            normalizer = normalizer + pl.read(partial_sums, [lane, 0])
         for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
             raw = weights[request : request + 1, start : start + ARGMAX_BLOCK_TILE]
             probs = pl.div(raw, normalizer)
@@ -830,9 +875,11 @@ def sample_markov_proposal_row(
             proposal_probs[request : request + 1, dest : dest + ARGMAX_BLOCK_TILE] = probs
     else:
         token = _greedy_sample_logits(logits_grid, request)
+        # A5 lowers arange to scalar stores; a one-hot row only needs one nonzero write.
         for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
-            token_ids = pl.arange(pl.cast(start, pl.INT32), [1, ARGMAX_BLOCK_TILE], dtype=pl.INT32)
-            probs = pl.cast(pl.cmp(token_ids, token, cmp_type=0), target_type=pl.FP32)
+            probs = pl.full([1, ARGMAX_BLOCK_TILE], dtype=pl.FP32, value=0.0)
+            if token >= start and token < start + ARGMAX_BLOCK_TILE:
+                pl.write(probs, [0, token - start], 1.0)
             dest = step * VOCAB + start
             proposal_probs[request : request + 1, dest : dest + ARGMAX_BLOCK_TILE] = probs
     return token
