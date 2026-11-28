@@ -22,7 +22,11 @@ from config import (
 from lm_head import VOCAB_PER_TP, clear_lm_head_signals, lm_head
 from rmsnorm import rms_norm
 from hc import hc_head
-from sample import ARGMAX_WIDTH_TILE, PROPOSAL_STREAM, golden_categorical, golden_dspark_probs, sample_markov_proposal_row
+from sample import (
+    ARGMAX_BLOCK_TILE, ARGMAX_WIDTH_TILE, CATEGORICAL_WIDTH_TILE, PROPOSAL_STREAM, SAMPLING_EPS,
+    PROPOSAL_BLOCKS_PER_PANEL, PROPOSAL_MASS_STRIDE, PROPOSAL_PANEL_WIDTH,
+    _filter_logits, _row_max, golden_categorical, golden_dspark_probs, sample_markov_proposal_row,
+)
 
 
 PROPOSAL_PARAMS_DYN = pl.dynamic("MARKOV_PROPOSAL_PARAMS")
@@ -39,9 +43,13 @@ GROUP_LOGIT_ROWS = LM_HEAD_TP_SIZE * LOGIT_ROWS
 
 # tiling
 VOCAB_TILE = 256
+MARKOV_SLOT_BYTES = 8 * VOCAB_TILE * 4
+MARKOV_RING_BYTES = 4 * MARKOV_SLOT_BYTES
 
 if (D, MARKOV_RANK, DSPARK_QUERY_WIDTH) != (5120, 256, 5):
     raise ValueError("Markov recurrence requires hidden_size=5120, rank=256, and five steps")
+if VOCAB % PROPOSAL_PANEL_WIDTH:
+    raise ValueError("Markov probability panels must cover the vocabulary exactly")
 if VOCAB % VOCAB_TILE != 0:
     raise ValueError("Markov recurrence requires complete 256-column vocabulary panels")
 if EP_SIZE % LM_HEAD_TP_SIZE:
@@ -93,6 +101,81 @@ def _store_markov_confidence(
     return confidence_state
 
 
+@pl.jit.incore(level=pl.Level.AIC)
+def _markov_score_cube(
+    base: pl.Tensor,
+    embedding: pl.Tensor,
+    w2: pl.Tensor,
+    scores: pl.Out[pl.Tensor],
+    step: pl.Scalar[pl.INDEX],
+):
+    pl.func_attr({"split_aiv": True})
+    peer = pl.system.import_peer_buffer(name="markov_score_bias", peer_func="_markov_score_vector")
+    pl.system.aic_initialize_pipe(peer, dir_mask=1, slot_size=MARKOV_SLOT_BYTES, slot_num=4, id=0)
+    block = pl.tile.get_block_idx()
+    blocks = pl.tile.get_block_num()
+    padded = pl.tensor.dim(embedding, 0)
+    for panel in pl.range(block, VOCAB // VOCAB_TILE, blocks):
+        col = panel * VOCAB_TILE
+        for row in pl.range(0, padded, 16):
+            left = pl.load(embedding, [row, 0], [16, MARKOV_RANK], target_memory=pl.Mem.Mat)
+            right = pl.load(w2, [col, 0], [VOCAB_TILE, MARKOV_RANK], target_memory=pl.Mem.Mat)
+            product = pl.matmul(left, pl.tile.transpose_view(right), out_dtype=pl.FP32)
+            pl.system.tpush_to_aiv(product, split=1, id=0)
+    return scores
+
+
+@pl.jit.incore(level=pl.Level.AIV)
+def _markov_score_vector(
+    base: pl.Tensor,
+    embedding: pl.Tensor,
+    w2: pl.Tensor,
+    scores: pl.Out[pl.Tensor],
+    step: pl.Scalar[pl.INDEX],
+):
+    pl.func_attr({"split_aiv": True, "dual_aiv_dispatch": True})
+    ring = pl.system.reserve_buffer(name="markov_score_bias", size=MARKOV_RING_BYTES)
+    pl.system.aiv_initialize_pipe(ring, dir_mask=1, slot_size=MARKOV_SLOT_BYTES, slot_num=4, id=0)
+    block = pl.tile.get_block_idx()
+    blocks = pl.tile.get_block_num()
+    lane = pl.tile.get_subblock_idx()
+    padded = pl.tensor.dim(embedding, 0)
+    batch = pl.tensor.dim(scores, 0)
+    for panel in pl.range(block, VOCAB // VOCAB_TILE, blocks):
+        col = panel * VOCAB_TILE
+        for first in pl.range(0, padded, 16):
+            row = first + lane * 8
+            valid = pl.max(0, pl.min(batch - row, 8))
+            if valid > 0:
+                logit = pl.load(
+                    base, [row, step * VOCAB + col], [8, VOCAB_TILE],
+                    valid_shape=[valid, VOCAB_TILE], target_memory=pl.Mem.Vec,
+                )
+                product = pl.system.tpop_from_aic(shape=[8, VOCAB_TILE], dtype=pl.FP32, split=1, id=0)
+                valid_product = pl.tile.set_validshape(product, valid, VOCAB_TILE)
+                summed = pl.add(logit, valid_product)
+                pl.system.tfree_to_aic(product, id=0)
+                scores = pl.store(pl.tile.set_validshape(summed, valid, VOCAB_TILE), [row, col], scores)
+            else:
+                # Empty AIV lanes must still drain their half of the Cube panel.
+                unused = pl.system.tpop_from_aic(shape=[8, VOCAB_TILE], dtype=pl.FP32, split=1, id=0)
+                pl.system.tfree_to_aic(unused, id=0)
+    return scores
+
+
+@pl.jit.incore(level=pl.Level.CORE_GROUP)
+def _markov_scores(
+    base: pl.Tensor,
+    embedding: pl.Tensor,
+    w2: pl.Tensor,
+    scores: pl.Out[pl.Tensor],
+    step: pl.Scalar[pl.INDEX],
+):
+    scores = _markov_score_cube(base, embedding, w2, scores, step)
+    scores = _markov_score_vector(base, embedding, w2, scores, step)
+    return scores
+
+
 @pl.jit.inline(auto_scope=False)
 def markov_propose(
     base_logits: pl.Tensor,
@@ -114,7 +197,7 @@ def markov_propose(
     batch = pl.tensor.dim(anchor_ids, 0)
     padded = (batch + 15) // 16 * 16
     hidden = pl.reshape(head_hidden, [batch * DSPARK_QUERY_WIDTH, D])
-    base = pl.reshape(base_logits, [batch * DSPARK_QUERY_WIDTH, VOCAB])
+    base = pl.reshape(base_logits, [batch, DSPARK_QUERY_WIDTH * VOCAB])
     aiv_count = pl.system.available_aiv_count()
     embedding_workers = pl.min(padded, aiv_count)
     request_workers = pl.min(batch, aiv_count)
@@ -131,37 +214,73 @@ def markov_propose(
                         previous = pl.cast(pl.read(previous_selected, [request, 0]), pl.INT64)
                 embedding[request : request + 1, :] = markov_w1[previous : previous + 1, :]
 
-        bias = pl.create_tensor([padded, VOCAB], dtype=pl.FP32)
-        workers = pl.system.available_cluster_count()
-        for worker in pl.spmd(workers, name_hint="markov_proposal_bias"):
-            for panel in pl.range(worker, VOCAB // VOCAB_TILE, workers):
-                col = panel * VOCAB_TILE
-                for row in pl.range(0, padded, 16):
-                    left = pl.load(embedding, [row, 0], [16, MARKOV_RANK], target_memory=pl.Mem.Mat)
-                    right = pl.load(markov_w2, [col, 0], [VOCAB_TILE, MARKOV_RANK], target_memory=pl.Mem.Mat)
-                    right_transposed = pl.tile.transpose_view(right)
-                    product = pl.matmul(left, right_transposed, out_dtype=pl.FP32)
-                    pl.store(product, [row, col], bias)
-
         scores = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
-        for worker in pl.spmd(request_workers, name_hint="markov_proposal_logits"):
-            for request in pl.range(worker, batch, request_workers):
-                row = request * DSPARK_QUERY_WIDTH + step
-                for col in pl.range(0, VOCAB, 1280):
-                    logits = pl.load(base, [row, col], [1, 1280])
-                    correction = pl.load(bias, [request, col], [1, 1280])
-                    pl.store(pl.add(logits, correction), [request, col], scores)
-
-        scores_grid = pl.reshape(scores, [batch * (VOCAB // ARGMAX_WIDTH_TILE), ARGMAX_WIDTH_TILE])
+        with pl.spmd(pl.system.available_cluster_count(), name_hint="markov_proposal_scores", sync_start=True):
+            scores = _markov_scores(base, embedding, markov_w2, scores, pl.cast(step, pl.INDEX))
         filtered = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
         weights = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
+        row_stats = pl.create_tensor([batch, 8], dtype=pl.FP32)
+        for worker in pl.spmd(request_workers, name_hint="markov_proposal_prepare"):
+            for request in pl.range(worker, batch, request_workers):
+                params = request * DECODE_SEQ
+                temperature = pl.read(temperatures, [params])
+                top_k = pl.read(top_ks, [params])
+                top_p = pl.read(top_ps, [params])
+                maximum = pl.cast(0.0, pl.FP32)
+                if temperature >= SAMPLING_EPS:
+                    maximum = _row_max(scores, request)
+                    if (top_k > 0 and top_k < VOCAB) or (top_p > 0.0 and top_p < 1.0):
+                        _filter_logits(
+                            scores, request, filtered, request, weights,
+                            maximum, temperature, top_k, top_p, True, False,
+                        )
+                row_data = pl.full([1, 8], dtype=pl.FP32, value=0.0)
+                pl.write(row_data, [0, 0], maximum)
+                row_stats[request : request + 1, :] = row_data
+
+        # Distribute independent vocabulary panels across AIVs, including when the batch mixes policies.
+        chunks = VOCAB // PROPOSAL_PANEL_WIDTH
+        masses = pl.create_tensor([batch, chunks * PROPOSAL_MASS_STRIDE], dtype=pl.FP32)
+        mass_workers = pl.min(batch * chunks, aiv_count)
+        for worker in pl.spmd(mass_workers, name_hint="markov_proposal_sharded_masses"):
+            for tile_id in pl.range(worker, batch * chunks, mass_workers):
+                request = tile_id // chunks
+                chunk = tile_id % chunks
+                params = request * DECODE_SEQ
+                temperature = pl.read(temperatures, [params])
+                if temperature >= SAMPLING_EPS:
+                    top_k = pl.read(top_ks, [params])
+                    top_p = pl.read(top_ps, [params])
+                    start = chunk * PROPOSAL_PANEL_WIDTH
+                    if (top_k > 0 and top_k < VOCAB) or (top_p > 0.0 and top_p < 1.0):
+                        scaled = filtered[request : request + 1, start : start + PROPOSAL_PANEL_WIDTH]
+                    else:
+                        maximum = pl.read(row_stats, [request, 0])
+                        raw = scores[request : request + 1, start : start + PROPOSAL_PANEL_WIDTH]
+                        scaled = pl.div(pl.sub(raw, maximum), temperature)
+                    exp_scores = pl.exp(scaled)
+                    weights[request : request + 1, start : start + PROPOSAL_PANEL_WIDTH] = exp_scores
+                    grid = pl.reshape(
+                        exp_scores, [PROPOSAL_BLOCKS_PER_PANEL * 8, CATEGORICAL_WIDTH_TILE // 8],
+                    )
+                    partial = pl.row_sum(grid)
+                    line = pl.full([1, PROPOSAL_MASS_STRIDE], dtype=pl.FP32, value=0.0)
+                    for block in pl.range(PROPOSAL_BLOCKS_PER_PANEL):
+                        mass = pl.cast(0.0, pl.FP32)
+                        for lane in pl.range(8):
+                            mass = mass + pl.read(partial, [block * 8 + lane, 0])
+                        pl.write(line, [0, block], mass)
+                    offset = chunk * PROPOSAL_MASS_STRIDE
+                    masses[request : request + 1, offset : offset + PROPOSAL_MASS_STRIDE] = line
+
+        scores_grid = pl.reshape(scores, [batch * (VOCAB // ARGMAX_WIDTH_TILE), ARGMAX_WIDTH_TILE])
         selected = pl.create_tensor([batch, 8], dtype=pl.INT32)
         confidence_state = pl.create_tensor([batch, 80], dtype=pl.FP32)
         for worker in pl.spmd(request_workers, name_hint="markov_proposal_sample"):
             for request in pl.range(worker, batch, request_workers):
                 token = sample_markov_proposal_row(
-                    scores, scores_grid, filtered, weights, proposal_probs, temperatures, top_ks,
-                    top_ps, seeds, first_positions, request, step, DECODE_SEQ,
+                    scores_grid, masses, weights, proposal_probs, temperatures,
+                    seeds, first_positions, request, step, DECODE_SEQ,
                 )
                 sampled = pl.full([1, 8], dtype=pl.INT32, value=0)
                 pl.write(sampled, [0, 0], token)
@@ -360,27 +479,53 @@ def build_tensor_specs(batch=2):
 def build_proposal_specs():
     from golden import TensorSpec
 
-    specs = build_tensor_specs()
+    # Exercise both AIV subblocks and a partial second 16-row group.
+    batch = 17
+    specs = build_tensor_specs(batch)
     by_name = {spec.name: spec for spec in specs}
     logits = by_name["base_logits"].init_value
-    logits[1].fill_(-4.0)
+    # Exercise both ends of the greedy one-hot store and a first-index tie.
+    for step, token in enumerate([0, ARGMAX_BLOCK_TILE - 1, ARGMAX_BLOCK_TILE, VOCAB - 1, 1]):
+        logits[0, step, token] = 16.0
+    logits[0, -1, ARGMAX_BLOCK_TILE + 1] = 16.0
+    logits[1].fill_(-24.0)
     logits[1, :, 5:9] = torch.tensor([0.1, 0.3, 0.2, 0.4])
+    logits[8].fill_(-24.0)
+    logits[8, :, [255, 1280, VOCAB - 1]] = torch.tensor([1.0, 0.5, 0.1])
+    # The unfiltered row puts mass on both sides of a shard boundary and at
+    # the last vocabulary ID. Its large offset requires a stable softmax.
+    logits[-1].fill_(900.0)
+    boundary_ids = [
+        CATEGORICAL_WIDTH_TILE - 1, CATEGORICAL_WIDTH_TILE,
+        PROPOSAL_PANEL_WIDTH - 1, PROPOSAL_PANEL_WIDTH, VOCAB - 1,
+    ]
+    logits[-1, :, boundary_ids] = torch.tensor([999.0, 999.25, 999.5, 999.75, 1000.0])
     by_name["markov_w2"].init_value.div_(128)
+    rows = batch * DECODE_SEQ
+    temperatures = torch.zeros(batch)
+    temperatures[[1, 8, batch - 1]] = torch.tensor([0.7, 0.9, 0.8])
+    top_ks = torch.zeros(batch, dtype=torch.int32)
+    top_ks[[1, 8]] = torch.tensor([3, 2], dtype=torch.int32)
+    top_ps = torch.ones(batch)
+    top_ps[1] = 0.45
+    positions = torch.arange(51, 51 + batch, dtype=torch.int32)
+    positions[1], positions[-1] = 73, 97
     params = [
-        TensorSpec("temperatures", [2 * DECODE_SEQ], torch.float32, torch.tensor([0.0, 0.7]).repeat_interleave(DECODE_SEQ)),
-        TensorSpec("top_ks", [2 * DECODE_SEQ], torch.int32, 3),
-        TensorSpec("top_ps", [2 * DECODE_SEQ], torch.float32, 0.75),
-        TensorSpec("seeds", [2 * DECODE_SEQ], torch.int32, 71),
-        TensorSpec("first_positions", [2], torch.int32, torch.tensor([51, 73])),
+        TensorSpec("temperatures", [rows], torch.float32, temperatures.repeat_interleave(DECODE_SEQ)),
+        TensorSpec("top_ks", [rows], torch.int32, top_ks.repeat_interleave(DECODE_SEQ)),
+        TensorSpec("top_ps", [rows], torch.float32, top_ps.repeat_interleave(DECODE_SEQ)),
+        TensorSpec("seeds", [rows], torch.int32, 71),
+        TensorSpec("first_positions", [batch], torch.int32, positions),
     ]
     return specs[:-2] + params + specs[-2:] + [
-        TensorSpec("proposal_probs", [2, DSPARK_QUERY_WIDTH * VOCAB], torch.float32),
+        TensorSpec("proposal_probs", [batch, DSPARK_QUERY_WIDTH * VOCAB], torch.float32),
     ]
 
 
 def golden_proposal_test(tensors):
-    proposal_probs = tensors["proposal_probs"].view(2, DSPARK_QUERY_WIDTH, VOCAB)
-    for request in range(2):
+    markov_w2 = tensors["markov_w2"].float()
+    proposal_probs = tensors["proposal_probs"].view(-1, DSPARK_QUERY_WIDTH, VOCAB)
+    for request in range(proposal_probs.shape[0]):
         params_row = request * DECODE_SEQ
         temperature = float(tensors["temperatures"][params_row])
         top_k = int(tensors["top_ks"][params_row])
@@ -390,7 +535,7 @@ def golden_proposal_test(tensors):
         previous = int(tensors["anchor_ids"][request])
         for step in range(DSPARK_QUERY_WIDTH):
             embedding = tensors["markov_w1"][previous].float()
-            bias = tensors["markov_w2"].float() @ embedding
+            bias = markov_w2 @ embedding
             scores = tensors["base_logits"][request, step] + bias
             if temperature == 0:
                 previous = int(scores.argmax())
@@ -408,7 +553,7 @@ def golden_proposal_test(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark Markov sampling validation")
     parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=SUPPORTED_LM_HEAD_TP_SIZES)
@@ -429,6 +574,7 @@ if __name__ == "__main__":
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         config=dict(backend_type=args.platform, execution_mode=False, device_id=args.device),
+        compare_fn={"draft_ids": ratio_allclose(rtol=0, atol=0, max_error_ratio=0)},
         rtol=1e-3,
         atol=1e-3,
     )
