@@ -8,9 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Prefill C1A and C2A index-key preparation, paged scoring, and selection."""
 
-from pathlib import Path
-from pypto.runtime import pto_isa_include_dir
-
 from gemm import _gemm_bf16_to_bf16, gemm_bf16_to_bf16
 
 import torch
@@ -23,7 +20,7 @@ from config import CACHE_ROWS_DYN
 from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, T_DYN
 from rmsnorm import EPS, rms_norm, golden_rms_norm
 from quant import quantize_bf16_to_mxfp8, dequantize_mxfp4_cache, golden_index_query_fp4, fp4_e4m3_lut
-from lightning_indexer import SCORE, _prefill_score
+from lightning_indexer import INDEX_Q_M_TILE, INDEX_Q_WIDE_M_TILE, SCORE, _prefill_score, idx_q_pypto
 from gemm import golden_mxfp8_linear_grouped_sum
 from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
 
@@ -37,7 +34,6 @@ INDEX_H = M.index_n_heads
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
 INDEX_QUERY_WIDTH = M.index_n_heads * INDEX_DIM
-INDEX_QUERY_SCALE_WIDTH = INDEX_QUERY_WIDTH // 32
 CANDIDATE_BLOCK_SIZE = M.candidate_block_size
 CANDIDATE_TOPK_BLOCKS = M.candidate_topk_blocks
 ALL_FIT_BLOCKS = INDEX_TOPK // CANDIDATE_BLOCK_SIZE
@@ -77,43 +73,18 @@ C1A_ALL_FIT, C1A_PAGED_PAIRED, C1A_PAGED_SINGLE, C1A_POOL_PAIRED, C1A_POOL_SINGL
 INDEX_SCORE_POSITIONS_DYN = pl.dynamic("INDEX_SCORE_POSITIONS_DYN")
 
 
-@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "prefill_idx_q.cpp",
-               aiv_source=Path(__file__).parent / "kernels" / "prefill_idx_q.cpp", dual_aiv_dispatch=True,
-               include_dirs=(pto_isa_include_dir(),))
-def _idx_q(
-    payload: pl.Tensor,
-    weight: pl.Tensor,
-    activation_scale: pl.Tensor,
-    weight_scale: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Out[pl.Tensor],
-    output_scale: pl.Out[pl.Tensor],
-    route: pl.Tensor[[1], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Project and quantize query heads with two C-to-V transfers per cube worker."""
-    ...
-
-
 @pl.jit.inline(auto_scope=False)
-def _project_index_query_packed(
+def _quantize_index_query_latent(
     latent: pl.Tensor,
-    weight: pl.Tensor,
-    weight_scale: pl.Tensor,
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    query: pl.Tensor,
-    query_scale: pl.Tensor,
+    payload: pl.Tensor,
+    scales: pl.Tensor,
     route: pl.Tensor[[1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Quantize the latent and project packed FP4 index queries."""
-    rows = pl.tensor.dim(latent, 0)
-    padded_rows = (rows + 79) // 80 * 80
-    payload = pl.create_tensor([padded_rows, Q_LORA], dtype=pl.FP8E4M3FN)
-    scales = pl.create_tensor([1, padded_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
-    with pl.spmd(16, name_hint="prefill_index_input_quant") as quantized:
+    """Pack the BF16 latent and zero-pad it to a complete projection tile."""
+    padded_rows = pl.tensor.dim(payload, 0)
+    with pl.spmd(16, name_hint="prefill_index_input_quant", deps=[ready]) as quantized:
         worker = pl.tile.get_block_idx()
         blocks = padded_rows // 16 * (Q_LORA // 256)
         if pl.read(route, [0]) == 0:
@@ -133,15 +104,7 @@ def _project_index_query_packed(
                 zero_codes = pl.tile.full([1, 128], dtype=pl.UINT8, value=0)
                 pl.store(zeros, [row, column], payload)
                 pl.store(pl.reinterpret_view(zero_codes, pl.FP8E8M0), [0, row * (Q_LORA // 32) + column // 256 * 128], scales)
-    cosine_rows = pl.reshape(cosine, [rows, 32])
-    sine_rows = pl.reshape(sine, [rows, 32])
-    output_scales = pl.reshape(query_scale, [rows, INDEX_QUERY_SCALE_WIDTH])
-    flat_scales = pl.reshape(scales, [padded_rows * (Q_LORA // 32)])
-    with pl.spmd(8, name_hint="idx_q", deps=[quantized]) as projected:
-        packed_result = _idx_q(
-            payload, weight, flat_scales, weight_scale, cosine_rows, sine_rows, query, output_scales, route, num_tokens,
-        )
-    return projected
+    return quantized
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1885,26 +1848,32 @@ def prefill_indexer(
                     packed_query = pl.create_tensor([rows, INDEX_QUERY_WIDTH // 2], dtype=pl.UINT8)
                     raw_weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
                     # Index-Q and Q-B consume MXFP8 from the same rounded BF16 latent.
-                    # The native projection reads a whole M80 or M128 tile including its tail.
-                    required_rows = pl.min((rows + 79) // 80 * 80, (rows + 127) // 128 * 128)
+                    narrow_rows = (rows + INDEX_Q_M_TILE - 1) // INDEX_Q_M_TILE * INDEX_Q_M_TILE
+                    wide_rows = (rows + INDEX_Q_WIDE_M_TILE - 1) // INDEX_Q_WIDE_M_TILE * INDEX_Q_WIDE_M_TILE
+                    required_rows = pl.min(narrow_rows, wide_rows)
+                    scale_count = required_rows * (Q_LORA // 32)
                     packed_done = pl.array.create(1, pl.TASK_ID)
                     if begin % 16 == 0 and begin + required_rows <= pl.tensor.dim(latent_payload, 0):
                         q_payload = pl.slice(latent_payload, [required_rows, Q_LORA], [begin, 0])
-                        # The native projection reads the packed scales as a
-                        # byte stream. A flat slice needs no dynamic row pitch.
+                        # The MX_A_ZZ scale slice starts at an M16 boundary.
                         scale_stream = pl.reshape(latent_scales, [pl.tensor.dim(latent_scales, 1)])
-                        q_scales = pl.slice(scale_stream, [required_rows * (Q_LORA // 32)],
-                                            [begin * (Q_LORA // 32)])
-                        with pl.spmd(8, name_hint="idx_q_reuse_mx") as projected:
-                            projected_query = _idx_q(q_payload, query_weight, q_scales, query_weight_scale,
-                                                     chunk_cos, chunk_sin, packed_query, query_scale, score_route, count)
-                        packed_done[0] = projected
-                    else:
-                        quantized_tid = _project_index_query_packed(
-                            chunk_latent, query_weight, query_weight_scale, chunk_cos, chunk_sin,
-                            packed_query, query_scale, score_route, count,
+                        q_scales = pl.slice(scale_stream, [scale_count], [begin * (Q_LORA // 32)])
+                        packed_done[0] = idx_q_pypto(
+                            q_payload, query_weight, q_scales, query_weight_scale,
+                            chunk_cos, chunk_sin, packed_query, query_scale,
+                            count, chunk_ready, worker_limit=8, route=score_route, guarded=True,
                         )
-                        packed_done[0] = quantized_tid
+                    else:
+                        padded_payload = pl.create_tensor([required_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+                        scale_backing = pl.create_tensor([1, scale_count], dtype=pl.FP8E8M0)
+                        quantized = _quantize_index_query_latent(
+                            chunk_latent, padded_payload, scale_backing, score_route, count, chunk_ready,
+                        )
+                        packed_done[0] = idx_q_pypto(
+                            padded_payload, query_weight, scale_backing, query_weight_scale,
+                            chunk_cos, chunk_sin, packed_query, query_scale,
+                            count, quantized, worker_limit=8, route=score_route, guarded=True,
+                        )
                     packed_tid = packed_done[0]
                     _gemm_bf16_to_bf16(chunk_x, weight_projection, raw_weights, count,
                                       width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
