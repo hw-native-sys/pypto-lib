@@ -1,0 +1,9 @@
+{
+  "cases": [
+    {
+      "id": "hello-chat",
+      "prompt_token_ids": [0, 128803, 19923, 128804, 128822],
+      "trace_token_ids": [30594, 303, 2788]
+    }
+  ]
+}

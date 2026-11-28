@@ -37,7 +37,14 @@ def run_case(file, platform, log, slots):
     build_root.mkdir(parents=True, exist_ok=True)
     env["PYPTO_PROG_BUILD_DIR"] = tempfile.mkdtemp(prefix=f"{Path(file).stem}-", dir=build_root)
     admission = nullcontext()
-    if uses_harness and not re.search(r"^#\s*ci:\s*direct-device\b", source, re.MULTILINE):
+    compile_only = re.search(r"^#[ \t]*ci:[ \t]*compile-only(?:[ \t]+(.*))?$", source, re.MULTILINE)
+    if compile_only:
+        from ci_device import _slot
+
+        admission = _slot(slots / "compile")
+        env.pop("PYPTO_CI_DEVICE_COUNT", None)
+        cmd = [sys.executable, "-u", *args, "--compile-only", *(compile_only[1] or "").split()]
+    elif uses_harness and not re.search(r"^#\s*ci:\s*direct-device\b", source, re.MULTILINE):
         env["PYPTO_CI_DEVICE_COUNT"] = str(devices)
         env["PYPTO_CI_PREPARE_SLOTS"] = str(slots)
         logical_devices = ",".join(str(rank) for rank in range(devices))

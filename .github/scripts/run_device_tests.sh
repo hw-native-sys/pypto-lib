@@ -16,7 +16,7 @@ fi
 
 source activate.sh
 export PYPTO_BENCH=0 PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error
-export PYTHONPATH="$PWD"
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 if (( $# )); then
   unset PYPTO_CI_DEVICE_COUNT
   exec python "$@" -d "${TASK_DEVICE:?task-submit must allocate the devices}"

@@ -15,8 +15,9 @@ Confirm that the file has an executable entry point; validate library-only
 operators through a consuming component or layer.
 
 Before running, inspect the entry's `--help`, source, and `# ci:` markers.
-`# ci: no-sim` requires a real device; `# ci: devices=N` requires N allocated
-cards. Parser acceptance alone does not establish validated platform support.
+`# ci: no-sim` excludes simulator CI. The device workflow reserves N cards for
+`# ci: devices=N` and runs entries marked `# ci: compile-only` without a card.
+Parser acceptance alone does not establish validated platform support.
 Run from the repository root with that root on `PYTHONPATH`, and allocate
 devices through the site's allocator rather than probing for an idle card.
 
