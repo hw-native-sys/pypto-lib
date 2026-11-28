@@ -335,7 +335,7 @@ def split_moe(
 
 def make_decode_moe(local_experts, topk, packed_routed_weights=False):
     """Wire HC and routing to the fused experts specialized for this entry."""
-    fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights)
+    fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights, overlap_decode_input=True)
 
     @pl.jit.inline(auto_scope=False)
     def moe(

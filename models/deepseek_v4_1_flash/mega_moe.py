@@ -220,7 +220,9 @@ def workspace_bytes(ep, local_experts, tokens, topk, hidden, intermediate):
     return align(offset, 2 * 1024 * 1024)
 
 
-def _fused_external_kernel(local_experts, topk, packed_routed_weights=False):
+def _fused_external_kernel(
+    local_experts, topk, packed_routed_weights=False, *, prepublished=False, publish_only=False,
+):
     """Prepare a content-addressed, shape-specialized native entry."""
     if packed_routed_weights and MOE_TOKENS > 80 and MOE_TOKENS not in (192, 384):
         raise ValueError("unsupported token capacity for packed routed weights")
@@ -228,6 +230,10 @@ def _fused_external_kernel(local_experts, topk, packed_routed_weights=False):
     values = dict(MOE_EP=EP_WORLD_SIZE, MOE_EXPERTS=local_experts, MOE_TOKENS=MOE_TOKENS,
                   MOE_TOPK=topk, MOE_HIDDEN=D, MOE_INTER=MOE_INTER, MOE_PACKED_ROUTED_WEIGHTS=int(packed_routed_weights))
     text = "".join(f"#define {name} {value}\n" for name, value in values.items())
+    if prepublished:
+        text += "#define MOE_PREPUBLISHED_INPUT 1\n"
+    if publish_only:
+        text += "#define MOE_EXTERNAL_PUBLISH 1\n"
     text += '#include "moe_fused.cpp"\n'
     digest = hashlib.sha256(text.encode())
     for name in ("moe_fused.cpp", "mx_quant.hpp"):
@@ -250,14 +256,26 @@ def _fused_external_kernel(local_experts, topk, packed_routed_weights=False):
             path = (base / relative).resolve()
             if path.is_dir() and path not in include_dirs:
                 include_dirs.append(path)
+    if publish_only:
+        return pl.jit.extern(core_type="aiv", source=wrapper, include_dirs=tuple(include_dirs))
     return pl.jit.extern(core_type="mixed", aic_source=wrapper, aiv_source=wrapper,
                          dual_aiv_dispatch=True, include_dirs=tuple(include_dirs))
 
 
 @lru_cache(maxsize=None)
-def specialize_mega_moe(local_experts, topk, packed_routed_weights=False):
+def specialize_mega_moe(local_experts, topk, packed_routed_weights=False, *, overlap_decode_input=False):
     """Bind the model entry's local expert count and route width to its mixed-core kernel."""
-    @_fused_external_kernel(local_experts, topk, packed_routed_weights)
+    prepublished = overlap_decode_input and EP_WORLD_SIZE == 8 and (
+        (MOE_TOKENS in (96, 192, 384) and (local_experts, topk) in ((48, 6), (16, 3)))
+        or (MOE_TOKENS == 384 and (local_experts, topk) == (12, 6))
+    )
+
+    @_fused_external_kernel(local_experts, topk, packed_routed_weights, publish_only=True)
+    def _publish_input(x: pl.Tensor, out: pl.Out[pl.Tensor], window: pl.InOut[pld.DistributedTensor],
+                       active: pl.Scalar[pl.INT32]) -> pl.Tensor:
+        return out
+
+    @_fused_external_kernel(local_experts, topk, packed_routed_weights, prepublished=prepublished)
     def _fused_experts(
         indices: pl.Tensor, x: pl.Tensor, weights: pl.Tensor,
         w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor,
@@ -291,6 +309,12 @@ def specialize_mega_moe(local_experts, topk, packed_routed_weights=False):
         workspace: pld.DistributedTensor,
         num_tokens: pl.Scalar[pl.INT32],
     ):
+        if prepublished:
+            clusters = pl.system.available_cluster_count()
+            workers = clusters * 2
+            # The mixed task consumes the published output and communication window in the AUTO scope.
+            with pl.spmd(workers, name_hint="moe_input_publication"):
+                output = _publish_input(normalized, output, workspace, num_tokens)
         with pl.spmd(pl.system.available_cluster_count(), sync_start=True, name_hint="moe_fused") as ready:
             output = _fused_experts(
                 indices, normalized, weights,

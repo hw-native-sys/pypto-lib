@@ -3495,6 +3495,11 @@ __aicore__ inline deep_gemm::layout::SymBuffer<> bind_pypto_sym_buffer(
 #include "mx_quant.hpp"
 namespace v41_official_input {
 
+inline constexpr bool kActiveInputPublication = MOE_EP == 8 && (
+    (((MOE_EXPERTS == 48 && MOE_TOPK == 6) || (MOE_EXPERTS == 16 && MOE_TOPK == 3)) &&
+     (MOE_TOKENS == 96 || MOE_TOKENS == 192 || MOE_TOKENS == 384)) ||
+    (MOE_EXPERTS == 12 && MOE_TOPK == 6 && MOE_TOKENS == 384));
+
 using namespace pto;
 
 template <typename T, int R, int C>
@@ -3609,7 +3614,9 @@ __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
 
     constexpr uint32_t chunks = width / 1024;
     static_assert(width % 1024 == 0);
-    for (uint32_t task = aiv_idx; task < (config.num_max_tokens_per_rank / rows) * chunks; task += topology.vectors()) {
+    const uint32_t row_tiles = kActiveInputPublication ? (active + rows - 1) / rows :
+                                                        config.num_max_tokens_per_rank / rows;
+    for (uint32_t task = aiv_idx; task < row_tiles * chunks; task += topology.vectors()) {
         const uint32_t first = (task / chunks) * rows;
         const uint32_t col = (task % chunks) * 1024;
         // Pack four adjacent 256-column groups so each scale row is a full DMA block.
@@ -3652,8 +3659,10 @@ __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
     }
     for (uint32_t first = aiv_idx * rows; first < config.num_max_tokens_per_rank;
          first += topology.vectors() * rows) {
-        pipe_barrier(PIPE_ALL);
-        dsb(DSB_DDR);
+        if constexpr (!kActiveInputPublication) {
+            pipe_barrier(PIPE_ALL);
+            dsb(DSB_DDR);
+        }
         const uint32_t tail_begin = first > active ? first : active;
         if (tail_begin < first + rows) {
             Vec<bfloat16_t, rows, width> zeros(first + rows - tail_begin, width);
@@ -3700,7 +3709,7 @@ template <typename T>
 __aicore__ inline __gm__ T* data(__gm__ int64_t* args, uint32_t index)
 {
     auto* tensor = reinterpret_cast<__gm__ Tensor*>(args[index]);
-    if constexpr (MOE_TOKENS > 80)
+    if constexpr (MOE_TOKENS > 80 && !v41_official_input::kActiveInputPublication)
         dcci(tensor, SINGLE_CACHE_LINE);
     return reinterpret_cast<__gm__ T*>(tensor->buffer.addr) + tensor->start_offset;
 }
@@ -3708,7 +3717,7 @@ __aicore__ inline __gm__ T* data(__gm__ int64_t* args, uint32_t index)
 __aicore__ inline int64_t dimension(__gm__ int64_t* args, uint32_t index, uint32_t axis)
 {
     auto* tensor = reinterpret_cast<__gm__ Tensor*>(args[index]);
-    if constexpr (MOE_TOKENS > 80) {
+    if constexpr (MOE_TOKENS > 80 && !v41_official_input::kActiveInputPublication) {
         dcci(tensor, SINGLE_CACHE_LINE);
         dcci(reinterpret_cast<__gm__ uint8_t*>(tensor) + 64, SINGLE_CACHE_LINE);
     }
@@ -3751,7 +3760,7 @@ __aicore__ inline void run(__gm__ int64_t* args, deep_gemm::CoreTopology<kFullTo
         MOE_TOPK, MOE_HIDDEN, MOE_INTER>;
     constexpr uint64_t workspace_bytes = workspace.get_num_bytes();
     const auto sym = [&]() __aicore__ {
-        if constexpr (MOE_TOKENS <= 80) {
+        if constexpr (MOE_TOKENS <= 80 || v41_official_input::kActiveInputPublication) {
             acquire_metadata(args);
             const auto acquired = bind_pypto_sym_buffer<MOE_EP, workspace_bytes>(args, 16, 18);
             validate_shapes<workspace_bytes>(args);
@@ -3773,10 +3782,12 @@ __aicore__ inline void run(__gm__ int64_t* args, deep_gemm::CoreTopology<kFullTo
     // Both asc_init and the Cube MAD direction update CTRL within this call.
     const uint64_t saved_ctrl = get_ctrl();
     asc_init();
+#ifndef MOE_PREPUBLISHED_INPUT
     v41_official_input::publish<workspace>(
         sym.template get_base_ptr<__gm__ uint8_t*>(), data<bfloat16_t>(args, 1),
         output, active, 2 * core + lane, topology);
     v41_official_input::publication_fence(lane);
+#endif
     const auto weights = deep_gemm::mega_moe::layout::make_original_weights(
         data<uint8_t>(args, 3), data<uint8_t>(args, 4), data<uint8_t>(args, 5), data<uint8_t>(args, 6),
         data<uint8_t>(args, 7), data<uint8_t>(args, 8), data<uint8_t>(args, 9), data<uint8_t>(args, 10),
@@ -3796,6 +3807,41 @@ __aicore__ inline void run(__gm__ int64_t* args, deep_gemm::CoreTopology<kFullTo
 
 } // namespace v41_official_entry
 
+#ifdef MOE_EXTERNAL_PUBLISH
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
+{
+    constexpr auto& workspace = deep_gemm::mega_moe::layout::kWorkspace<
+        MOE_EP, MOE_EP * MOE_EXPERTS, 1, MOE_TOKENS, MOE_TOPK, MOE_HIDDEN, MOE_INTER>;
+    const auto lanes = get_block_num(args);
+    if (lanes == 0 || lanes % 2 != 0) trap();
+    #pragma unroll
+    for (uint32_t i = 0; i < 3; ++i) {
+        auto* desc = reinterpret_cast<__gm__ uint8_t*>(args[i]);
+        dcci(desc, SINGLE_CACHE_LINE);
+        dcci(desc + 64, SINGLE_CACHE_LINE);
+    }
+    using v41_official_entry::dimension;
+    constexpr auto bytes = workspace.get_num_bytes();
+    if (dimension(args, 0, 0) != MOE_TOKENS || dimension(args, 0, 1) != MOE_HIDDEN ||
+        dimension(args, 1, 0) != MOE_TOKENS || dimension(args, 1, 1) != MOE_HIDDEN ||
+        dimension(args, 2, 0) < static_cast<int64_t>(bytes)) trap();
+    const auto sym = bind_pypto_sym_buffer<MOE_EP, bytes>(args, 2, 4);
+    const int32_t requested = static_cast<int32_t>(args[3]);
+    const uint32_t active = requested < 0 ? 0 : (requested > MOE_TOKENS ? MOE_TOKENS : requested);
+    const uint64_t ctrl = get_ctrl();
+    asc_init();
+    v41_official_input::publish<workspace>(
+        sym.template get_base_ptr<__gm__ uint8_t*>(), v41_official_entry::data<bfloat16_t>(args, 0),
+        v41_official_entry::data<bfloat16_t>(args, 1), active, get_block_idx(args),
+        deep_gemm::CoreTopology<false>{static_cast<uint32_t>(lanes / 2)});
+#ifdef __DAV_VEC__
+    constexpr uint64_t unit_loop = (uint64_t{1} << 21) | 1;
+    set_loop_size_ubtoout(unit_loop);
+    set_loop_size_outtoub(unit_loop);
+#endif
+    set_ctrl(ctrl);
+}
+#else
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
     const uint32_t cores = get_block_num(args);
@@ -3807,3 +3853,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     else
         v41_official_entry::run(args, deep_gemm::CoreTopology<false>{cores});
 }
+
+#endif
