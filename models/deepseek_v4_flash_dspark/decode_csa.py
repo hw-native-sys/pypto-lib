@@ -121,6 +121,7 @@ from decode_sparse_attn_csa import (
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")  # per-request axis
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+O_T_DYN = pl.dynamic("O_T_DYN")  # dense output-token prefix for TP1
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
@@ -811,7 +812,7 @@ def _decode_csa_tp1(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    x_out: pl.Out[pl.Tensor[[O_T_DYN, HC_MULT, D], pl.FP32]],
 ):
     x_hc.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(0, T_DYN)
@@ -837,7 +838,7 @@ def _decode_csa_tp1(
     inner_compress_state_block_table.bind_dynamic(0, B_DYN)
     cmp_block_table.bind_dynamic(0, B_DYN)
     idx_block_table.bind_dynamic(0, B_DYN)
-    x_out.bind_dynamic(0, T_DYN)
+    x_out.bind_dynamic(0, O_T_DYN)
     t_dim = pl.tensor.dim(x_hc, 0)
     wb_blocks = t_dim // TP1_CSA_WB_TOKEN_TILE
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
@@ -943,8 +944,13 @@ def _decode_csa_tp1(
             o_packed_heads,
             kv_seq_lens, leaf_tid, arena, cap,
         )
+        output_t = pl.tensor.dim(x_out, 0)
+        residual_rows = pl.slice(x_hc, [output_t, HC_MULT, D], [0, 0, 0])
+        post_rows = pl.slice(post_t, [output_t, HC_MULT], [0, 0])
+        comb_rows = pl.slice(comb_t, [output_t, HC_MULT * HC_MULT], [0, 0])
+        output_rows = pl.slice(x_out, [output_t, HC_MULT, D], [0, 0, 0])
         decode_o_proj_tp1_hc(
-            o_packed_heads, wo_a, wo_b, wo_b_scale, x_hc, post_t, comb_t, x_out, heads_dep,
+            o_packed_heads, wo_a, wo_b, wo_b_scale, residual_rows, post_rows, comb_rows, output_rows, heads_dep,
         )
     return x_out
 

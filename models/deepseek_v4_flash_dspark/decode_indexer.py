@@ -1473,28 +1473,36 @@ def indexer(
     cache_write_dep: pl.Scalar[pl.TASK_ID],
     DEFER_8K: pl.constexpr,
 ):
+    topk_batch_count = pl.tensor.dim(idx_block_table, 0)
+    max_topk_cache_len = 0
+    query_requests = 1
+    for topk_batch in pl.range(topk_batch_count):
+        topk_cache_len = pl.read(kv_seq_lens, [topk_batch]) // COMPRESS_RATIO
+        max_topk_cache_len = pl.max(max_topk_cache_len, topk_cache_len)
+        if topk_cache_len > 0:
+            query_requests = topk_batch + 1
+    # Score loads query panels only if the request has compressed history.
+    # Keep complete requests and every preceding slot so cache/arena indexing
+    # is unchanged even with holes. One request keeps empty-batch SPMDs valid.
+    query_rows = pl.min(query_requests * S, pl.tensor.dim(x, 0))
+    query_x = pl.slice(x, [query_rows, D], [0, 0])
     qr_hadamard_i8 = pl.create_tensor([T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T_PAD * IDX_N_HEADS, 1], dtype=pl.FP32)
     qr_bf16 = pl.create_tensor([T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
-    idx_qr_mm_tid = indexer_qr_rope(x, qr, qr_scale, wq_b, wq_b_scale, cos, sin, qr_bf16)
-    qh_acc_gm, qh_mm_tid = indexer_qr_hadamard_accumulate(x, qr_bf16, hadamard, idx_qr_mm_tid)
+    idx_qr_mm_tid = indexer_qr_rope(query_x, qr, qr_scale, wq_b, wq_b_scale, cos, sin, qr_bf16)
+    qh_acc_gm, qh_mm_tid = indexer_qr_hadamard_accumulate(query_x, qr_bf16, hadamard, idx_qr_mm_tid)
     weights_gate_dep = pl.system.task_dummy(deps=[])
-    weights_partial = indexer_weights_partials(x, weights_proj, weights_gate_dep, TP1_WEIGHTS_WORKERS)
+    weights_partial = indexer_weights_partials(query_x, weights_proj, weights_gate_dep, TP1_WEIGHTS_WORKERS)
     weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     score_coefficient = pl.create_tensor(
         [T_PAD // SCORE_QUERY_TILE * MM_ROW_TILE, IDX_N_HEADS * SCORE_QUERY_TILE],
         dtype=pl.FP16,
     )
     stream_coefficient = pl.create_tensor([STREAM_COEF_ROWS, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16)
-    topk_batch_count = pl.tensor.dim(idx_block_table, 0)
-    max_topk_cache_len = 0
-    for topk_batch in pl.range(topk_batch_count):
-        topk_cache_len = pl.read(kv_seq_lens, [topk_batch]) // COMPRESS_RATIO
-        max_topk_cache_len = pl.max(max_topk_cache_len, topk_cache_len)
     stream_score = pl.cast(max_topk_cache_len >= 32768, pl.INDEX) * STREAM_ENABLED
     stream_score = stream_score * pl.cast(topk_batch_count < 64, pl.INDEX)
     fused_tid = quant_reduce_pairs(qh_acc_gm, weights_partial, qr_hadamard_i8, qr_hadamard_scale_dq,
-                                  weights, score_coefficient, stream_coefficient, pl.tensor.dim(x, 0),
+                                  weights, score_coefficient, stream_coefficient, query_rows,
                                   stream_score, qh_mm_tid)
     topk_scores, topk_idxs, leaf_tid, arena = indexer_score_topk_forest(
         qr_hadamard_i8, qr_hadamard_scale_dq, weights, score_coefficient, stream_coefficient,

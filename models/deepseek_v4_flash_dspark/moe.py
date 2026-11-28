@@ -63,11 +63,11 @@ from expert_routed import (
     MID_TILE, MID_D_ACT_TILE, RECV_TILE, D_OUT_TILE_ACT, TILES_PER_EXPERT,
     TAIL_TILE, TAIL_D_OUT_TILE_ACT, make_expert_routed_tile,
 )
-from expert_shared import expert_shared
+from expert_shared import expert_shared, expert_shared_tile
 from eplb import make_moe_eplb
-from gate import gate
+from gate import GATE_M_TILE, gate
 from hc_post import OUT_T_DYN, hc_post
-from hc_pre import hc_pre, _hc_pre_prefill
+from hc_pre import COMB_T_TILE, _hc_pre_impl, _hc_pre_prefill, hc_pre
 from prefill_cp_token_allgather import (
     CP_KV_T_DYN as PREFILL_GROUP_T_DYN,
     CP_Q_T_DYN as PREFILL_LOCAL_T_DYN,
@@ -124,6 +124,7 @@ IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/
              # (an FP32 tile can't hold it: INDEX->FP32 casts are unsupported).
 
 # tiling
+HC_PRE_GATE_ROWS = min(T, GATE_M_TILE)
 PUSH_ROW_TILE = 16
 PREFILL_MOE_T_TILE = ((1024 + T - 1) // T) * T if T % 16 == 0 else T
 COMBINE_TOKEN_TILE = gcd(T, 4)
@@ -272,6 +273,56 @@ def combine(
 
 
 
+@pl.jit.inline(auto_scope=False)
+def _moe_hc_pre(
+    x: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    post: pl.Tensor[[T, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    output_tokens: pl.Scalar[pl.INT32],
+    output_capacity: pl.Scalar[pl.INDEX],
+):
+    # Gate reads up to one full M tile even on an owner with no local rows.
+    # HC post can separately request all rows by passing a negative count.
+    hc_rows = output_capacity
+    if output_tokens >= 0:
+        hc_rows = pl.min(output_capacity, pl.cast(output_tokens, pl.INDEX))
+    if T > GATE_M_TILE and num_tokens <= GATE_M_TILE and hc_rows <= GATE_M_TILE:
+        x_rows = pl.slice(x, [HC_PRE_GATE_ROWS, HC_MULT, D], [0, 0, 0])
+        mixed_rows = pl.slice(x_mixed, [HC_PRE_GATE_ROWS, D], [0, 0])
+        post_rows = pl.slice(post, [HC_PRE_GATE_ROWS, HC_MULT], [0, 0])
+        comb_rows = pl.slice(comb, [HC_PRE_GATE_ROWS, HC_MULT * HC_MULT], [0, 0])
+        _hc_pre_impl(x_rows, hc_fn, hc_scale, hc_base, mixed_rows, post_rows, comb_rows,
+                     LINEAR_T_TILE=16, COMB_T_TILE=COMB_T_TILE)
+    else:
+        hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+
+
+@pl.jit.inline(auto_scope=False)
+def _shared_prefix_16(
+    x_local_i8: pl.Tensor[[T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+):
+    expert_shared_tile(
+        x_local_i8, x_local_scale_dq, shared_w1, shared_w1_scale, shared_w3,
+        shared_w3_scale, shared_w2, shared_w2_scale, sh, 16, 16, 1,
+    )
+    for block in pl.spmd((T - 16) // 8, name_hint="sh_clear_tail"):
+        row = 16 + block * 8
+        sh[row : row + 8, :] = pl.full([8, D], dtype=pl.BF16, value=0.0)
+
+
 def make_moe(local_experts: int, *, enable_eplb: bool = False):
     """Specialize decode dispatch and expert storage without changing logical gate width."""
     if not 0 < local_experts <= N_EXPERTS_GLOBAL:
@@ -279,6 +330,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
     LOCAL_EXPERTS = local_experts
     LOCAL_META_SLOTS = (LOCAL_EXPERTS + 15) // 16 * 16
     PUSH_GROUPS = max(1, LOCAL_EXPERTS // N_RANKS) if T <= 8 else LOCAL_EXPERTS
+    short_shared = _shared_prefix_16 if N_RANKS == 8 and T == 128 else expert_shared
     geometry = make_expert_routed_tile(LOCAL_EXPERTS)
     expert_routed_tile = geometry.tile
     EXPERT_GROUP_TILE = geometry.expert_group_tile
@@ -318,6 +370,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
         my_rank: pl.Scalar[pl.INT32],
         # 1-based MoE call id; `arrived`/`data_arrived` are monotonic so waits use `>= moe_epoch`.
         moe_epoch: pl.Scalar[pl.INT32],
+        output_tokens: pl.Scalar[pl.INT32],
     ) -> pl.Scalar[pl.TASK_ID]:
         # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
         recv_x_out_flat = pl.reshape(recv_x_out, [LOCAL_EXPERTS * RECV_MAX, D])
@@ -390,22 +443,33 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
                     acc = acc + count
                 pl.write(recv_count_out, [e, 0], acc)
 
-        # Push source-major lanes with one block per destination and expert group.
-        with pl.spmd(N_RANKS * PUSH_GROUPS, name_hint="dispatch_push", allow_early_resolve=True) as push_tid:
+        # Each source contributes PUSH_GROUPS credits to every peer in every epoch.
+        # Short decode batches can cover four expert lanes per block after their puts.
+        push_groups = pl.const(PUSH_GROUPS, pl.INDEX)
+        notify_credits = pl.const(1, pl.INT32)
+        if T > 8 and N_RANKS == 8 and PUSH_GROUPS >= 4 and PUSH_GROUPS % 4 == 0:
+            if output_tokens >= 0 and num_tokens >= 0 and num_tokens <= 16:
+                push_groups = pl.const(PUSH_GROUPS // 4, pl.INDEX)
+                notify_credits = pl.const(4, pl.INT32)
+
+        with pl.spmd(N_RANKS * push_groups, name_hint="dispatch_push", allow_early_resolve=True) as push_tid:
             push_block = pl.tile.get_block_idx()
-            dst = push_block // PUSH_GROUPS
-            push_group = push_block - dst * PUSH_GROUPS
+            dst = push_block // push_groups
+            push_group = push_block - dst * push_groups
             active_tokens = pl.cast(num_tokens, pl.INDEX)
             if active_tokens < 0:
                 active_tokens = pl.cast(0, pl.INDEX)
             if active_tokens > T:
                 active_tokens = pl.cast(T, pl.INDEX)
 
-            for loc_e in pl.range(push_group, LOCAL_EXPERTS, PUSH_GROUPS):
+            # The expert id changes between lanes owned by one worker. The route ids
+            # and mixing weights do not, so keep one copy of each tile across lanes.
+            flat_ids = pl.tile.load(indices_flat, [0, 0], [1, N_ROUTES])
+            weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
+            for loc_e in pl.range(push_group, LOCAL_EXPERTS, push_groups):
                 e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
 
                 target_eid = pl.cast(dst * LOCAL_EXPERTS + loc_e, pl.INT32)
-                flat_ids = pl.tile.load(indices_flat, [0, 0], [1, N_ROUTES])
                 matches = pl.tile.cmps(flat_ids, target_eid, cmp_type=0)
                 # Packed predicate bytes; only their low eight bits are consumed.
                 signed_matches = pl.tile.reinterpret_view(matches, pl.INT8)
@@ -421,7 +485,6 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
                                 if (bits & (1 << bit)) != 0:
                                     pl.tile.write(routes_tile, [0, route_count], pl.cast(flat_route, pl.INT32))
                                     route_count = route_count + 1
-                weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
                 for slot_base in pl.range(0, route_count, PUSH_ROW_TILE):
                     valid_rows = pl.min(route_count - slot_base, PUSH_ROW_TILE)
                     payload = pl.tile.create([PUSH_ROW_TILE, D], dtype=pl.INT8)
@@ -446,13 +509,13 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
                     pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[row, 0])
 
             # Payload-arrival notify folded into the push: a block signals its own
-            # destination after its own puts, so a peer sees PUSH_GROUPS notifies per
+            # destination after its own puts, so a peer receives PUSH_GROUPS credits per
             # source per epoch and the wait below expects PUSH_GROUPS * moe_epoch. The
             # count must bump only after this block's puts issue in program order:
             # recv_aux / recv_route ride a non-draining remote_store and a PIPE_ALL
             # barrier is not a cross-rank DDR fence (PTOAS#872).
             if dst != my_rank:
-                pld.system.notify(target=data_arrived, peer=dst, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+                pld.system.notify(target=data_arrived, peer=dst, offsets=[my_rank, 0], value=notify_credits, op=pld.NotifyOp.AtomicAdd)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[push_tid]) as _wait_tid:
             for src in pl.range(N_RANKS):
@@ -636,6 +699,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
         num_tokens: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
         moe_epoch: pl.Scalar[pl.INT32],
+        output_tokens: pl.Scalar[pl.INT32],
     ) -> pl.Scalar[pl.TASK_ID]:
         """Run one fixed-capacity gate, expert dispatch, and combine tile."""
         x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
@@ -654,12 +718,18 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
         )
 
         shared_out = pl.create_tensor([T, D], dtype=pl.BF16)
-        expert_shared(
-            x_norm_i8, x_norm_scale,
-            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-            shared_w2, shared_w2_scale,
-            shared_out,
-        )
+        # A small target batch uses one 16-row cube tile. The combine kernel
+        # copies the inactive part of the shared output before HC post clears it.
+        if N_RANKS == 8 and T == 128 and output_tokens == num_tokens and num_tokens >= 0 and num_tokens <= 16:
+            short_shared(
+                x_norm_i8, x_norm_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+                shared_w2, shared_w2_scale, shared_out,
+            )
+        else:
+            expert_shared(
+                x_norm_i8, x_norm_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+                shared_w2, shared_w2_scale, shared_out,
+            )
 
         recv_x_out = pl.create_tensor([LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.INT8)
         recv_scale_out = pl.create_tensor([LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32, manual_dep=True)
@@ -673,7 +743,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
             recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
             gather_ready,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            num_tokens, my_rank, moe_epoch,
+            num_tokens, my_rank, moe_epoch, output_tokens,
         )
         export_eplb(recv_count_out, eplb_load, eplb_control, layer_id, 0, dispatch_done)
 
@@ -754,7 +824,20 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
                         tile_row = tile * RECV_TILE
                         valid_rows = pl.min(RECV_TILE, expert_rows - tile_row)
                         tile_inputs_ready = gather_ready[local_e * TILES_PER_EXPERT + tile]
-                        if RECV_TILE == 64 and valid_rows > TAIL_TILE and valid_rows <= MID_TILE:
+                        if N_RANKS == 8 and T == 128 and output_tokens >= 0 and valid_rows <= 16:
+                            recv_y_small = pl.create_tensor([16, D], dtype=pl.BF16)
+                            small_ready = expert_routed_tile(
+                                recv_x_out, recv_scale_out, recv_w_out,
+                                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                                recv_count_out, recv_y_small,
+                                local_e, tile_row, valid_rows, tile_inputs_ready,
+                                16, TAIL_INTER_K, TAIL_D_OUT_TILE, TAIL_D_OUT_TILE_ACT, 1, 16,
+                            )
+                            tile_completion_tids[tile] = scatter_expert_tile(
+                                recv_y_small, recv_meta_local, recv_r_route_out, routed_y_buf,
+                                local_e, tile_row, valid_rows, small_ready,
+                            )
+                        elif RECV_TILE == 64 and valid_rows > TAIL_TILE and valid_rows <= MID_TILE:
                             recv_y_mid = pl.create_tensor([MID_TILE, D], dtype=pl.BF16)
                             mid_ready = expert_routed_tile(
                                 recv_x_out, recv_scale_out, recv_w_out,
@@ -860,7 +943,8 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
         x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
         post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
         comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-        hc_pre(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
+        _moe_hc_pre(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn,
+                    num_tokens, output_tokens, pl.tensor.dim(x_next, 0))
 
         ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
         with pl.scope():
@@ -875,7 +959,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
                 recv_meta, recv_x, recv_aux, recv_route,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 eplb_mapping, eplb_replicas, eplb_source_rows, eplb_load, eplb_control,
-                layer_id, num_tokens, my_rank, moe_epoch,
+                layer_id, num_tokens, my_rank, moe_epoch, output_tokens,
             )
             hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next, output_tokens, T_TILE=8)
 
