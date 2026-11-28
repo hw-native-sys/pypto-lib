@@ -100,6 +100,8 @@ PROJ_L1_BUFFERS = 4
 PROJ_L0_BUFFERS = 2
 QUANT_M_TILE = 16
 QUANT_K_TILE = 1280
+QUANT_SMALL_K_TILE = 512
+QUANT_PAD_K_TILE = 2 * QUANT_K_TILE
 
 
 MOE_WORKSPACE_BYTES = workspace_bytes(EP_SIZE, N_LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
@@ -188,6 +190,34 @@ def _dspark_publish_quant(
     return payload, scales
 
 
+@pl.jit.inline
+def _dspark_publish_small_quant(
+    source: pl.Tile[[QUANT_M_TILE, QUANT_SMALL_K_TILE], pl.BF16, pl.Mem.Vec],
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    k: pl.Scalar[pl.INDEX],
+):
+    padded = pl.fillpad(source, pad_value=pl.PadValue.zero)
+    full = pl.set_validshape(padded, QUANT_M_TILE, QUANT_SMALL_K_TILE)
+    data, scale = pl.quant_mx(full, group_axis=1, quant_scale_alg="ocp")
+    payload = pl.store(data, [row, k], payload)
+    packed = pl.reshape(scale, [1, QUANT_M_TILE * (QUANT_SMALL_K_TILE // MX_GROUP)])
+    offset = row * (MAIN_IN // MX_GROUP) + k // MX_GROUP * QUANT_M_TILE
+    scales = pl.store(packed, [0, offset], scales)
+    return payload, scales
+
+
+@pl.jit.inline
+def _dspark_publish_padding(payload: pl.Tensor, scales: pl.Tensor, row: pl.Scalar[pl.INDEX], k: pl.Scalar[pl.INDEX]):
+    offset = row * (MAIN_IN // MX_GROUP) + k // MX_GROUP * QUANT_M_TILE
+    zero_payload = pl.tile.full([QUANT_M_TILE, QUANT_PAD_K_TILE], dtype=pl.INT8, value=0)
+    zero_scale = pl.tile.full([1, QUANT_M_TILE * (QUANT_PAD_K_TILE // MX_GROUP)], dtype=pl.UINT8, value=0)
+    payload = pl.store(pl.reinterpret_view(zero_payload, pl.FP8E4M3FN), [row, k], payload)
+    scales = pl.store(pl.reinterpret_view(zero_scale, pl.FP8E8M0), [0, offset], scales)
+    return payload, scales
+
+
 @pl.jit.inline(auto_scope=False)
 def dspark_proj(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
@@ -210,72 +240,81 @@ def dspark_proj(
             with pl.at(level=pl.Level.CORE_GROUP):
                 worker = pl.tile.get_block_idx()
                 block_workers = pl.tile.get_block_num()
-                quant_tasks = padded_rows // QUANT_M_TILE * (MAIN_IN // QUANT_K_TILE)
                 for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                     first_task = worker * 2 + lane
                     task_stride = block_workers * 2
-                    active_tasks = (batch_rows + QUANT_M_TILE - 1) // QUANT_M_TILE * (MAIN_IN // QUANT_K_TILE)
-                    pairs = pl.max(0, (active_tasks - first_task + task_stride - 1) // (2 * task_stride))
-                    for pair in pl.range(pairs):
-                        work0 = first_task + pair * 2 * task_stride
-                        work1 = work0 + task_stride
-                        row0 = work0 // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
-                        row1 = work1 // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
-                        k0 = work0 % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
-                        k1 = work1 % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
-                        rows0 = pl.min(QUANT_M_TILE, batch_rows - row0)
-                        rows1 = pl.min(QUANT_M_TILE, batch_rows - row1)
-                        source0: pl.Tile[
-                            [QUANT_M_TILE, QUANT_K_TILE], pl.BF16, pl.MemRef("quant_input_ub", slots=2)[0], pl.Mem.Vec,
-                        ] = pl.load(
-                            target_hidden, [batch_start + row0, k0], [QUANT_M_TILE, QUANT_K_TILE],
-                            valid_shape=[rows0, QUANT_K_TILE],
-                        )
-                        source1: pl.Tile[
-                            [QUANT_M_TILE, QUANT_K_TILE], pl.BF16, pl.MemRef("quant_input_ub", slots=2)[1], pl.Mem.Vec,
-                        ] = pl.load(
-                            target_hidden, [batch_start + row1, k1], [QUANT_M_TILE, QUANT_K_TILE],
-                            valid_shape=[rows1, QUANT_K_TILE],
-                        )
-                        payload, scales = _dspark_publish_quant(source0, payload, scales, row0, k0)
-                        payload, scales = _dspark_publish_quant(source1, payload, scales, row1, k1)
-                    tail_task = first_task + pairs * 2 * task_stride
-                    for task in pl.range(tail_task, quant_tasks, task_stride):
-                        row = task // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
-                        k = task % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
-                        rows = pl.max(0, pl.min(QUANT_M_TILE, batch_rows - row))
-                        offset = row * (MAIN_IN // MX_GROUP) + k // MX_GROUP * QUANT_M_TILE
-                        if rows > 0:
-                            # Keep the next input load independent of the previous quantized writeback.
-                            source: pl.Tile[
-                                [QUANT_M_TILE, QUANT_K_TILE], pl.BF16,
-                                pl.MemRef("quant_input_ub", slots=2)[0], pl.Mem.Vec,
+                    if batch_rows <= QUANT_M_TILE:
+                        # Assign active chunks and padded chunks to disjoint tasks.
+                        active_chunks = MAIN_IN // QUANT_SMALL_K_TILE
+                        pad_chunks = MAIN_IN // QUANT_PAD_K_TILE
+                        pad_tasks = (PROJ_M_TILE // QUANT_M_TILE - 1) * pad_chunks
+                        for task in pl.range(first_task, active_chunks + pad_tasks, task_stride):
+                            if task < active_chunks:
+                                k = task * QUANT_SMALL_K_TILE
+                                small_source = pl.load(
+                                    target_hidden, [batch_start, k], [QUANT_M_TILE, QUANT_SMALL_K_TILE],
+                                    valid_shape=[batch_rows, QUANT_SMALL_K_TILE],
+                                )
+                                payload, scales = _dspark_publish_small_quant(small_source, payload, scales, 0, k)
+                            else:
+                                pad_task = task - active_chunks
+                                row = (1 + pad_task // pad_chunks) * QUANT_M_TILE
+                                k = pad_task % pad_chunks * QUANT_PAD_K_TILE
+                                payload, scales = _dspark_publish_padding(payload, scales, row, k)
+                    else:
+                        active_tasks = (batch_rows + QUANT_M_TILE - 1) // QUANT_M_TILE * (MAIN_IN // QUANT_K_TILE)
+                        pairs = pl.max(0, (active_tasks - first_task + task_stride - 1) // (2 * task_stride))
+                        for pair in pl.range(pairs):
+                            work0 = first_task + pair * 2 * task_stride
+                            work1 = work0 + task_stride
+                            row0 = work0 // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
+                            row1 = work1 // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
+                            k0 = work0 % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
+                            k1 = work1 % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
+                            rows0 = pl.min(QUANT_M_TILE, batch_rows - row0)
+                            rows1 = pl.min(QUANT_M_TILE, batch_rows - row1)
+                            source0: pl.Tile[
+                                [QUANT_M_TILE, QUANT_K_TILE], pl.BF16, pl.MemRef("quant_input_ub", slots=2)[0], pl.Mem.Vec,
                             ] = pl.load(
-                                target_hidden,
-                                [batch_start + row, k],
-                                [QUANT_M_TILE, QUANT_K_TILE],
+                                target_hidden, [batch_start + row0, k0], [QUANT_M_TILE, QUANT_K_TILE],
+                                valid_shape=[rows0, QUANT_K_TILE],
+                            )
+                            source1: pl.Tile[
+                                [QUANT_M_TILE, QUANT_K_TILE], pl.BF16, pl.MemRef("quant_input_ub", slots=2)[1], pl.Mem.Vec,
+                            ] = pl.load(
+                                target_hidden, [batch_start + row1, k1], [QUANT_M_TILE, QUANT_K_TILE],
+                                valid_shape=[rows1, QUANT_K_TILE],
+                            )
+                            payload, scales = _dspark_publish_quant(source0, payload, scales, row0, k0)
+                            payload, scales = _dspark_publish_quant(source1, payload, scales, row1, k1)
+                        tail_task = first_task + pairs * 2 * task_stride
+                        for task in pl.range(tail_task, active_tasks, task_stride):
+                            row = task // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
+                            k = task % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
+                            rows = pl.min(QUANT_M_TILE, batch_rows - row)
+                            source: pl.Tile[
+                                [QUANT_M_TILE, QUANT_K_TILE], pl.BF16, pl.MemRef("quant_input_ub", slots=2)[0], pl.Mem.Vec,
+                            ] = pl.load(
+                                target_hidden, [batch_start + row, k], [QUANT_M_TILE, QUANT_K_TILE],
                                 valid_shape=[rows, QUANT_K_TILE],
                             )
                             payload, scales = _dspark_publish_quant(source, payload, scales, row, k)
-                        else:
-                            data_bytes = pl.tile.full(
-                                [QUANT_M_TILE, QUANT_K_TILE], dtype=pl.INT8, value=0
-                            )
-                            scale_bytes = pl.tile.full(
-                                [1, QUANT_M_TILE * (QUANT_K_TILE // MX_GROUP)],
-                                dtype=pl.UINT8,
-                                value=0,
-                            )
-                            payload = pl.store(
-                                pl.reinterpret_view(data_bytes, pl.FP8E4M3FN), [row, k], payload
-                            )
-                            scales = pl.store(
-                                pl.reinterpret_view(scale_bytes, pl.FP8E8M0), [0, offset], scales
-                            )
 
-                # Publish the quantized activations before Cube reads the workspace.
-                pl.system.fence()
-                pl.system.syncall(core_type=pl.KernelType.MIX)
+                        first_pad_row = (batch_rows + QUANT_M_TILE - 1) // QUANT_M_TILE * QUANT_M_TILE
+                        pad_tasks = (padded_rows - first_pad_row) // QUANT_M_TILE * (MAIN_IN // QUANT_PAD_K_TILE)
+                        for task in pl.range(first_task, pad_tasks, task_stride):
+                            row = first_pad_row + task // (MAIN_IN // QUANT_PAD_K_TILE) * QUANT_M_TILE
+                            k = task % (MAIN_IN // QUANT_PAD_K_TILE) * QUANT_PAD_K_TILE
+                            payload, scales = _dspark_publish_padding(payload, scales, row, k)
+
+                # Every Cube worker reads activations produced by all Vector workers.
+                pl.system.barrier(pipe=pl.PipeType.ALL, core_type=pl.KernelType.AIV)
+                pl.system.syncall(core_type=pl.KernelType.AIV)
+                pl.system.set_intra_block(10, pipe=pl.PipeType.V, core_type=pl.KernelType.AIV)
+                pl.system.wait_intra_block(10, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
+                pl.system.wait_intra_block(26, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
+                pl.system.set_flag(pl.PipeType.FIX, pl.PipeType.MTE2, 6, core_type=pl.KernelType.AIC)
+                pl.system.wait_flag(pl.PipeType.FIX, pl.PipeType.MTE2, 6, core_type=pl.KernelType.AIC)
                 activation_scale = pl.tensor.view(
                     scales, [PROJ_ROWS_PER_LAUNCH, MAIN_IN // MX_GROUP], layout=pl.MX_A_ZZ
                 )
@@ -818,6 +857,7 @@ def l3_dspark_drafter(
 def build_drafter_specs():
     """One request on every DP rank, with nonzero embeddings and two context writes."""
     from golden import ScalarSpec
+    from pypto.ir.param_info import block_nz_shape
 
     dynamic_sizes = {
         "DSPARK_CONTEXT_T_DYN": 6,
@@ -863,9 +903,9 @@ def build_drafter_specs():
         annotation = parameter.annotation
         if hasattr(annotation, "shape"):
             shape = [size if isinstance(size, int) else dynamic_sizes[size.name] for size in annotation.shape]
-            if parameter.name == "main_proj_weight":
-                shape = [shape[0], D // 32, MAIN_IN // 16, 16, 32]
             dtype = dtypes[str(annotation.dtype)]
+            if annotation.layout == pl.NZ:
+                shape = block_nz_shape(shape, dtype)
             init = initial_value(parameter.name, shape, dtype)
             specs.append(forward_routed_weight_spec(
                 parameter.name, shape, dtype, init, PACK_ROUTED_WEIGHTS,

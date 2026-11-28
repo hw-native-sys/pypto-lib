@@ -761,6 +761,7 @@ def build_tensor_specs(active_requests=1):
     import torch
 
     from golden import ScalarSpec, TensorSpec
+    from pypto.ir.param_info import block_nz_shape
 
     if not 1 <= active_requests <= DECODE_BATCH:
         raise ValueError(f"active requests must be between 1 and {DECODE_BATCH}")
@@ -815,9 +816,9 @@ def build_tensor_specs(active_requests=1):
         ]
         if name == "engram_ids":
             shape = [EP_SIZE, 2 * PADDED_ROWS * TARGET_FWD_N_HASH_COLS, 1]
-        if name == "draft_main_proj_weight":
-            shape = [shape[0], D // 32, DRAFT_MAIN_IN // 16, 16, 32]
         dtype = target_fwd._torch_dtype(ann.dtype)
+        if ann.layout == pl.NZ:
+            shape = block_nz_shape(shape, dtype)
         base = target_specs.get(name)
         value = initial.get(name, base.init_value if base is not None else None)
         if name == "engram_ids":
