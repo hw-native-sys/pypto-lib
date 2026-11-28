@@ -436,13 +436,18 @@ def _gate_project_tile(
     column: pl.Scalar[pl.INDEX],
     columns: pl.constexpr,
     k_tile: pl.constexpr,
+    guard_rows: pl.constexpr,
 ):
     """Project one row group onto a contiguous expert panel."""
     width = pl.tensor.dim(x, 1)
     valid = pl.min(columns, pl.tensor.dim(gate_w, 0) - column)
     acc = pl.create_tile([GATE_M_TILE, columns], dtype=pl.FP32, target_memory=pl.Mem.Acc)
     for k0 in pl.pipeline(0, width, k_tile, stage=2):
-        left = pl.load(x, [row, k0], [GATE_M_TILE, k_tile], target_memory=pl.Mem.Mat)
+        if guard_rows:
+            valid_m = pl.min(GATE_M_TILE, pl.tensor.dim(x, 0) - row)
+            left = pl.load(x, [row, k0], [GATE_M_TILE, k_tile], valid_shape=[valid_m, k_tile], target_memory=pl.Mem.Mat)
+        else:
+            left = pl.load(x, [row, k0], [GATE_M_TILE, k_tile], target_memory=pl.Mem.Mat)
         right = pl.load(gate_w, [column, k0], [columns, k_tile], valid_shape=[valid, k_tile], target_memory=pl.Mem.Mat)
         right = pl.tile.transpose_view(right)
         acc = pl.tile.matmul_acc(acc, left, right, init_cond=k0 == 0)
@@ -451,11 +456,11 @@ def _gate_project_tile(
 
 @pl.jit.inline(auto_scope=False)
 def _gate_project(xg_buf: pl.Tensor, gate_w: pl.Tensor, active_tokens: pl.Scalar[pl.INDEX],
-                  n_experts: pl.constexpr, n_tile: pl.constexpr):
+                  n_experts: pl.constexpr, n_tile: pl.constexpr, padded_rows: pl.Scalar[pl.INDEX], guard_rows: pl.constexpr):
     """Project the active token rows onto the router experts."""
     row_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
     column_tiles = (n_experts + n_tile - 1) // n_tile
-    logits = pl.create_tensor([T_PAD, column_tiles * n_tile], dtype=pl.FP32)
+    logits = pl.create_tensor([padded_rows, column_tiles * n_tile], dtype=pl.FP32)
     tasks = row_tiles * column_tiles
     workers = pl.max(1, pl.min(tasks, pl.system.available_cluster_count()))
     with pl.spmd(workers, name_hint="gate_project"):
@@ -463,7 +468,7 @@ def _gate_project(xg_buf: pl.Tensor, gate_w: pl.Tensor, active_tokens: pl.Scalar
         for block in pl.range(worker, tasks, pl.tile.get_block_num()):
             row = block // column_tiles * GATE_M_TILE
             col = block % column_tiles * n_tile
-            acc = _gate_project_tile(xg_buf, gate_w, row, col, n_tile, 1024)
+            acc = _gate_project_tile(xg_buf, gate_w, row, col, n_tile, 1024, guard_rows)
             pl.store(acc, [row, col], logits)
     return logits
 
@@ -491,7 +496,7 @@ def _gate_project_and_select_routes(
             scores = pl.create_tile([GATE_M_TILE, 384], dtype=pl.FP32, target_memory=pl.Mem.Vec)
             for panel in pl.range(3):
                 col = panel * 128
-                acc = _gate_project_tile(xg_buf, gate_w, row, col, 128, 256)
+                acc = _gate_project_tile(xg_buf, gate_w, row, col, 128, 256, False)
                 raw = pl.tile.move(acc, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
                 raw = pl.tile.move(raw, target_memory=pl.Mem.Vec)
                 raw = pl.set_validshape(pl.tile.fillpad(raw), GATE_M_TILE, 128)
@@ -514,6 +519,35 @@ def _gate_project_and_select_routes(
     return weights
 
 
+@pl.jit.inline(auto_scope=False)
+def _route_full_width_split(
+    n_tile: pl.constexpr, guard_rows: pl.constexpr, norm: pl.Tensor, gate_w: pl.Tensor, bias: pl.Tensor,
+    active: pl.Scalar[pl.INDEX], indices: pl.Tensor, weights: pl.Tensor,
+):
+    padded_rows = ((pl.tensor.dim(norm, 0) + 15) // 16) * 16
+    logits = _gate_project(norm, gate_w, active, 384, n_tile, padded_rows, guard_rows)
+    _gate_select_routes(logits, bias, indices, weights, active, 6, 384, 384)
+
+
+@pl.jit.inline(auto_scope=False)
+def route_full_width_dynamic(
+    norm: pl.Tensor, gate_w: pl.Tensor, gate_b: pl.Tensor, num_tokens: pl.Scalar[pl.INT32],
+    indices: pl.Tensor, weights: pl.Tensor,
+):
+    """Apply the upstream 384-column gate tiling to the runtime physical extent."""
+    rows = pl.tensor.dim(norm, 0)
+    active = pl.max(0, pl.min(pl.cast(num_tokens, pl.INDEX), rows))
+    bias = pl.reshape(gate_b, [pl.tensor.dim(gate_b, 0) // 384, 384])
+    if rows % GATE_M_TILE != 0:
+        _route_full_width_split(GATE_N_TILE, True, norm, gate_w, bias, active, indices, weights)
+    elif rows >= 256:
+        _gate_project_and_select_routes(norm, gate_w, bias, indices, weights, active, 6, 384)
+    elif rows <= GATE_M_TILE:
+        _route_full_width_split(16, False, norm, gate_w, bias, active, indices, weights)
+    else:
+        _route_full_width_split(GATE_N_TILE, False, norm, gate_w, bias, active, indices, weights)
+
+
 @pl.jit.inline
 def route_tokens(
     xg_buf: pl.Tensor[[T_PAD, D], pl.BF16],
@@ -534,9 +568,9 @@ def route_tokens(
         # Use 16 expert columns when all projection tiles fit in one A5 wave.
         logits = _gate_project(
             xg_buf, gate_w, active_tokens, n_experts,
-            16 if (T_PAD // GATE_M_TILE) * ((n_experts + 15) // 16) <= 32 else GATE_N_TILE,
+            16 if (T_PAD // GATE_M_TILE) * ((n_experts + 15) // 16) <= 32 else GATE_N_TILE, T_PAD, False,
         )
-        indices, weights = _gate_select_routes(
+        _gate_select_routes(
             logits, bias, indices, weights, active_tokens, topk,
             32 if n_experts <= 32 else ((n_experts + 127) // 128) * 128, n_experts,
         )

@@ -55,7 +55,8 @@ from expert_routed import (
     ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, expert_routed_scatter,
 )
 from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
-from hc import hc_pre_moe, hc_sinkhorn, hc_post
+from hc import hc_pre_moe, hc_sinkhorn, hc_post, hc_post_live
+from hc_router import compare_live_ranks, live_prefix_contract, select_hc_router
 from input_pack import gather_rows
 
 
@@ -487,6 +488,9 @@ def make_prefill_moe(local_experts):
     experts = EP_SIZE * local_experts
     fused_experts = specialize_mega_moe(local_experts, TOPK)
 
+    cube_router = select_hc_router(experts, TOPK)
+    enabled = cube_router is not None
+
     @pl.jit.inline(auto_scope=False)
     def prefill_moe(
         x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
@@ -520,18 +524,28 @@ def make_prefill_moe(local_experts):
         post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
         residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
         ffn_input = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-        inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, ffn_input, x_mixed, num_tokens, hc_ffn_fn)
-        mixes_ready = hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+        if not enabled:
+            inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, ffn_input, x_mixed, num_tokens, hc_ffn_fn)
+            mixes_ready = hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
         # MoE transport and routed-result scope.
         with pl.scope():
             sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
             indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
             weights = pl.create_tensor([t, TOPK], dtype=pl.FP32)
-            route_tokens(
-                ffn_input, gate_weight, correction_bias, num_tokens,
-                indices, weights, n_experts=experts, topk=TOPK,
-            )
+            if enabled:
+                router_done = pl.array.create(1, pl.TASK_ID)
+                cube_router(
+                    x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
+                    x_mixed, ffn_input, next_pre_mix, post_mix, residual_mix,
+                    gate_weight, correction_bias, indices, weights, num_tokens, pl.system.available_cluster_count(), router_done,
+                )
+                mixes_ready = router_done[0]
+            else:
+                route_tokens(
+                    ffn_input, gate_weight, correction_bias, num_tokens,
+                    indices, weights, n_experts=experts, topk=TOPK,
+                )
 
             round_ready = fused_experts(
                 indices, ffn_input, weights, sublayer,
@@ -542,7 +556,10 @@ def make_prefill_moe(local_experts):
             hc_post_deps = pl.array.create(2, pl.TASK_ID)
             hc_post_deps[0] = round_ready
             hc_post_deps[1] = mixes_ready
-            hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps, dep_count=2)
+            if enabled:
+                hc_post_live(sublayer, x_hc, post_mix, residual_mix, x_next, num_tokens, deps=hc_post_deps, dep_count=2)
+            else:
+                hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps, dep_count=2)
         return x_next
 
 
@@ -617,7 +634,7 @@ def make_prefill_moe(local_experts):
             row_ids = pl.slice(slab_rows, [MOE_TOKENS], [0])
             round_hidden = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [0, 0, 0])
             round_pre = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [0, 0])
-            # Complete physical slabs publish every output row, including inactive padding.
+            # Full slabs write directly into caller storage; only the legacy path defines inactive rows.
             if full_slab:
                 round_output = pl.slice(x_next, [MOE_TOKENS, HC_MULT, D], [begin, 0, 0])
                 round_next = pl.slice(next_pre_mix, [MOE_TOKENS, HC_MULT], [begin, 0])
@@ -665,10 +682,13 @@ def make_prefill_moe(local_experts):
                         pl.write(hidden_destination, [0, 0, 0], anchor)
                     round_completion[0] = outputs_ready
                 else:
+                    copy_rows = rows
+                    if enabled:
+                        copy_rows = active
                     with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
                         worker = pl.tile.get_block_idx()
                         for row in pl.range(worker, MOE_TOKENS, 32):
-                            if row < rows:
+                            if row < copy_rows:
                                 for lane in pl.range(HC_MULT):
                                     for column in pl.range(0, D, D):
                                         hidden = round_output[row:row + 1, lane:lane + 1, column:column + D]
@@ -679,7 +699,7 @@ def make_prefill_moe(local_experts):
                         pl.system.cacheinvalid()
                         writer = pl.tile.get_block_idx()
                         for row in pl.range(writer, MOE_TOKENS):
-                            if row < rows:
+                            if row < copy_rows:
                                 for lane in pl.range(HC_MULT):
                                     value = pl.read(round_next, [row, lane])
                                     pl.write(pre_destination, [row, lane], value)
@@ -1305,7 +1325,7 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next
 
 
-def _local_hc_compare(num_tokens):
+def _local_hc_compare(num_tokens, *, active_only=False):
     """Compare the complete local-token output for every EP rank."""
     from golden.validation import ratio_reldiff
 
@@ -1359,6 +1379,8 @@ def _local_hc_compare(num_tokens):
                         f"    rank {rank} active rows [:{active}] left the "
                         f"MoE budget\n{message}"
                     )
+            if active_only:
+                continue
             for row in range(active, MOE_TOKENS):
                 ok, message = compare_region(
                     actual[rank:rank + 1, row:row + 1],
@@ -1458,6 +1480,14 @@ if __name__ == "__main__":
             "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "x_next": _local_hc_compare(counts),
         }
+
+    if live_prefix_contract(N_EXPERTS, TOPK, args.runtime_dir):
+        for name in ("x_mixed", "next_pre_mix"):
+            compare_fn[name] = compare_live_ranks(compare_fn[name], counts)
+        if VALIDATE_SLABS:
+            compare_fn["x_next"] = compare_live_ranks(compare_fn["x_next"], counts)
+        else:
+            compare_fn["x_next"] = _local_hc_compare(counts, active_only=True)
 
     result = run(
         a5_default_runtime="host_build_graph",
