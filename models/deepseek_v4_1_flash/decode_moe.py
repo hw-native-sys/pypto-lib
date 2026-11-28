@@ -50,13 +50,13 @@ from gate import gate, route_tokens
 from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
 from mega_moe import (
     FP4_PANEL_ROWS, forward_routed_weight_spec,
-    specialize_mega_moe, use_packed_decode_weights, workspace_bytes,
+    specialize_mega_moe_hc_post, use_packed_decode_weights, workspace_bytes,
 )
 from expert_routed import (
     ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
 )
-from hc import hc_pre_moe, hc_sinkhorn, hc_post
+from hc import hc_head_norm_store, hc_project_tiled, hc_sinkhorn, hc_post
 
 
 # model config
@@ -270,7 +270,8 @@ def split_moe(
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
-    inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn)
+    hc_head_norm_store(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, worker_limit=64)
+    inv_rms, partials = hc_project_tiled(x_hc, hc_ffn_fn, rms_worker_limit=64, projection_row_tile=16)
     hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
     # MoE transport and routed-result scope.
@@ -335,7 +336,7 @@ def split_moe(
 
 def make_decode_moe(local_experts, topk, packed_routed_weights=False):
     """Wire HC and routing to the fused experts specialized for this entry."""
-    fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights)
+    fused_experts = specialize_mega_moe_hc_post(local_experts, topk, packed_routed_weights)
 
     @pl.jit.inline(auto_scope=False)
     def moe(
@@ -371,7 +372,8 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
         post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
         residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
         x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
-        inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn)
+        hc_head_norm_store(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, worker_limit=64)
+        inv_rms, partials = hc_project_tiled(x_hc, hc_ffn_fn, rms_worker_limit=64, projection_row_tile=16)
         hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
         # MoE transport and routed-result scope.
@@ -387,14 +389,13 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
             else:
                 dispatch_indices = indices
 
-            sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
             fused_experts(
-                dispatch_indices, x_norm, weights, sublayer,
+                dispatch_indices, x_norm, weights,
                 routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
                 shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
                 moe_workspace, num_tokens,
+                x_hc, post_mix, residual_mix, x_next,
             )
-            hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=None, dep_count=0)
         return x_next
 
     return moe

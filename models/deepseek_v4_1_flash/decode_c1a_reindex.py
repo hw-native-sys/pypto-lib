@@ -19,11 +19,10 @@ from config import (
     INDEX_CACHE_GROUP, FLASH as M, B_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN,
     ORI_BLOCKS_DYN, TABLE_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
-from hc import hc_head_norm, hc_project, hc_sinkhorn
+from hc import hc_project, hc_sinkhorn
 from decode_indexer import c1a_index, plan_reindex_pool, score_reindex_pool
-from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
-from o_proj import o_proj_hc_post
-from sparse_attention import gather_sparse_attention
+from qkv_proj_rope import hc_qkv_quant, q_proj_rope, kv_proj, window_publish
+from o_proj import gather_project_hc_post
 
 
 # model config
@@ -86,23 +85,27 @@ def decode_c1a_reindex(
     output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
+    runs: pl.Tensor,
+    build_pool_plan: pl.Scalar[pl.BOOL],
 ):
     tokens = pl.tensor.dim(x_hc, 0)
-    x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm, worker_limit=64)
+    proj_payload, proj_scales, proj_payload_padded_rows, x_norm = hc_qkv_quant(
+        x_hc, pre_mix, attn_norm_weight, num_tokens, projection_tile=80, emit_normalized=True,
+    )
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     pool_width = pl.tensor.dim(pool_block_ids, 1) * CANDIDATE_BLOCK_SIZE
-    runs, dense_width = plan_reindex_pool(
-        index_cache, index_block_table, request_ids, compressed_lens,
-        pool_block_ids, pool_block_counts, pool_width, num_tokens,
-    )
+    dense_width = pl.min(pool_width, pl.tensor.dim(index_block_table, 1) * 128)
+    if build_pool_plan:
+        plan_reindex_pool(
+            index_cache, index_block_table, request_ids, compressed_lens,
+            pool_block_ids, pool_block_counts, pool_width, num_tokens, runs,
+        )
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = qkv_quant(x_norm, num_tokens, row_tile=80)
     qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
@@ -133,15 +136,10 @@ def decode_c1a_reindex(
         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
         runs, dense_width, topk_indices, num_tokens,
     )
-    attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    gather_sparse_attention(
+    gather_project_hc_post(
         query, window_indices, window_cache, topk_indices, compressed_cache,
-        attn_sink, attn_out, num_tokens, compressed_keys=INDEX_TOPK,
-    )
-    o_proj_hc_post(
-        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        x_hc, post_mix, residual_mix, output, num_tokens,
-        oa_row_tile=80, ob_row_tile=128,
+        attn_sink, rope_cos, rope_sin, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        x_hc, post_mix, residual_mix, output, num_tokens, compressed_keys=INDEX_TOPK,
     )
     return output
 
@@ -198,6 +196,7 @@ def l2_decode_c1a_reindex(
     index_block_table.bind_dynamic(0, B_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
     pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
+    runs = pl.create_tensor([5, pl.tensor.dim(pool_block_ids, 0) + 1], dtype=pl.INT32)
     return decode_c1a_reindex(
         x_hc, pre_mix,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -216,7 +215,7 @@ def l2_decode_c1a_reindex(
         index_wq_b, index_wq_b_scale, index_weights_proj,
         topk_indices,
         output, next_pre_mix,
-        num_tokens,
+        num_tokens, runs, True,
     )
 
 

@@ -220,13 +220,15 @@ def workspace_bytes(ep, local_experts, tokens, topk, hidden, intermediate):
     return align(offset, 2 * 1024 * 1024)
 
 
-def _fused_external_kernel(local_experts, topk, packed_routed_weights=False):
+def _fused_external_kernel(local_experts, topk, packed_routed_weights=False, *, hc_post=False):
     """Prepare a content-addressed, shape-specialized native entry."""
     if packed_routed_weights and MOE_TOKENS > 80 and MOE_TOKENS not in (192, 384):
         raise ValueError("unsupported token capacity for packed routed weights")
     kernels = Path(__file__).parent / "kernels"
     values = dict(MOE_EP=EP_WORLD_SIZE, MOE_EXPERTS=local_experts, MOE_TOKENS=MOE_TOKENS,
                   MOE_TOPK=topk, MOE_HIDDEN=D, MOE_INTER=MOE_INTER, MOE_PACKED_ROUTED_WEIGHTS=int(packed_routed_weights))
+    if hc_post:
+        values["MOE_HC_POST"] = 1
     text = "".join(f"#define {name} {value}\n" for name, value in values.items())
     text += '#include "moe_fused.cpp"\n'
     digest = hashlib.sha256(text.encode())
@@ -301,6 +303,74 @@ def specialize_mega_moe(local_experts, topk, packed_routed_weights=False):
         return ready
 
     return mega_moe
+
+
+@lru_cache(maxsize=None)
+def specialize_mega_moe_hc_post(local_experts, topk, packed_routed_weights=False):
+    """Bind the decode expert pipeline with the residual-mix epilogue."""
+    @_fused_external_kernel(local_experts, topk, packed_routed_weights, hc_post=True)
+    def _fused_experts_hc_post(
+        indices: pl.Tensor,
+        normalized: pl.Tensor,
+        weights: pl.Tensor,
+        w1: pl.Tensor,
+        w1_scale: pl.Tensor,
+        w3: pl.Tensor,
+        w3_scale: pl.Tensor,
+        w2: pl.Tensor,
+        w2_scale: pl.Tensor,
+        shared_w1: pl.Tensor,
+        shared_w1_scale: pl.Tensor,
+        shared_w3: pl.Tensor,
+        shared_w3_scale: pl.Tensor,
+        shared_w2: pl.Tensor,
+        shared_w2_scale: pl.Tensor,
+        combined: pl.Out[pl.Tensor],
+        workspace: pl.InOut[pld.DistributedTensor],
+        active_tokens: pl.Scalar[pl.INT32],
+        residual: pl.Tensor,
+        post_mix: pl.Tensor,
+        residual_mix: pl.Tensor,
+        output: pl.Out[pl.Tensor],
+    ) -> tuple[pl.Tensor, pl.Tensor]:
+        return combined, output
+
+    @pl.jit.inline(auto_scope=False)
+    def mega_moe_hc_post(
+        indices: pl.Tensor,
+        normalized: pl.Tensor,
+        weights: pl.Tensor,
+        w1: pl.Tensor,
+        w1_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+        w3: pl.Tensor,
+        w3_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+        w2: pl.Tensor,
+        w2_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+        shared_w1: pl.Tensor,
+        shared_w1_scale: pl.Tensor,
+        shared_w3: pl.Tensor,
+        shared_w3_scale: pl.Tensor,
+        shared_w2: pl.Tensor,
+        shared_w2_scale: pl.Tensor,
+        workspace: pld.DistributedTensor,
+        num_tokens: pl.Scalar[pl.INT32],
+        residual: pl.Tensor,
+        post_mix: pl.Tensor,
+        residual_mix: pl.Tensor,
+        output: pl.Tensor,
+    ):
+        combined = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+        with pl.spmd(pl.system.available_cluster_count(), sync_start=True, name_hint="moe_fused") as ready:
+            combined, output = _fused_experts_hc_post(
+                indices, normalized, weights,
+                w1, w1_scale, w3, w3_scale, w2, w2_scale,
+                shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+                combined, workspace, num_tokens,
+                residual, post_mix, residual_mix, output,
+            )
+        return ready
+
+    return mega_moe_hc_post
 
 
 # Kernel used by the independent, guarded expert-row validation below.

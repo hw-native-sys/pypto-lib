@@ -28,6 +28,9 @@
 #include "sparse_dequant_vf.hpp"
 #include "sparse_softmax_vf.hpp"
 #include "sparse_merge_vf.hpp"
+#if defined(SPARSE_GATHER_MXFP8)
+#include "sparse_quant_epilogue.hpp"
+#endif
 
 using namespace pto;
 
@@ -51,11 +54,20 @@ constexpr int ARG_COMPRESSED = 4;
 constexpr int ARG_WINDOW_INDICES = 5;
 constexpr int ARG_COMPRESSED_INDICES = 6;
 constexpr int ARG_PARTIALS = 7;
-constexpr int ARG_TOKENS = 8;
-constexpr int ARG_HEADS = 9;
-constexpr int ARG_WINDOW_KEYS = 10;
-constexpr int ARG_COMPRESSED_KEYS = 11;
-constexpr int ARG_BALANCED = 12;
+#if defined(SPARSE_GATHER_MXFP8)
+constexpr int ARG_SCALES = 8;
+constexpr int ARG_COSINE = 9;
+constexpr int ARG_SINE = 10;
+constexpr int FIRST_SCALAR = 11;
+constexpr int ARG_PADDED_ROWS = FIRST_SCALAR + 5;
+#else
+constexpr int FIRST_SCALAR = 8;
+#endif
+constexpr int ARG_TOKENS = FIRST_SCALAR;
+constexpr int ARG_HEADS = FIRST_SCALAR + 1;
+constexpr int ARG_WINDOW_KEYS = FIRST_SCALAR + 2;
+constexpr int ARG_COMPRESSED_KEYS = FIRST_SCALAR + 3;
+constexpr int ARG_BALANCED = FIRST_SCALAR + 4;
 constexpr int PARTIAL_STRIDE = 64 * (512 + 2);
 
 #if !defined(__CPU_SIM)
@@ -860,7 +872,63 @@ __aicore__ inline void softmax_publish(__gm__ int64_t* args, const TileTask& tas
     set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(EV_P_STAGE));
 }
 
+#if defined(SPARSE_GATHER_MXFP8)
+static_assert(UB_USED == sparse_quant::PayloadUb && VEC_HEADS == sparse_quant::HeadHalf);
+
+template <typename SourceTile>
+__aicore__ inline void emit_quantized(
+    __gm__ int64_t* args, SourceTile& src, int source_column, int token, int channel, event_t event) {
+    sparse_quant::PayloadTile payload;
+    sparse_quant::ScaleTile scales;
+    sparse_quant::AngleTile cos_tile, sin_tile;
+    TASSIGN(payload, sparse_quant::PayloadUb);
+    TASSIGN(scales, sparse_quant::ScalesUb);
+    TASSIGN(cos_tile, sparse_quant::CosineUb);
+    TASSIGN(sin_tile, sparse_quant::SineUb);
+    if (channel == 1) {
+        GM<float, 1, sparse_quant::RopePairs> cos_gm(
+            data<float>(args, ARG_COSINE) + int64_t(token) * row_stride(args, ARG_COSINE));
+        GM<float, 1, sparse_quant::RopePairs> sin_gm(
+            data<float>(args, ARG_SINE) + int64_t(token) * row_stride(args, ARG_SINE));
+        TLOAD(cos_tile, cos_gm);
+        TLOAD(sin_tile, sin_gm);
+        // P staging uses EVENT_ID7 on a separate V<->MTE3 event domain.
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID7);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID7);
+    }
+    sparse_quant::quantize_channel<SourceTile>(
+        payload, scales, src, cos_tile, sin_tile, source_column, channel == 1);
+    sparse_quant::store_channel(
+        payload, scales, data<uint8_t>(args, ARG_OUTPUT), data<uint8_t>(args, ARG_SCALES),
+        token, get_sub_block_id(args) * VEC_HEADS, channel, event);
+}
+
+__aicore__ inline void pad_quantized_rows(__gm__ int64_t* args) {
+    const int rows = args[ARG_TOKENS], padded = args[ARG_PADDED_ROWS];
+    if (rows + get_block_idx(args) >= padded) return;
+    sparse_quant::PayloadTile payload;
+    sparse_quant::ScaleTile scales;
+    TASSIGN(payload, sparse_quant::PayloadUb);
+    TASSIGN(scales, sparse_quant::ScalesUb);
+    TEXPANDS(payload, uint8_t(0));
+    TEXPANDS(scales, uint8_t(0));
+    const int head = get_sub_block_id(args) * VEC_HEADS;
+    for (int token = rows + get_block_idx(args); token < padded; token += get_block_num(args)) {
+        for (int channel = 0; channel < 2; ++channel) {
+            sparse_quant::store_channel(
+                payload, scales, data<uint8_t>(args, ARG_OUTPUT), data<uint8_t>(args, ARG_SCALES),
+                token, head, channel, EVENT_ID0);
+        }
+    }
+}
+#endif
+
 __aicore__ inline void store_channel(__gm__ int64_t* args, const TileTask& task, int channel) {
+#if defined(SPARSE_GATHER_MXFP8)
+    ResultBf16 result;
+    TASSIGN(result, channel * PV_CHANNEL_BYTES + PV_ROW_HALF_BYTES);
+    emit_quantized(args, result, 0, task.token, channel, static_cast<event_t>(channel));
+#else
     set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(channel));
     wait_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(channel));
     const int valid = valid_heads_of(args);
@@ -879,6 +947,7 @@ __aicore__ inline void store_channel(__gm__ int64_t* args, const TileTask& task,
     }
     set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(channel));
     wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(channel));
+#endif
     set_intra_block(PIPE_V, FLAG_PV_FREE + channel);
 }
 
@@ -1188,15 +1257,28 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
                 for (int pause = 0; pause < 50; ++pause) asm volatile("nop");
             }
             // Main-loop users are drained; the reducer reuses their UB storage.
+#if defined(SPARSE_GATHER_MXFP8)
+            sparse_merge::Result result;
+            sparse_merge::combine(
+                result, data<float>(args, ARG_PARTIALS), data<float>(args, ARG_SINK),
+                row_stride(args, ARG_SINK), args[ARG_HEADS], boundary, head);
+            for (int channel = 0; channel < 2; ++channel) {
+                emit_quantized(args, result, channel * 256, cut / parts, channel, static_cast<event_t>(channel));
+            }
+#else
             sparse_merge::reduce(
                 data<float>(args, ARG_PARTIALS), data<bfloat16_t>(args, ARG_OUTPUT), data<float>(args, ARG_SINK),
                 row_stride(args, ARG_OUTPUT), row_stride(args, ARG_SINK), args[ARG_HEADS], boundary, head, cut / parts);
+#endif
         }
     } else {
         if (parts == 5) attend_vector<5, false>(args);
         else if (parts == 1) attend_vector<1, false>(args);
         else attend_vector<0, false>(args);
     }
+#if defined(SPARSE_GATHER_MXFP8)
+    pad_quantized_rows(args);
+#endif
 #endif
 #endif
 }

@@ -37,7 +37,7 @@ WORKERS = 32
 LI_INCLUDES = (pto_isa_include_dir(), CANN / "asc", CANN / "asc/include",
                CANN / "asc/include/basic_api", CANN / "include")
 # Stage tags in the lightning_indexer.cpp task ABI.
-METADATA, ATTENTION, SCORE, POOL, SCORE_CANDIDATES = range(5)
+METADATA, ATTENTION, SCORE, ATTENTION_WITH_POOL, SCORE_CANDIDATES = range(5)
 
 
 @pl.jit.extern(core_type="aiv", aiv_source=LI_SOURCE, include_dirs=LI_INCLUDES)
