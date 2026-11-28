@@ -389,6 +389,7 @@ def _quant_o_vf_schedule(
     scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, O_IN_SCALE_COLS], pl.FP8E8M0]],
     active_rows: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
+    fixed_workers: pl.constexpr,
 ):
     """Inverse-rotate BF16 tails and produce grouped MXFP8 payload and scales."""
     scale_block_rows = padded_rows // O_QUANT_SCALE_BLOCK
@@ -397,7 +398,10 @@ def _quant_o_vf_schedule(
     # Form the view before pl.spmd.
     scale_stride = O_QUANT_HEADS_PER_GROUP * O_QUANT_SCALE_COLS
     scale_view = pl.reshape(scales, [LOCAL_O_GROUPS * pl.tensor.dim(scales, 1) // scale_stride, scale_stride])
-    workers = pl.max(1, pl.min(O_QUANT_HEADS, 2 * pl.system.available_cluster_count()))
+    if fixed_workers:
+        workers = fixed_workers
+    else:
+        workers = pl.max(1, pl.min(O_QUANT_HEADS, 2 * pl.system.available_cluster_count()))
     with pl.spmd(workers, name_hint="quant_o_vf_pypto") as published:
         worker = pl.tile.get_block_idx()
         worker_count = pl.tile.get_block_num()
@@ -566,22 +570,27 @@ def quant_o_vf_pypto(
     if padded_rows <= O_QUANT_ROW_TILE:
         published = _quant_o_vf_schedule(
             O_QUANT_ROW_TILE, 0, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+            fixed_workers=0,
         )
     elif full_rows >= 8 * O_QUANT_PREFETCH_ROW_TILE:
         published = _quant_o_vf_schedule(
             O_QUANT_PREFETCH_ROW_TILE, 8, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+            fixed_workers=0,
         )
     elif full_rows >= 6 * O_QUANT_PREFETCH_ROW_TILE:
         published = _quant_o_vf_schedule(
             O_QUANT_PREFETCH_ROW_TILE, 6, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+            fixed_workers=0,
         )
     elif full_rows >= 5 * O_QUANT_PREFETCH_ROW_TILE:
         published = _quant_o_vf_schedule(
             O_QUANT_PREFETCH_ROW_TILE, 5, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+            fixed_workers=0,
         )
     else:
         published = _quant_o_vf_schedule(
             O_QUANT_PREFETCH_ROW_TILE, 4, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+            fixed_workers=0,
         )
     return published
 

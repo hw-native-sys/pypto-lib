@@ -120,6 +120,57 @@ def _gather_compact_sparse_vf_rows(
 
 
 @pl.jit.inline(auto_scope=False)
+def _submit_sparse_attention(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    sink: pl.Tensor,
+    active_output: pl.Tensor,
+    partials: pl.Tensor,
+    partials_size: pl.Scalar[pl.INDEX],
+    num_tokens: pl.Scalar[pl.INT32],
+    workers: pl.Scalar[pl.INT32],
+    balanced: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+    plan_pool: pl.Scalar[pl.INT32] = 0,
+):
+    if balanced != 0:
+        ready_offset = 2 * workers * 64 * (HEAD_DIM + 2)
+        flat_partials = pl.reshape(partials, [1, partials_size])
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sparse_gather_reset") as reset:
+            flags = pl.tile.full([1, 2 * SPARSE_VF_WORKER_TILE], dtype=pl.FP32, value=0.0)
+            flags = pl.tile.set_validshape(flags, 1, 2 * workers)
+            pl.store(flags, [0, ready_offset], flat_partials)
+        with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[reset]) as attended:
+            _gather_sparse_vf_rows(
+                active_output, query, sink, window, compressed,
+                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                balanced, cache_mode=compressed_keys,
+            )
+    elif compressed_keys == INDEX_TOPK and num_tokens >= SPARSE_VF_WORKER_TILE and plan_pool:
+        parts = (WINDOW_KEYS + compressed_keys) // 128
+        tiles_per_worker = ((num_tokens + workers - 1) // workers) * parts
+        plan_cols = 128 + ((tiles_per_worker + 127) // 128) * 128
+        compact_plan = pl.create_tensor([workers * plan_cols], dtype=pl.INT32)
+        with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
+            _gather_compact_sparse_vf_rows(
+                active_output, query, sink, window, compressed,
+                window_indices, compressed_indices, compact_plan, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                pl.cast(2, pl.INT32), cache_mode=compressed_keys,
+            )
+    else:
+        with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
+            _gather_sparse_vf_rows(
+                active_output, query, sink, window, compressed,
+                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                balanced, cache_mode=compressed_keys,
+            )
+    return attended
+
+
+@pl.jit.inline(auto_scope=False)
 def gather_sparse_attention(
     query: pl.Tensor,
     window_indices: pl.Tensor,
@@ -157,37 +208,10 @@ def gather_sparse_attention(
     page_rows = pl.max(1, pl.tensor.dim(compressed, 1))
     batch_pages = (num_tokens + page_rows - 1) // page_rows
     plan_pool = num_tokens >= INDEX_TOPK or pl.tensor.dim(compressed, 0) <= batch_pages + 1
-    if balanced != 0:
-        ready_offset = 2 * workers * 64 * (HEAD_DIM + 2)
-        flat_partials = pl.reshape(partials, [1, partials_size])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sparse_gather_reset") as reset:
-            flags = pl.tile.full([1, 2 * SPARSE_VF_WORKER_TILE], dtype=pl.FP32, value=0.0)
-            flags = pl.tile.set_validshape(flags, 1, 2 * workers)
-            pl.store(flags, [0, ready_offset], flat_partials)
-        with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[reset]) as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
-    elif compressed_keys == INDEX_TOPK and num_tokens >= SPARSE_VF_WORKER_TILE and plan_pool:
-        tiles_per_worker = ((num_tokens + workers - 1) // workers) * parts
-        plan_cols = 128 + ((tiles_per_worker + 127) // 128) * 128
-        compact_plan = pl.create_tensor([workers * plan_cols], dtype=pl.INT32)
-        with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
-            _gather_compact_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, compact_plan, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                pl.cast(2, pl.INT32), cache_mode=compressed_keys,
-            )
-    else:
-        with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
-    return attended
+    return _submit_sparse_attention(
+        query, window_indices, window, compressed_indices, compressed, sink,
+        active_output, partials, partials_size, num_tokens, workers, balanced, compressed_keys, plan_pool,
+    )
 
 
 @pl.jit.inline(auto_scope=False)
