@@ -581,38 +581,19 @@ def _filter_logits(
     top_k: pl.Scalar[pl.INT32],
     top_p: pl.Scalar[pl.FP32],
     nucleus_first: pl.constexpr,
+    fast_verify: pl.constexpr = False,
 ):
     _scale_logits(logits, row, filtered_logits, scratch_row, row_max, temperature)
     if nucleus_first:
         if top_p > 0.0 and top_p < 1.0:
-            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row, False)
+            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row, fast_verify)
         if top_k > 0 and top_k < VOCAB:
-            _apply_top_k_row(filtered_logits, top_k, scratch_row, False)
+            _apply_top_k_row(filtered_logits, top_k, scratch_row, fast_verify)
     else:
         if top_k > 0 and top_k < VOCAB:
-            _apply_top_k_row(filtered_logits, top_k, scratch_row, False)
+            _apply_top_k_row(filtered_logits, top_k, scratch_row, fast_verify)
         if top_p > 0.0 and top_p < 1.0:
-            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row, False)
-    return filtered_logits
-
-
-@pl.jit.inline
-def _verify_filter_logits(
-    logits: pl.Tensor,
-    row: pl.Scalar[pl.INDEX],
-    filtered_logits: pl.Tensor,
-    scratch_row: pl.Scalar[pl.INDEX],
-    probabilities: pl.Tensor,
-    row_max: pl.Scalar[pl.FP32],
-    temperature: pl.Scalar[pl.FP32],
-    top_k: pl.Scalar[pl.INT32],
-    top_p: pl.Scalar[pl.FP32],
-):
-    _scale_logits(logits, row, filtered_logits, scratch_row, row_max, temperature)
-    if top_p > 0.0 and top_p < 1.0:
-        _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row, True)
-    if top_k > 0 and top_k < VOCAB:
-        _apply_top_k_row(filtered_logits, top_k, scratch_row, True)
+            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row, fast_verify)
     return filtered_logits
 
 
@@ -647,7 +628,7 @@ def _sample_row(
         if use_top_k or use_top_p:
             _filter_logits(
                 logits, row, filtered_logits, scratch_row, probabilities,
-                row_max, temperature, top_k, top_p, False,
+                row_max, temperature, top_k, top_p, False, False,
             )
             zero = pl.cast(0.0, pl.FP32)
             one = pl.cast(1.0, pl.FP32)
@@ -1009,8 +990,9 @@ def dspark_rejection_sample(
                 top_k = pl.read(top_ks, [row])
                 top_p = pl.read(top_ps, [row])
                 if (top_k > 0 and top_k < VOCAB) or (top_p > 0.0 and top_p < 1.0):
-                    _verify_filter_logits(
-                        logits, row, filtered_logits, worker, probabilities, row_max, temperature, top_k, top_p,
+                    _filter_logits(
+                        logits, row, filtered_logits, worker, probabilities,
+                        row_max, temperature, top_k, top_p, True, True,
                     )
                     normalizer = _store_exp_weights(filtered_logits, residual_weights, worker)
                 else:

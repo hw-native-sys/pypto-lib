@@ -231,7 +231,8 @@ def markov_propose(
                     maximum = _row_max(scores, request)
                     if (top_k > 0 and top_k < VOCAB) or (top_p > 0.0 and top_p < 1.0):
                         _filter_logits(
-                            scores, request, filtered, request, weights, maximum, temperature, top_k, top_p, True,
+                            scores, request, filtered, request, weights,
+                            maximum, temperature, top_k, top_p, True, False,
                         )
                 row_data = pl.full([1, 8], dtype=pl.FP32, value=0.0)
                 pl.write(row_data, [0, 0], maximum)
@@ -522,6 +523,7 @@ def build_proposal_specs():
 
 
 def golden_proposal_test(tensors):
+    markov_w2 = tensors["markov_w2"].float()
     proposal_probs = tensors["proposal_probs"].view(-1, DSPARK_QUERY_WIDTH, VOCAB)
     for request in range(proposal_probs.shape[0]):
         params_row = request * DECODE_SEQ
@@ -533,7 +535,7 @@ def golden_proposal_test(tensors):
         previous = int(tensors["anchor_ids"][request])
         for step in range(DSPARK_QUERY_WIDTH):
             embedding = tensors["markov_w1"][previous].float()
-            bias = tensors["markov_w2"].float() @ embedding
+            bias = markov_w2 @ embedding
             scores = tensors["base_logits"][request, step] + bias
             if temperature == 0:
                 previous = int(scores.argmax())
