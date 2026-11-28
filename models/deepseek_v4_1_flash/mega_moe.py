@@ -237,8 +237,10 @@ def _fused_external_kernel(local_experts, topk, packed_routed_weights=False, *, 
                   MOE_TOPK=topk, MOE_HIDDEN=D, MOE_INTER=MOE_INTER, MOE_PACKED_ROUTED_WEIGHTS=int(packed_routed_weights))
     if entry == "publish":
         values["MOE_PUBLISH_ONLY"] = 1
-    elif entry == "prepared":
+    elif entry in ("prepared", "decode"):
         values["MOE_INPUT_PREPARED"] = 1
+        if entry == "decode":
+            values["MOE_HC_POST"] = 1
     text = "".join(f"#define {name} {value}\n" for name, value in values.items())
     text += '#include "moe_fused.cpp"\n'
     digest = hashlib.sha256(text.encode())
@@ -269,18 +271,43 @@ def _fused_external_kernel(local_experts, topk, packed_routed_weights=False, *, 
 
 
 @lru_cache(maxsize=None)
+def _specialize_moe_input(local_experts, topk, packed_routed_weights):
+    @_fused_external_kernel(local_experts, topk, packed_routed_weights, entry="publish")
+    def _publish_moe_input(
+        normalized: pl.Tensor, output: pl.Out[pl.Tensor], workspace: pl.InOut[pld.DistributedTensor],
+        active_tokens: pl.Scalar[pl.INT32],
+    ) -> pl.Tensor:
+        return output
+
+    return _publish_moe_input
+
+
+@lru_cache(maxsize=None)
+def specialize_decode_mega_moe(local_experts, topk, packed_routed_weights=False):
+    """Bind decode input publication and the expert kernel that writes the next HC state."""
+    @_fused_external_kernel(local_experts, topk, packed_routed_weights, entry="decode")
+    def _fused_experts_hc_post(
+        indices: pl.Tensor, x: pl.Tensor, weights: pl.Tensor,
+        w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor,
+        w2: pl.Tensor, w2_scale: pl.Tensor,
+        shared_w1: pl.Tensor, shared_w1_scale: pl.Tensor,
+        shared_w3: pl.Tensor, shared_w3_scale: pl.Tensor,
+        shared_w2: pl.Tensor, shared_w2_scale: pl.Tensor,
+        output: pl.Out[pl.Tensor], workspace: pl.InOut[pld.DistributedTensor],
+        active_tokens: pl.Scalar[pl.INT32],
+        residual: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
+        next_hidden: pl.Out[pl.Tensor],
+    ) -> tuple[pl.Tensor, pld.DistributedTensor, pl.Tensor]:
+        return output, workspace, next_hidden
+
+    publish_input = _specialize_moe_input(local_experts, topk, packed_routed_weights)
+    return publish_input, _fused_experts_hc_post
+
+
+@lru_cache(maxsize=None)
 def specialize_mega_moe(local_experts, topk, packed_routed_weights=False, *, separate_input=False):
     """Bind the model entry's local expert count and route width to its mixed-core kernel."""
-    if separate_input:
-        @_fused_external_kernel(local_experts, topk, packed_routed_weights, entry="publish")
-        def _publish_moe_input(
-            normalized: pl.Tensor, output: pl.Out[pl.Tensor], workspace: pl.InOut[pld.DistributedTensor],
-            active_tokens: pl.Scalar[pl.INT32],
-        ) -> pl.Tensor:
-            return output
-    else:
-        _publish_moe_input = None
-
+    _publish_moe_input = _specialize_moe_input(local_experts, topk, packed_routed_weights) if separate_input else None
     entry = "prepared" if separate_input else "fused"
 
     @_fused_external_kernel(local_experts, topk, packed_routed_weights, entry=entry)

@@ -50,7 +50,7 @@ from gate import gate, route_tokens
 from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
 from mega_moe import (
     FP4_PANEL_ROWS, forward_routed_weight_spec,
-    specialize_mega_moe, use_packed_decode_weights, workspace_bytes,
+    specialize_decode_mega_moe, specialize_mega_moe, use_packed_decode_weights, workspace_bytes,
 )
 from expert_routed import (
     ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, dispatch,
@@ -339,7 +339,15 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
     """Wire HC and routing to the fused experts specialized for this entry."""
     # On the four-local-expert EP8 drafter, six rows of HC collapse share each AIV tile.
     collapse_row_tile = 6 if (EP_SIZE, MOE_TOKENS, topk, local_experts) == (8, 384, 3, 4) else PRE_NORM_STORE_T_TILE
-    fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights, separate_input=True)
+    # Larger decode capacities use the independently scheduled HC post.
+    fuse_hc_post = MOE_TOKENS <= 80
+    if fuse_hc_post:
+        publish_input, fused_hc = specialize_decode_mega_moe(local_experts, topk, packed_routed_weights)
+        fused_experts = None
+    else:
+        publish_input = None
+        fused_hc = None
+        fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights, separate_input=True)
 
     @pl.jit.inline(auto_scope=False)
     def moe(
@@ -394,13 +402,24 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
                 dispatch_indices = indices
 
             sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
-            fused_experts(
-                dispatch_indices, x_norm, weights, sublayer,
-                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-                shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
-                moe_workspace, num_tokens,
-            )
-            hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=None, dep_count=0)
+            if fuse_hc_post:
+                with pl.spmd(pl.system.available_aiv_count(), name_hint="moe_publish_input"):
+                    publish_input(x_norm, sublayer, moe_workspace, num_tokens)
+                with pl.spmd(pl.system.available_cluster_count(), sync_start=True, name_hint="moe_fused"):
+                    sublayer, moe_workspace, x_next = fused_hc(
+                        dispatch_indices, x_norm, weights,
+                        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+                        sublayer, moe_workspace, num_tokens, x_hc, post_mix, residual_mix, x_next,
+                    )
+            else:
+                fused_experts(
+                    dispatch_indices, x_norm, weights, sublayer,
+                    routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                    shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+                    moe_workspace, num_tokens,
+                )
+                hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=None, dep_count=0)
         return x_next
 
     return moe

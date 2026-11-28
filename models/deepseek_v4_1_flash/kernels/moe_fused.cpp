@@ -3341,14 +3341,14 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
 
 template <uint32_t kNumRanks, uint32_t kNumExperts, uint32_t kNumSharedExperts,
           uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden,
-          bool kFullTopology>
+          bool kFullTopology, typename PostCombine>
 __aicore__ inline void mega_moe_device(__gm__ bfloat16_t* output, __gm__ int32_t* cumulative_local_expert_recv_stats,
                                             const layout::Weights& weights,
                                             uint32_t num_tokens, float activation_clamp,
                                             layout::SymBuffer<> sym_buffer, uint32_t logical_core_idx, uint32_t logical_subblock_idx,
-                                            CoreTopology<kFullTopology> topology
-                                            , __gm__ uint32_t* local_route_ids, __gm__ uint32_t* local_route_weights
-                                            ) {
+                                            CoreTopology<kFullTopology> topology,
+                                            __gm__ uint32_t* local_route_ids, __gm__ uint32_t* local_route_weights,
+                                            PostCombine post_combine) {
     constexpr auto& workspace = layout::kWorkspace<kNumRanks, kNumExperts, kNumSharedExperts,
                                                    kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden>;
     constexpr auto& config = workspace.config;
@@ -3386,10 +3386,20 @@ __aicore__ inline void mega_moe_device(__gm__ bfloat16_t* output, __gm__ int32_t
     const uint32_t aiv_idx = 2 * core_idx + subblock_idx;
 
     // Overlap mode revisits round-robin tokens; the final-only path uses contiguous ranges
+#if defined(MOE_HC_POST)
+    // Share partial waves across all AIVs before each owner expands its rows to FP32.
+    const uint32_t even_rows = num_tokens / topology.vectors();
+    const uint32_t extra_rows = num_tokens % topology.vectors();
+    const uint32_t first_token_idx = kOverlapReduce ? aiv_idx : aiv_idx * even_rows + min(aiv_idx, extra_rows);
+    const uint32_t num_reduce_tokens = kOverlapReduce ?
+        (num_tokens > aiv_idx ? ceil_div(num_tokens - aiv_idx, topology.vectors()) : 0) :
+        even_rows + (aiv_idx < extra_rows);
+#else
     const uint32_t first_token_idx = kOverlapReduce ? aiv_idx : min(aiv_idx * ceil_div(num_tokens, topology.vectors()), num_tokens);
     const uint32_t num_reduce_tokens = kOverlapReduce ?
         (num_tokens > aiv_idx ? ceil_div(num_tokens - aiv_idx, topology.vectors()) : 0) :
         min(ceil_div(num_tokens, topology.vectors()), num_tokens - first_token_idx);
+#endif
     CombineReduceState<workspace, kFullTopology> reduce{.token_idx = first_token_idx, .num_remaining_tokens = num_reduce_tokens};
     reduce.local_route_ids = local_route_ids;
 
@@ -3442,6 +3452,8 @@ __aicore__ inline void mega_moe_device(__gm__ bfloat16_t* output, __gm__ int32_t
 
     combine_reduce<workspace, kOverlapReduce>(buffer, output, num_tokens, rank_idx, aiv_idx, reduce, sym_buffer, topology);
 
+    // A dependent Cube projection can read any residual row after MIX completion.
+    post_combine(aiv_idx, first_token_idx, num_reduce_tokens);
     // Notify AIC after final output stores
     asc_sync_block_arrive(PIPE_MTE3, kCombineDoneID);
     asc_sync_pipe(PIPE_ALL);
@@ -3723,6 +3735,105 @@ __aicore__ inline void publication_fence(uint32_t subblock)
 
 namespace v41_official_entry {
 
+#if defined(MOE_HC_POST)
+constexpr uint32_t kResidualArg = 17;
+constexpr uint32_t kPostMixArg = 18;
+constexpr uint32_t kResidualMixArg = 19;
+constexpr uint32_t kNextHiddenArg = 20;
+constexpr uint32_t kActiveTokensArg = 21;
+#else
+constexpr uint32_t kActiveTokensArg = 17;
+#endif
+constexpr uint32_t kPeerTableArg = kActiveTokensArg + 1;
+
+#if defined(MOE_HC_POST) && defined(__DAV_VEC__)
+constexpr uint32_t kHcStreams = 4;
+constexpr uint32_t kHcWidth = MOE_HIDDEN;
+constexpr uint32_t kHcRows = 2;
+
+__simd_vf__ inline void mix_hc_row(
+    __ubuf__ bfloat16_t* combined, __ubuf__ float* residual, __ubuf__ float* post, __ubuf__ float* mix
+) {
+    constexpr uint32_t channels = sizeof(vector_bfloat16_t) / sizeof(bfloat16_t);
+    static_assert(kHcWidth % channels == 0);
+    const auto mask = asc_create_mask_b32(PAT_ALL);
+    vector_bfloat16_t zeros;
+    asc_duplicate_scalar(zeros, 0);
+    vector_float post_coefficient[kHcStreams], mix_coefficient[kHcStreams][kHcStreams];
+    #pragma unroll
+    for (uint32_t out = 0; out < kHcStreams; ++out) {
+        asc_loadalign_brc_elem(post_coefficient[out], post + out);
+        #pragma unroll
+        for (uint32_t in = 0; in < kHcStreams; ++in)
+            asc_loadalign_brc_elem(mix_coefficient[in][out], mix + in * kHcStreams + out);
+    }
+    for (uint32_t column = 0; column < kHcWidth; column += channels) {
+        vector_bfloat16_t packed;
+        vector_float input[2];
+        asc_loadalign(packed, combined + column);
+        asc_intlv(reinterpret_cast<vector_bfloat16_t&>(input[0]),
+                  reinterpret_cast<vector_bfloat16_t&>(input[1]), zeros, packed);
+        vector_float old[kHcStreams][2];
+        #pragma unroll
+        for (uint32_t stream = 0; stream < kHcStreams; ++stream) {
+            asc_loadalign(old[stream][0], residual + stream * kHcWidth + column);
+            asc_loadalign(old[stream][1], residual + stream * kHcWidth + column + channels / 2);
+        }
+        #pragma unroll
+        for (uint32_t stream = 0; stream < kHcStreams; ++stream) {
+            vector_float value[2];
+            asc_mul(value[0], input[0], post_coefficient[stream], mask);
+            asc_mul(value[1], input[1], post_coefficient[stream], mask);
+            #pragma unroll
+            for (uint32_t input_stream = 0; input_stream < kHcStreams; ++input_stream) {
+                asc_mula(value[0], old[input_stream][0], mix_coefficient[input_stream][stream], mask);
+                asc_mula(value[1], old[input_stream][1], mix_coefficient[input_stream][stream], mask);
+            }
+            asc_storealign(residual + stream * kHcWidth + column, value[0], mask);
+            asc_storealign(residual + stream * kHcWidth + column + channels / 2, value[1], mask);
+        }
+    }
+}
+
+__aicore__ inline void store_hc_rows(
+    uint32_t token, uint32_t rows, __gm__ bfloat16_t* combined, __gm__ float* residual, __gm__ float* post,
+    __gm__ float* mix, __gm__ float* output
+) {
+    using deep_gemm::copy_gm_to_ub;
+    using deep_gemm::copy_ub_to_gm;
+    constexpr uint32_t residual_offset = kHcRows * kHcWidth * sizeof(bfloat16_t);
+    constexpr uint32_t row_width = kHcStreams * kHcWidth;
+    constexpr uint32_t post_offset = residual_offset + kHcRows * row_width * sizeof(float);
+    constexpr uint32_t mix_offset = post_offset + 32;
+    static_assert(kHcRows * kHcStreams * sizeof(float) == 32);
+    static_assert(mix_offset + kHcRows * kHcStreams * kHcStreams * sizeof(float) <= deep_gemm::UBSizeBytes);
+    auto* combined_ub = reinterpret_cast<__ubuf__ bfloat16_t*>(0);
+    auto* residual_ub = reinterpret_cast<__ubuf__ float*>(residual_offset);
+    auto* post_ub = reinterpret_cast<__ubuf__ float*>(post_offset);
+    auto* mix_ub = reinterpret_cast<__ubuf__ float*>(mix_offset);
+    const uint64_t combined_offset = static_cast<uint64_t>(token) * kHcWidth;
+    const uint64_t row_offset = combined_offset * kHcStreams;
+    const uint32_t hidden_elements = rows * kHcWidth;
+    const uint32_t residual_elements = rows * row_width;
+    const uint32_t post_elements = rows * kHcStreams;
+    const uint32_t mix_elements = post_elements * kHcStreams;
+    copy_gm_to_ub(combined_ub, combined + combined_offset, 1, hidden_elements, hidden_elements * sizeof(bfloat16_t));
+    copy_gm_to_ub(residual_ub, residual + row_offset, 1, residual_elements, residual_elements * sizeof(float));
+    copy_gm_to_ub(post_ub, post + token * kHcStreams, 1, post_elements, post_elements * sizeof(float));
+    copy_gm_to_ub(mix_ub, mix + token * kHcStreams * kHcStreams, 1, mix_elements, mix_elements * sizeof(float));
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    for (uint32_t row = 0; row < rows; ++row)
+        mix_hc_row(combined_ub + row * kHcWidth, residual_ub + row * row_width,
+                   post_ub + row * kHcStreams, mix_ub + row * kHcStreams * kHcStreams);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    copy_ub_to_gm(output + row_offset, residual_ub, 1, residual_elements, residual_elements * sizeof(float));
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+}
+#endif
+
 template <typename T>
 __aicore__ inline __gm__ T* data(__gm__ int64_t* args, uint32_t index)
 {
@@ -3744,6 +3855,11 @@ __aicore__ inline void acquire_metadata(__gm__ int64_t* args)
     #pragma unroll
     for (uint32_t index = 0; index < 16; ++index)
         dcci(reinterpret_cast<__gm__ Tensor*>(args[index]), SINGLE_CACHE_LINE);
+#if defined(MOE_HC_POST)
+    #pragma unroll
+    for (uint32_t index = kResidualArg; index <= kNextHiddenArg; ++index)
+        dcci(reinterpret_cast<__gm__ Tensor*>(args[index]), SINGLE_CACHE_LINE);
+#endif
     // The symmetric binding acquires argument 16's first metadata line.
     dcci(reinterpret_cast<__gm__ uint8_t*>(args[0]) + 64, SINGLE_CACHE_LINE);
     dcci(reinterpret_cast<__gm__ uint8_t*>(args[1]) + 64, SINGLE_CACHE_LINE);
@@ -3777,7 +3893,7 @@ __aicore__ inline void run(__gm__ int64_t* args, deep_gemm::CoreTopology<kFullTo
         MOE_TOPK, MOE_HIDDEN, MOE_INTER>;
     constexpr uint64_t workspace_bytes = workspace.get_num_bytes();
     acquire_metadata(args);
-    const auto sym = bind_pypto_sym_buffer<MOE_EP, workspace_bytes>(args, 16, 18);
+    const auto sym = bind_pypto_sym_buffer<MOE_EP, workspace_bytes>(args, 16, kPeerTableArg);
     validate_shapes<workspace_bytes>(args);
     const uint32_t core = get_block_idx(args);
 #ifdef __DAV_VEC__
@@ -3785,7 +3901,7 @@ __aicore__ inline void run(__gm__ int64_t* args, deep_gemm::CoreTopology<kFullTo
 #else
     const uint32_t lane = 0;
 #endif
-    const uint32_t active = active_tokens(static_cast<int32_t>(args[17]));
+    const uint32_t active = active_tokens(static_cast<int32_t>(args[kActiveTokensArg]));
     auto* output = data<bfloat16_t>(args, 15);
     // Both asc_init and the Cube MAD direction update CTRL within this call.
     const uint64_t saved_ctrl = get_ctrl();
@@ -3800,9 +3916,31 @@ __aicore__ inline void run(__gm__ int64_t* args, deep_gemm::CoreTopology<kFullTo
         data<uint8_t>(args, 3), data<uint8_t>(args, 4), data<uint8_t>(args, 5), data<uint8_t>(args, 6),
         data<uint8_t>(args, 7), data<uint8_t>(args, 8), data<uint8_t>(args, 9), data<uint8_t>(args, 10),
         data<uint8_t>(args, 11), data<uint8_t>(args, 12), data<uint8_t>(args, 13), data<uint8_t>(args, 14));
+    const auto post_combine = [&](uint32_t aiv, uint32_t first, uint32_t count) __aicore__ {
+#if defined(MOE_HC_POST) && defined(__DAV_VEC__)
+        // The reduce has drained its stores. Reuse its UB for the four FP32 streams.
+        asc_sync_pipe(PIPE_ALL);
+        auto* residual = data<float>(args, kResidualArg);
+        auto* post_mix = data<float>(args, kPostMixArg);
+        auto* residual_mix = data<float>(args, kResidualMixArg);
+        auto* next_hidden = data<float>(args, kNextHiddenArg);
+        const uint32_t vectors = topology.vectors();
+        if constexpr (workspace.config.overlap_reduce()) {
+            for (uint32_t row = 0; row < count; ++row)
+                store_hc_rows(first + row * vectors, 1, output, residual, post_mix, residual_mix, next_hidden);
+        } else {
+            for (uint32_t row = 0; row < count; row += kHcRows)
+                store_hc_rows(first + row, min(kHcRows, count - row), output, residual, post_mix, residual_mix, next_hidden);
+        }
+        // Assign the padding from the last AIV down, where the active partition can leave idle lanes.
+        for (uint32_t token = active + (vectors - 1 - aiv); token < MOE_TOKENS; token += vectors)
+            store_hc_rows(token, 1, output, residual, post_mix, residual_mix, next_hidden);
+#endif
+    };
     deep_gemm::mega_moe::mega_moe_device<MOE_EP, MOE_EP * MOE_EXPERTS, 1,
         MOE_TOKENS, MOE_TOPK, MOE_HIDDEN, MOE_INTER>(
-        output, nullptr, weights, active, 10.0f, sym, core, lane, topology, data<uint32_t>(args, 0), data<uint32_t>(args, 2));
+        output, nullptr, weights, active, 10.0f, sym, core, lane, topology,
+        data<uint32_t>(args, 0), data<uint32_t>(args, 2), post_combine);
     // The core drains its event credits and all pipes before returning. Keep
     // the PTO unit-repeat DMA convention and restore the caller's CTRL.
 #ifdef __DAV_VEC__
