@@ -23,6 +23,8 @@ from quant import (
     pack_quantized_cache, unpack_quantized_cache,
 )
 
+from utils import materialize_cpp_specialization
+
 # model config
 HEAD_DIM = M.head_dim
 LOCAL_H = M.num_attention_heads
@@ -119,12 +121,17 @@ def _gather_compact_sparse_vf_rows(
     ...
 
 
+_KERNEL_DIR = Path(__file__).parent / "kernels"
+_MXFP8_GATHER_SOURCE = materialize_cpp_specialization(
+    _KERNEL_DIR / "sparse_gather_vf.cpp", {"SPARSE_GATHER_MXFP8": 1},
+)
+
 
 @pl.jit.extern(
     core_type="mixed",
-    aic_source=Path(__file__).parent / "kernels/sparse_gather_mxfp8.cpp",
-    aiv_source=Path(__file__).parent / "kernels/sparse_gather_mxfp8.cpp",
-    include_dirs=(pto_isa_include_dir(), Path(__file__).parent / "kernels"),
+    aic_source=_MXFP8_GATHER_SOURCE,
+    aiv_source=_MXFP8_GATHER_SOURCE,
+    include_dirs=(pto_isa_include_dir(), _KERNEL_DIR),
     dual_aiv_dispatch=True,
 )
 def _gather_sparse_mxfp8(

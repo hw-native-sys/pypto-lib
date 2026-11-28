@@ -11,7 +11,6 @@
 """DeepSeek-V4.1 fused shared and routed experts with distributed transport."""
 
 import argparse
-import hashlib
 import os
 from pathlib import Path
 from functools import lru_cache
@@ -20,6 +19,8 @@ import torch
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
+
+from utils import materialize_cpp_specialization
 
 
 if __name__ == "__main__":
@@ -229,21 +230,7 @@ def _fused_external_kernel(local_experts, topk, packed_routed_weights=False, *, 
                   MOE_TOPK=topk, MOE_HIDDEN=D, MOE_INTER=MOE_INTER, MOE_PACKED_ROUTED_WEIGHTS=int(packed_routed_weights))
     if hc_post:
         values["MOE_HC_POST"] = 1
-    text = "".join(f"#define {name} {value}\n" for name, value in values.items())
-    text += '#include "moe_fused.cpp"\n'
-    digest = hashlib.sha256(text.encode())
-    for name in ("moe_fused.cpp", "mx_quant.hpp"):
-        digest.update((kernels / name).read_bytes())
-    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
-    directory = cache / "pypto-lib" / "moe-fused" / digest.hexdigest()
-    wrapper = directory / "entry.cpp"
-    if not wrapper.exists():
-        directory.mkdir(parents=True, exist_ok=True)
-        temporary = directory / f"entry.{os.getpid()}.tmp"
-        temporary.write_text(text)
-        temporary.replace(wrapper)
-    elif wrapper.read_text() != text:
-        raise RuntimeError("Fused MoE source cache mismatch")
+    wrapper = materialize_cpp_specialization(kernels / "moe_fused.cpp", values, headers=("mx_quant.hpp",))
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/latest"))
     from pypto.runtime import pto_isa_include_dir
     include_dirs = [kernels, pto_isa_include_dir()]

@@ -8,10 +8,37 @@
 # -----------------------------------------------------------------------------------------------------------
 """Shared Host utilities, metadata lowering, and validation helpers."""
 
+import hashlib
+import os
+import tempfile
+from pathlib import Path
+
 import torch
 
 import config as C
 from config import BLOCK_SIZE, FLASH as M
+
+
+def materialize_cpp_specialization(source: Path, defines: dict[str, int], *, headers: tuple[str, ...] = ()) -> Path:
+    """Publish a cached C++ entry with compile-time defines for an existing kernel."""
+    text = "".join(f"#define {name} {value}\n" for name, value in defines.items())
+    text += f'#include "{source.name}"\n'
+    digest = hashlib.sha256(text.encode())
+    for dependency in (source, *(source.with_name(name) for name in headers)):
+        digest.update(dependency.read_bytes())
+    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    directory = cache / "pypto-lib" / source.stem.replace("_", "-") / digest.hexdigest()
+    entry = directory / "entry.cpp"
+    if entry.is_file():
+        if entry.read_text() != text:
+            raise RuntimeError(f"C++ specialization source cache mismatch for {source.name}")
+        return entry
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=directory) as staging:
+        temporary = Path(staging) / entry.name
+        temporary.write_text(text)
+        temporary.replace(entry)
+    return entry
 
 
 def forward_replay_weight_shapes(runtime_dir):
