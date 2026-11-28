@@ -246,6 +246,7 @@ def _apply_top_k_row(
     scaled_logits: pl.Tensor,
     top_k: pl.Scalar[pl.INT32],
     row: pl.Scalar[pl.INDEX],
+    fast_verify: pl.constexpr = False,
 ):
     # Signed IEEE magnitude keys preserve finite FP32 order, including zero ties.
     search_lower = pl.cast(-2139095039, pl.INT64)
@@ -256,34 +257,39 @@ def _apply_top_k_row(
     tail_scores = pl.reshape(tail_flat, [tail_rows, TOPK_ROW_WIDTH_TILE])
     tail_padded = pl.full([SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
     tail_padded[:tail_rows, :] = tail_scores
+    cutoff_found = pl.cast(0, pl.INT32)
     for search_step in pl.range(TOPK_SEARCH_STEPS):
-        midpoint = search_lower + (search_upper - search_lower + pl.cast(1, pl.INT64)) // pl.cast(2, pl.INT64)
-        pivot_bits_scalar = pl.cast(midpoint, pl.INT32)
-        if midpoint < 0:
-            pivot_bits_scalar = pl.cast(-midpoint - pl.cast(2147483648, pl.INT64), pl.INT32)
-        pivot_bits = pl.full([8, 8], dtype=pl.INT32, value=0)
-        pl.write(pivot_bits, [0, 0], pivot_bits_scalar)
-        pivot_values = pl.reinterpret_view(pivot_bits, pl.FP32)
-        pivot = pl.read(pivot_values, [0, 0])
-        tail_mask = pl.cmp(tail_padded, pivot, cmp_type=5)
-        tail_counts = pl.row_sum(tail_mask)
-        counts = pl.mul(tail_counts, 0.0)
-        for count_block in pl.range(VOCAB // PROBE_WIDTH_TILE):
-            count_start = count_block * PROBE_WIDTH_TILE
-            count_flat = scaled_logits[row : row + 1, count_start : count_start + PROBE_WIDTH_TILE]
-            count_scores = pl.reshape(count_flat, [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE])
-            count_mask = pl.cmp(count_scores, pivot, cmp_type=5)
-            count_rows = pl.row_sum(count_mask)
-            counts = pl.add(counts, count_rows)
-        count = pl.cast(0, pl.INT32)
-        for lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
-            count = count + pl.cast(pl.read(counts, [lane, 0]), pl.INT32)
-        for lane in pl.range(tail_rows):
-            count = count + pl.cast(pl.read(tail_counts, [lane, 0]), pl.INT32)
-        if count >= top_k:
-            search_lower = midpoint
-        else:
-            search_upper = midpoint - pl.cast(1, pl.INT64)
+        if cutoff_found == 0:
+            midpoint = search_lower + (search_upper - search_lower + pl.cast(1, pl.INT64)) // pl.cast(2, pl.INT64)
+            pivot_bits_scalar = pl.cast(midpoint, pl.INT32)
+            if midpoint < 0:
+                pivot_bits_scalar = pl.cast(-midpoint - pl.cast(2147483648, pl.INT64), pl.INT32)
+            pivot_bits = pl.full([8, 8], dtype=pl.INT32, value=0)
+            pl.write(pivot_bits, [0, 0], pivot_bits_scalar)
+            pivot_values = pl.reinterpret_view(pivot_bits, pl.FP32)
+            pivot = pl.read(pivot_values, [0, 0])
+            tail_mask = pl.cmp(tail_padded, pivot, cmp_type=5)
+            tail_counts = pl.row_sum(tail_mask)
+            counts = pl.mul(tail_counts, 0.0)
+            for count_block in pl.range(VOCAB // PROBE_WIDTH_TILE):
+                count_start = count_block * PROBE_WIDTH_TILE
+                count_flat = scaled_logits[row : row + 1, count_start : count_start + PROBE_WIDTH_TILE]
+                count_scores = pl.reshape(count_flat, [SAMPLE_BLOCK_ROWS_TILE, TOPK_ROW_WIDTH_TILE])
+                count_mask = pl.cmp(count_scores, pivot, cmp_type=5)
+                count_rows = pl.row_sum(count_mask)
+                counts = pl.add(counts, count_rows)
+            count = pl.cast(0, pl.INT32)
+            for lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
+                count = count + pl.cast(pl.read(counts, [lane, 0]), pl.INT32)
+            for lane in pl.range(tail_rows):
+                count = count + pl.cast(pl.read(tail_counts, [lane, 0]), pl.INT32)
+            if count >= top_k:
+                search_lower = midpoint
+            else:
+                search_upper = midpoint - pl.cast(1, pl.INT64)
+            if fast_verify:
+                if count == top_k:
+                    cutoff_found = pl.cast(1, pl.INT32)
 
     boundary_bits_scalar = pl.cast(search_lower, pl.INT32)
     if search_lower < 0:
@@ -390,11 +396,27 @@ def _top_p_mass(
 
 
 @pl.jit.inline
+def _next_probability_below(probabilities: pl.Tensor, row: pl.Scalar[pl.INDEX], upper: pl.Scalar[pl.FP32]):
+    maxima = pl.full([SAMPLE_BLOCK_ROWS_TILE, TEMPERATURE_WIDTH_TILE], dtype=pl.FP32, value=0.0)
+    for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
+        flat = probabilities[row : row + 1, start : start + ARGMAX_BLOCK_TILE]
+        scores = pl.reshape(flat, [SAMPLE_BLOCK_ROWS_TILE, TEMPERATURE_WIDTH_TILE])
+        below = pl.mul(scores, pl.cmp(scores, upper, cmp_type=2))
+        maxima = pl.maximum(maxima, below)
+    peak_lanes = pl.row_max(maxima)
+    peak = pl.cast(0.0, pl.FP32)
+    for lane in pl.range(SAMPLE_BLOCK_ROWS_TILE):
+        peak = pl.max(peak, pl.read(peak_lanes, [lane, 0]))
+    return peak
+
+
+@pl.jit.inline
 def _apply_top_p_row(
     scaled_logits: pl.Tensor,
     top_p: pl.Scalar[pl.FP32],
     probabilities: pl.Tensor,
     row: pl.Scalar[pl.INDEX],
+    fast_verify: pl.constexpr = False,
 ):
     row_max = pl.cast(FP32_NEG_INF, pl.FP32)
     for max_block in pl.range(VOCAB // PROBE_WIDTH_TILE):
@@ -459,17 +481,33 @@ def _apply_top_p_row(
         # Nucleus boundary: largest probability value whose tail mass still reaches top_p.
         search_lower = pl.cast(0, pl.INT64)
         search_upper = pl.cast(TOPP_ABOVE_ONE_BITS, pl.INT64)
-        for search_step in pl.range(TOPP_SEARCH_STEPS):
-            midpoint = search_lower + (search_upper - search_lower + pl.cast(1, pl.INT64)) // pl.cast(2, pl.INT64)
-            pivot_bits = pl.full([8, 8], dtype=pl.INT32, value=0)
-            pl.write(pivot_bits, [0, 0], pl.cast(midpoint, pl.INT32))
-            pivot_values = pl.reinterpret_view(pivot_bits, pl.FP32)
-            pivot = pl.read(pivot_values, [0, 0])
-            probe_mass = _top_p_mass(probabilities, row, pivot)
-            if probe_mass >= top_p:
-                search_lower = midpoint
-            else:
-                search_upper = midpoint - pl.cast(1, pl.INT64)
+        boundary_found = pl.cast(0, pl.INT32)
+        if fast_verify:
+            # Start with the two greatest distinct FP32 probabilities. If the
+            # crossing occurs there, the exact boundary is already known.
+            peak = _row_max(probabilities, row)
+            peak_mass = _top_p_mass(probabilities, row, peak)
+            if peak_mass < top_p:
+                peak = _next_probability_below(probabilities, row, peak)
+                peak_mass = _top_p_mass(probabilities, row, peak)
+            if peak > 0.0 and peak_mass >= top_p:
+                known = pl.full([8, 8], dtype=pl.FP32, value=0.0)
+                pl.write(known, [0, 0], peak)
+                bits = pl.reinterpret_view(known, pl.INT32)
+                search_lower = pl.cast(pl.read(bits, [0, 0]), pl.INT64)
+                boundary_found = pl.cast(1, pl.INT32)
+        if boundary_found == 0:
+            for search_step in pl.range(TOPP_SEARCH_STEPS):
+                midpoint = search_lower + (search_upper - search_lower + pl.cast(1, pl.INT64)) // pl.cast(2, pl.INT64)
+                pivot_bits = pl.full([8, 8], dtype=pl.INT32, value=0)
+                pl.write(pivot_bits, [0, 0], pl.cast(midpoint, pl.INT32))
+                pivot_values = pl.reinterpret_view(pivot_bits, pl.FP32)
+                pivot = pl.read(pivot_values, [0, 0])
+                probe_mass = _top_p_mass(probabilities, row, pivot)
+                if probe_mass >= top_p:
+                    search_lower = midpoint
+                else:
+                    search_upper = midpoint - pl.cast(1, pl.INT64)
 
         if search_lower > 0:
             boundary_bits = pl.full([8, 8], dtype=pl.INT32, value=0)
@@ -547,14 +585,34 @@ def _filter_logits(
     _scale_logits(logits, row, filtered_logits, scratch_row, row_max, temperature)
     if nucleus_first:
         if top_p > 0.0 and top_p < 1.0:
-            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row)
+            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row, False)
         if top_k > 0 and top_k < VOCAB:
-            _apply_top_k_row(filtered_logits, top_k, scratch_row)
+            _apply_top_k_row(filtered_logits, top_k, scratch_row, False)
     else:
         if top_k > 0 and top_k < VOCAB:
-            _apply_top_k_row(filtered_logits, top_k, scratch_row)
+            _apply_top_k_row(filtered_logits, top_k, scratch_row, False)
         if top_p > 0.0 and top_p < 1.0:
-            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row)
+            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row, False)
+    return filtered_logits
+
+
+@pl.jit.inline
+def _verify_filter_logits(
+    logits: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    filtered_logits: pl.Tensor,
+    scratch_row: pl.Scalar[pl.INDEX],
+    probabilities: pl.Tensor,
+    row_max: pl.Scalar[pl.FP32],
+    temperature: pl.Scalar[pl.FP32],
+    top_k: pl.Scalar[pl.INT32],
+    top_p: pl.Scalar[pl.FP32],
+):
+    _scale_logits(logits, row, filtered_logits, scratch_row, row_max, temperature)
+    if top_p > 0.0 and top_p < 1.0:
+        _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row, True)
+    if top_k > 0 and top_k < VOCAB:
+        _apply_top_k_row(filtered_logits, top_k, scratch_row, True)
     return filtered_logits
 
 
@@ -666,13 +724,28 @@ def _store_exp_weights(
 
 
 @pl.jit.inline
-def _categorical_tile_mass(tile: pl.Tensor):
-    grid = pl.reshape(tile, [8, CATEGORICAL_WIDTH_TILE // 8])
-    row_masses = pl.row_sum(grid)
-    total = pl.cast(0.0, pl.FP32)
-    for row in pl.range(8):
-        total = total + pl.read(row_masses, [row, 0])
-    return total
+def _verify_unfiltered_weights(
+    logits: pl.Tensor,
+    weights_out: pl.Tensor,
+    worker: pl.Scalar[pl.INDEX],
+    src_row: pl.Scalar[pl.INDEX],
+    row_max: pl.Scalar[pl.FP32],
+    temperature: pl.Scalar[pl.FP32],
+):
+    sums = pl.full([ARGMAX_ROWS_TILE, ARGMAX_WIDTH_TILE], dtype=pl.FP32, value=0.0)
+    for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
+        score = logits[src_row : src_row + 1, start : start + ARGMAX_BLOCK_TILE]
+        scaled = pl.div(pl.sub(score, row_max), temperature)
+        exp_score = pl.exp(scaled)
+        weights_out[worker : worker + 1, start : start + ARGMAX_BLOCK_TILE] = exp_score
+        weights = pl.reshape(exp_score, [ARGMAX_ROWS_TILE, ARGMAX_WIDTH_TILE])
+        sums = pl.add(sums, weights)
+    partial_sums = pl.row_sum(sums)
+    normalizer = pl.cast(0.0, pl.FP32)
+    for lane in pl.range(ARGMAX_ROWS_TILE):
+        normalizer = normalizer + pl.read(partial_sums, [lane, 0])
+
+    return normalizer
 
 
 @pl.jit.inline
@@ -681,10 +754,20 @@ def _categorical_sample(
     row: pl.Scalar[pl.INDEX],
     uniform: pl.Scalar[pl.FP32],
 ):
+    # Cache each mass in UB so the CDF search reuses the original FP32 sums.
+    block_masses = pl.full([1, (VOCAB // CATEGORICAL_WIDTH_TILE + 7) // 8 * 8], dtype=pl.FP32, value=0.0)
     total = pl.cast(0.0, pl.FP32)
-    for start in pl.range(0, VOCAB, CATEGORICAL_WIDTH_TILE):
-        tile = weights[row : row + 1, start : start + CATEGORICAL_WIDTH_TILE]
-        total = total + _categorical_tile_mass(tile)
+    # Batch 5 original tiles per DMA. The 32-lane row reductions and both
+    # FP32 accumulation orders remain identical to the scalar-tile sampler.
+    for base in pl.range(0, VOCAB, 5 * CATEGORICAL_WIDTH_TILE):
+        group = weights[row : row + 1, base : base + 5 * CATEGORICAL_WIDTH_TILE]
+        partials = pl.row_sum(pl.reshape(group, [5 * 8, CATEGORICAL_WIDTH_TILE // 8]))
+        for block in pl.range(5):
+            mass = pl.cast(0.0, pl.FP32)
+            for lane in pl.range(8):
+                mass = mass + pl.read(partials, [block * 8 + lane, 0])
+            pl.write(block_masses, [0, base // CATEGORICAL_WIDTH_TILE + block], mass)
+            total = total + mass
 
     threshold = uniform * total
     cumulative = pl.cast(0.0, pl.FP32)
@@ -693,8 +776,7 @@ def _categorical_sample(
     local_threshold = pl.cast(0.0, pl.FP32)
     for start in pl.range(0, VOCAB, CATEGORICAL_WIDTH_TILE):
         if selected_tile < 0:
-            tile = weights[row : row + 1, start : start + CATEGORICAL_WIDTH_TILE]
-            mass = _categorical_tile_mass(tile)
+            mass = pl.read(block_masses, [0, start // CATEGORICAL_WIDTH_TILE])
             if mass > 0.0:
                 last_tile = start
                 if threshold < cumulative + mass:
@@ -724,7 +806,7 @@ def _categorical_sample(
 
 @pl.jit.inline
 def _verify_stochastic_row(
-    filtered_logits: pl.Tensor,
+    normalizer: pl.Scalar[pl.FP32],
     correction_logits: pl.Tensor,
     worker: pl.Scalar[pl.INDEX],
     proposal: pl.Scalar[pl.INT32],
@@ -736,7 +818,6 @@ def _verify_stochastic_row(
 ):
     selected = proposal
     accepted = pl.cast(0, pl.INT32)
-    normalizer = _store_exp_weights(filtered_logits, correction_logits, worker)
     column = pl.cast(proposal, pl.INDEX)
     block_start = column // 8 * 8
     block_offset = column % 8
@@ -750,13 +831,27 @@ def _verify_stochastic_row(
         accepted = pl.cast(1, pl.INT32)
     else:
         for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
-            target = correction_logits[worker : worker + 1, start : start + ARGMAX_BLOCK_TILE]
+            target_block = pl.load(
+                correction_logits, [worker, start], [1, ARGMAX_BLOCK_TILE], target_memory=pl.Mem.Vec,
+            )
+            target = pl.reshape(target_block, [ARGMAX_BLOCK_TILE])
             draft_start = proposal_start + start
-            words = proposal_state[slot : slot + 1, draft_start : draft_start + ARGMAX_BLOCK_TILE]
-            draft = pl.reinterpret_view(words, pl.FP32)
-            residual = pl.sub(target, pl.mul(draft, normalizer))
-            positive = pl.maximum(residual, 0.0)
-            correction_logits[worker : worker + 1, start : start + ARGMAX_BLOCK_TILE] = positive
+            words = pl.load(
+                proposal_state, [slot, draft_start], [1, ARGMAX_BLOCK_TILE], target_memory=pl.Mem.Vec,
+            )
+            draft = pl.reshape(pl.reinterpret_view(words, pl.FP32), [ARGMAX_BLOCK_TILE])
+            out = pl.create_tile([ARGMAX_BLOCK_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            with pl.reg_scope():
+                full = pl.reg.full_mask(lanes=64)
+                divisor = pl.reg.broadcast(normalizer, lanes=64, dtype=pl.FP32)
+                for i in pl.hardware_loop(ARGMAX_BLOCK_TILE // 64):
+                    p_weight = pl.reg.load(target, i * 64, lanes=64)
+                    q = pl.reg.load(draft, i * 64, lanes=64)
+                    q_weight = pl.reg.mul(q, divisor, full)
+                    diff = pl.reg.sub(p_weight, q_weight, full)
+                    pos = pl.reg.maximums(diff, 0.0, full)
+                    _stored = pl.reg.store(out, i * 64, pos, full)
+            pl.store(pl.reshape(out, [1, ARGMAX_BLOCK_TILE]), [worker, start], correction_logits)
         selected = _categorical_sample(correction_logits, worker, correction_uniform)
     return selected, accepted
 
@@ -913,9 +1008,15 @@ def dspark_rejection_sample(
                 row_max = _row_max(logits, row)
                 top_k = pl.read(top_ks, [row])
                 top_p = pl.read(top_ps, [row])
-                _filter_logits(
-                    logits, row, filtered_logits, worker, probabilities, row_max, temperature, top_k, top_p, True,
-                )
+                if (top_k > 0 and top_k < VOCAB) or (top_p > 0.0 and top_p < 1.0):
+                    _verify_filter_logits(
+                        logits, row, filtered_logits, worker, probabilities, row_max, temperature, top_k, top_p,
+                    )
+                    normalizer = _store_exp_weights(filtered_logits, residual_weights, worker)
+                else:
+                    normalizer = _verify_unfiltered_weights(
+                        logits, residual_weights, worker, row, row_max, temperature,
+                    )
                 seed = pl.read(seeds, [row])
                 position = pl.read(positions, [row])
                 if slot >= 0:
@@ -924,13 +1025,12 @@ def dspark_rejection_sample(
                     correction_uniform = _dspark_uniform(seed, position, CORRECTION_STREAM)
                     proposal_start = pl.cast(pl.read(row_proposals, [row, 2]), pl.INDEX)
                     token, accepted = _verify_stochastic_row(
-                        filtered_logits, residual_weights, worker, proposal, uniform,
+                        normalizer, residual_weights, worker, proposal, uniform,
                         correction_uniform, proposal_state, pl.cast(slot, pl.INDEX), proposal_start,
                     )
                     decision_flag = pl.cast(accepted * 2 - 1, pl.INT32)
                 else:
                     uniform = _dspark_uniform(seed, position, TARGET_STREAM)
-                    _store_exp_weights(filtered_logits, residual_weights, worker)
                     token = _categorical_sample(residual_weights, worker, uniform)
             else:
                 token = _greedy_sample_logits(logits_grid, row)
@@ -1114,6 +1214,11 @@ def build_rejection_specs():
         logits[:, 23] = torch.log(torch.tensor(0.75))
         logits[8::12, 23] = torch.log(torch.tensor(0.125))
         logits[8::12, VOCAB - 1] = torch.log(torch.tensor(0.625))
+        # Cut through equal positive probabilities on opposite sides of the vocabulary.
+        for rows in (slice(12, None, 24), slice(13, None, 24)):
+            logits[rows, 7] = torch.log(torch.tensor(0.5))
+            logits[rows, 23] = torch.log(torch.tensor(0.25))
+            logits[rows, VOCAB - 1] = logits[rows, 23]
         return logits
 
     proposals = torch.full((SAMPLE_ROWS, SAMPLED_IDS_PAD), -1, dtype=torch.int32)
@@ -1131,6 +1236,14 @@ def build_rejection_specs():
     temperatures = repeat([1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0], torch.float32)
     top_ks = repeat([0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 1, 0], torch.int32)
     top_ps = repeat([1, 1, 0.7, 1, 1, 1, 1, 1, 0.7, 1, 1, 1], torch.float32)
+    # The higher-ID member of the tie must be rejected by either filter.
+    for first, k, p in ((12, 2, 1.0), (13, 0, 0.7)):
+        for row in range(first, SAMPLE_ROWS, 24):
+            proposals[row, :3] = torch.tensor([VOCAB - 1, row, 0])
+            proposal_probs[row].zero_()
+            proposal_probs[row, VOCAB - 1] = 0.0001
+            proposal_probs[row, 1] = 0.9999
+            temperatures[row], top_ks[row], top_ps[row] = 1.0, k, p
     seeds = torch.arange(SAMPLE_ROWS, dtype=torch.int32) - 3
     positions = torch.arange(SAMPLE_ROWS, dtype=torch.int32) + 65531
     return [
