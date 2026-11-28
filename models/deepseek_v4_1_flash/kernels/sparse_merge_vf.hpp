@@ -68,6 +68,17 @@ __tf__ __aicore__ inline void merge_factors(
     }
 }
 
+PTO_INTERNAL void rounded_merge(RegTensor<bfloat16_t>& rounded, __ubuf__ float* left, __ubuf__ float* right,
+                                uint32_t offset, RegTensor<float>& alpha, RegTensor<float>& beta, MaskReg& all) {
+    RegTensor<float> x, y;
+    vlds(x, left, offset, NORM);
+    vlds(y, right, offset, NORM);
+    vmul(x, x, alpha, all, MODE_ZEROING);
+    vmul(y, y, beta, all, MODE_ZEROING);
+    vadd(x, x, y, all, MODE_ZEROING);
+    vcvt(rounded, x, all, ROUND_R, RS_DISABLE, PART_EVEN);
+}
+
 __tf__ __aicore__ inline void merge_values(
     Result::TileDType __out__ result, Values::TileDType __in__ left, Values::TileDType __in__ right,
     State::TileDType __in__ left_weight, State::TileDType __in__ right_weight) {
@@ -77,29 +88,48 @@ __tf__ __aicore__ inline void merge_values(
     auto wa = (__ubuf__ float*)__cce_get_tile_ptr(left_weight);
     auto wb = (__ubuf__ float*)__cce_get_tile_ptr(right_weight);
     __VEC_SCOPE__ {
+#if defined(SPARSE_GATHER_MXFP8)
+        sparse_quant::Angles angles;
+        sparse_quant::load_angles(angles);
+#endif
         MaskReg all = pset_b32(PAT_ALL);
         for (uint16_t row = 0; row < HALF; ++row) {
             RegTensor<float> alpha, beta;
             vlds(alpha, wa, row, BRC_B32);
             vlds(beta, wb, row, BRC_B32);
+#if defined(SPARSE_GATHER_MXFP8)
+            for (uint16_t band = 0; band < DIM / 256; ++band) {
+                RegTensor<bfloat16_t> a0, a1, a2, a3;
+#pragma unroll
+                for (uint16_t piece = 0; piece < 4; ++piece) {
+                    const uint16_t col = band * 256 + piece * 64;
+                    RegTensor<bfloat16_t> out;
+                    rounded_merge(out, a, b, row * DIM + col, alpha, beta, all);
+                    if (band == 1 && piece == 3) sparse_quant::rotate_tail(out, angles);
+                    if (piece == 0) a0 = out;
+                    if (piece == 1) a1 = out;
+                    if (piece == 2) a2 = out;
+                    if (piece == 3) a3 = out;
+                    vsts(out, dst, row * DIM + col, PK_B32, all);
+                }
+                sparse_quant::publish_maxima(a0, a1, a2, a3, row, band);
+            }
+#else
             for (uint16_t col = 0; col < DIM; col += 64) {
-                RegTensor<float> x, y;
                 RegTensor<bfloat16_t> out;
-                vlds(x, a, row * DIM + col, NORM);
-                vlds(y, b, row * DIM + col, NORM);
-                vmul(x, x, alpha, all, MODE_ZEROING);
-                vmul(y, y, beta, all, MODE_ZEROING);
-                vadd(x, x, y, all, MODE_ZEROING);
-                vcvt(out, x, all, ROUND_R, RS_DISABLE, PART_EVEN);
+                rounded_merge(out, a, b, row * DIM + col, alpha, beta, all);
                 vsts(out, dst, row * DIM + col, PK_B32, all);
             }
+#endif
         }
     }
 }
 
-__aicore__ inline void reduce(
-    __gm__ float* partials, __gm__ bfloat16_t* output, __gm__ float* sink_values,
-    int64_t output_stride, int64_t sink_stride, int heads, int boundary, int head, int token) {
+constexpr int RESULT_UB = 139264;
+
+__aicore__ inline void combine(
+    Result& result, __gm__ float* partials, __gm__ float* sink_values,
+    int64_t sink_stride, int heads, int boundary, int head) {
     const int valid = heads - head < HALF ? heads - head : HALF;
     auto left_base = partials + (int64_t)(2 * boundary - 1) * PARTIAL_STRIDE;
     auto right_base = partials + (int64_t)(2 * boundary) * PARTIAL_STRIDE;
@@ -142,32 +172,37 @@ __aicore__ inline void reduce(
     }
     merge_factors(wl.data(), wr.data(), ml.data(), ll.data(), mr.data(), lr.data(), sink.data());
     Values left, right;
-    Result result;
     TASSIGN(left, 8192);
     TASSIGN(right, 73728);
-    TASSIGN(result, 139264);
-    for (int channel = 0; channel < 1; ++channel) {
-        using InputShape = TileShape2D<float, HALF, DIM>;
-        using InputBase = BaseShape2D<float, HEADS, DIM>;
-        GlobalTensor<float, InputShape, InputBase> left_gm(left_base + head * DIM + channel * DIM);
-        GlobalTensor<float, InputShape, InputBase> right_gm(right_base + head * DIM + channel * DIM);
-        TLOAD(left, left_gm);
-        TLOAD(right, right_gm);
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        merge_values(result.data(), left.data(), right.data(), wl.data(), wr.data());
-        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        Tile<TileType::Vec, bfloat16_t, HALF, DIM, BLayout::RowMajor, DYNAMIC, DIM> active(valid);
-        TASSIGN(active, 139264);
-        using OutShape = TileShape2D<bfloat16_t, DYNAMIC, DIM>;
-        using OutBase = BaseShape2D<bfloat16_t, HEADS, DIM>;
-        GlobalTensor<bfloat16_t, OutShape, OutBase> dst(
-            output + token * output_stride + head * DIM + channel * DIM, OutShape(valid, DIM));
-        TSTORE(dst, active);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    }
+    TASSIGN(result, RESULT_UB);
+    using InputShape = TileShape2D<float, HALF, DIM>;
+    using InputBase = BaseShape2D<float, HEADS, DIM>;
+    GlobalTensor<float, InputShape, InputBase> left_gm(left_base + head * DIM);
+    GlobalTensor<float, InputShape, InputBase> right_gm(right_base + head * DIM);
+    TLOAD(left, left_gm);
+    TLOAD(right, right_gm);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    merge_values(result.data(), left.data(), right.data(), wl.data(), wr.data());
+}
+
+__aicore__ inline void reduce(
+    __gm__ float* partials, __gm__ bfloat16_t* output, __gm__ float* sink_values,
+    int64_t output_stride, int64_t sink_stride, int heads, int boundary, int head, int token) {
+    Result result;
+    combine(result, partials, sink_values, sink_stride, heads, boundary, head);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    const int valid = heads - head < HALF ? heads - head : HALF;
+    Tile<TileType::Vec, bfloat16_t, HALF, DIM, BLayout::RowMajor, DYNAMIC, DIM> active(valid);
+    TASSIGN(active, RESULT_UB);
+    using OutShape = TileShape2D<bfloat16_t, DYNAMIC, DIM>;
+    using OutBase = BaseShape2D<bfloat16_t, HEADS, DIM>;
+    GlobalTensor<bfloat16_t, OutShape, OutBase> dst(
+        output + token * output_stride + head * DIM, OutShape(valid, DIM));
+    TSTORE(dst, active);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     pipe_barrier(PIPE_ALL);
 }
 #endif

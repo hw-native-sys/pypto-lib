@@ -167,37 +167,67 @@ __tf__ __aicore__ inline void normalization(
     }
 }
 
+template <bool First>
+PTO_INTERNAL void rounded_pv(RegTensor<bfloat16_t>& rounded, __ubuf__ float* pv, __ubuf__ float* old,
+                             uint32_t offset, RegTensor<float>& correction, RegTensor<float>& norm, MaskReg& all) {
+    RegTensor<float> value;
+    vlds(value, pv, offset, NORM);
+    if constexpr (!First) {
+        RegTensor<float> previous;
+        vlds(previous, old, offset, NORM);
+        vmul(previous, previous, correction, all, MODE_ZEROING);
+        vadd(value, previous, value, all, MODE_ZEROING);
+    }
+    vmul(value, value, norm, all, MODE_ZEROING);
+    vcvt(rounded, value, all, ROUND_R, RS_DISABLE, PART_EVEN);
+}
+
 template <bool First, typename Result, typename Values, typename State>
 __tf__ __aicore__ inline void finish(
     typename Result::TileDType __out__ result, typename Values::TileDType __in__ previous,
     typename Values::TileDType __in__ weighted, typename State::TileDType __in__ correction,
-    typename State::TileDType __in__ multiplier) {
+    typename State::TileDType __in__ multiplier, int channel) {
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(result);
     auto old = (__ubuf__ float*)__cce_get_tile_ptr(previous);
     auto pv = (__ubuf__ float*)__cce_get_tile_ptr(weighted);
     auto corr = (__ubuf__ float*)__cce_get_tile_ptr(correction);
     auto scale = (__ubuf__ float*)__cce_get_tile_ptr(multiplier);
     __VEC_SCOPE__ {
+#if defined(SPARSE_GATHER_MXFP8)
+        sparse_quant::Angles angles;
+        if (channel == 1) sparse_quant::load_angles(angles);
+#endif
         MaskReg all = pset_b32(PAT_ALL);
         for (uint16_t row = 0; row < Values::Rows; ++row) {
             RegTensor<float> c, norm;
             if constexpr (!First) vlds(c, corr, row, BRC_B32);
             vlds(norm, scale, row, BRC_B32);
-            for (uint16_t col = 0; col < Values::Cols; col += 64) {
-                RegTensor<float> value;
-                RegTensor<bfloat16_t> converted;
-                vlds(value, pv, row * Values::Cols + col, NORM);
-                if constexpr (!First) {
-                    RegTensor<float> old_value;
-                    vlds(old_value, old, row * Values::Cols + col, NORM);
-                    vmul(old_value, old_value, c, all, MODE_ZEROING);
-                    vadd(value, old_value, value, all, MODE_ZEROING);
+#if defined(SPARSE_GATHER_MXFP8)
+            for (uint16_t band = 0; band < Values::Cols / 256; ++band) {
+                RegTensor<bfloat16_t> a0, a1, a2, a3;
+#pragma unroll
+                for (uint16_t piece = 0; piece < 4; ++piece) {
+                    const uint16_t col = band * 256 + piece * 64;
+                    RegTensor<bfloat16_t> converted;
+                    rounded_pv<First>(converted, pv, old, row * Values::Cols + col, c, norm, all);
+                    // Packed BF16 writes stay behind unread FP32 values when result aliases weighted.
+                    if (channel == 1 && piece == 3) sparse_quant::rotate_tail(converted, angles);
+                    if (piece == 0) a0 = converted;
+                    if (piece == 1) a1 = converted;
+                    if (piece == 2) a2 = converted;
+                    if (piece == 3) a3 = converted;
+                    vsts(converted, dst, row * Values::Cols + col, PK_B32, all);
                 }
-                vmul(value, value, norm, all, MODE_ZEROING);
-                vcvt(converted, value, all, ROUND_R, RS_DISABLE, PART_EVEN);
+                sparse_quant::publish_maxima(a0, a1, a2, a3, row, channel);
+            }
+#else
+            for (uint16_t col = 0; col < Values::Cols; col += 64) {
+                RegTensor<bfloat16_t> converted;
+                rounded_pv<First>(converted, pv, old, row * Values::Cols + col, c, norm, all);
                 // Packed BF16 writes stay behind unread FP32 values when result aliases weighted.
                 vsts(converted, dst, row * Values::Cols + col, PK_B32, all);
             }
+#endif
         }
     }
 }

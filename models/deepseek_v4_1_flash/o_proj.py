@@ -23,6 +23,7 @@ from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_lin
 
 
 import pypto.language as pl
+from sparse_attention import gather_sparse_attention_mxfp8
 import pypto.language.distributed as pld
 from pypto.runtime import pto_isa_include_dir
 
@@ -598,10 +599,14 @@ def _o_proj_a_mixed(
     active_rows: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
     row_tile: pl.constexpr,
+    row_major_input: pl.constexpr = False,
 ):
     scales = pl.reshape(output_scale, [padded_rows // 16, output_width // 2])
     # Each packed scale band holds 16 rows or columns and 128 E8M0 codes per row or column.
-    raw_a = pl.reshape(activation_scale, [output_width // O_LORA * padded_rows // 16, 2048])
+    if row_major_input:
+        raw_a = pl.tensor.view(activation_scale, [padded_rows, LOCAL_H * (HEAD_DIM // 32)], layout=pl.MX_A_ND)
+    else:
+        raw_a = pl.reshape(activation_scale, [output_width // O_LORA * padded_rows // 16, 2048])
     raw_b = pl.reshape(weight_scale, [output_width // 16, 2048])
     w: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN, pl.NZ] = weight[:, :, :]
     workers = output_width // O_A_N_TILE
@@ -617,26 +622,39 @@ def _o_proj_a_mixed(
             input_row = cube_group * padded_rows + cube_row
             acc = pl.create_tile([row_tile, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc)
             # Preload the first K256 panel.
-            a = pl.load(payload, [input_row, 0], [row_tile, 256], target_memory=pl.Mem.Mat)
+            if row_major_input:
+                a = pl.load(payload, [cube_row, cube_group * O_GROUP_IN], [row_tile, 256], target_memory=pl.Mem.Mat)
+                # Keep the physical stride in MX_A_ND partition lowering.
+                scale_rows = pl.min(row_tile, padded_rows - cube_row)
+            else:
+                a = pl.load(payload, [input_row, 0], [row_tile, 256], target_memory=pl.Mem.Mat)
             weight_panel = pl.load(w, [cube_group, 0, cube_col], [1, 256, 256], target_memory=pl.Mem.Mat)
             b = pl.reshape(weight_panel, [256, 256])
             a_band = input_row // 16
             b_band = (cube_group * O_LORA + cube_col) // 16
             # Gather each K128 scale fragment into its flat L1 slot and mark its valid extent.
-            a_buf_lo: pl.Tile[[row_tile // 16, 64], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[0], pl.Mem.Mat] = pl.tile.create([row_tile // 16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+            if row_major_input:
+                a_buf_lo: pl.Tile[[row_tile, 4], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[0], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.load(raw_a, [cube_row, cube_group * 64], [row_tile, 4], valid_shape=[scale_rows, 4], target_memory=pl.Mem.Mat)
+                a_lo = a_buf_lo
+            else:
+                a_buf_lo: pl.Tile[[row_tile // 16, 64], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[0], pl.Mem.Mat] = pl.tile.create([row_tile // 16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a_dst_lo = pl.tile.reshape(a_buf_lo, [row_tile // 16, 64])
+                a_dst_lo = pl.tile.gather_row(a_dst_lo, raw_a, [0, 0], [a_band, 0], [row_tile // 16, 64])
+                pl.tile.set_validshape(a_dst_lo, row_tile // 16, 64)
             b_buf_lo: pl.Tile[[16, 64], pl.FP8E8M0, pl.MemRef("oa_sb", slots=4)[0], pl.Mem.Mat] = pl.tile.create([16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
-            a_dst_lo = pl.tile.reshape(a_buf_lo, [row_tile // 16, 64])
             b_dst_lo = pl.tile.reshape(b_buf_lo, [16, 64])
-            a_dst_lo = pl.tile.gather_row(a_dst_lo, raw_a, [0, 0], [a_band, 0], [row_tile // 16, 64])
-            pl.tile.set_validshape(a_dst_lo, row_tile // 16, 64)
             b_dst_lo = pl.tile.gather_row(b_dst_lo, raw_b, [0, 0], [b_band, 0], [16, 64])
             pl.tile.set_validshape(b_dst_lo, 16, 64)
-            a_buf_hi: pl.Tile[[row_tile // 16, 64], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[1], pl.Mem.Mat] = pl.tile.create([row_tile // 16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+            if row_major_input:
+                a_buf_hi: pl.Tile[[row_tile, 4], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[1], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.load(raw_a, [cube_row, cube_group * 64 + 4], [row_tile, 4], valid_shape=[scale_rows, 4], target_memory=pl.Mem.Mat)
+                a_hi = a_buf_hi
+            else:
+                a_buf_hi: pl.Tile[[row_tile // 16, 64], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[1], pl.Mem.Mat] = pl.tile.create([row_tile // 16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a_dst_hi = pl.tile.reshape(a_buf_hi, [row_tile // 16, 64])
+                a_dst_hi = pl.tile.gather_row(a_dst_hi, raw_a, [0, 0], [a_band, 64], [row_tile // 16, 64])
+                pl.tile.set_validshape(a_dst_hi, row_tile // 16, 64)
             b_buf_hi: pl.Tile[[16, 64], pl.FP8E8M0, pl.MemRef("oa_sb", slots=4)[1], pl.Mem.Mat] = pl.tile.create([16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
-            a_dst_hi = pl.tile.reshape(a_buf_hi, [row_tile // 16, 64])
             b_dst_hi = pl.tile.reshape(b_buf_hi, [16, 64])
-            a_dst_hi = pl.tile.gather_row(a_dst_hi, raw_a, [0, 0], [a_band, 64], [row_tile // 16, 64])
-            pl.tile.set_validshape(a_dst_hi, row_tile // 16, 64)
             b_dst_hi = pl.tile.gather_row(b_dst_hi, raw_b, [0, 0], [b_band, 64], [16, 64])
             pl.tile.set_validshape(b_dst_hi, 16, 64)
             pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0, core_type=pl.KernelType.AIC)
@@ -645,29 +663,43 @@ def _o_proj_a_mixed(
                 next_slot = (step + 1) % 2
                 a_next = a
                 b_next = b
+                if row_major_input:
+                    a_lo_next = a_lo
+                    a_hi_next = a_hi
                 # Refill the alternate L1 slot after its last MTE1 read.
                 if step < 15:
                     if step >= 1:
                         pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, next_slot, core_type=pl.KernelType.AIC)
                     next_k = (step + 1) * 256
                     scale_byte = (step + 1) * 128
-                    a_next = pl.load(payload, [input_row, next_k], [row_tile, 256], target_memory=pl.Mem.Mat)
+                    if row_major_input:
+                        a_next = pl.load(payload, [cube_row, cube_group * O_GROUP_IN + next_k], [row_tile, 256], target_memory=pl.Mem.Mat)
+                    else:
+                        a_next = pl.load(payload, [input_row, next_k], [row_tile, 256], target_memory=pl.Mem.Mat)
                     weight_panel_next = pl.load(w, [cube_group, next_k, cube_col], [1, 256, 256], target_memory=pl.Mem.Mat)
                     b_next = pl.reshape(weight_panel_next, [256, 256])
-                    a_buf_lo_next: pl.Tile[[row_tile // 16, 64], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[2 * next_slot], pl.Mem.Mat] = pl.tile.create([row_tile // 16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                    if row_major_input:
+                        a_buf_lo_next: pl.Tile[[row_tile, 4], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[2 * next_slot], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.load(raw_a, [cube_row, cube_group * 64 + (step + 1) // 2 * 8 + (step + 1) % 2 * (LOCAL_H * 8)], [row_tile, 4], valid_shape=[scale_rows, 4], target_memory=pl.Mem.Mat)
+                        a_lo_next = a_buf_lo_next
+                    else:
+                        a_buf_lo_next: pl.Tile[[row_tile // 16, 64], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[2 * next_slot], pl.Mem.Mat] = pl.tile.create([row_tile // 16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a_dst_lo_next = pl.tile.reshape(a_buf_lo_next, [row_tile // 16, 64])
+                        a_dst_lo_next = pl.tile.gather_row(a_dst_lo_next, raw_a, [0, 0], [a_band, scale_byte], [row_tile // 16, 64])
+                        pl.tile.set_validshape(a_dst_lo_next, row_tile // 16, 64)
                     b_buf_lo_next: pl.Tile[[16, 64], pl.FP8E8M0, pl.MemRef("oa_sb", slots=4)[2 * next_slot], pl.Mem.Mat] = pl.tile.create([16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
-                    a_dst_lo_next = pl.tile.reshape(a_buf_lo_next, [row_tile // 16, 64])
                     b_dst_lo_next = pl.tile.reshape(b_buf_lo_next, [16, 64])
-                    a_dst_lo_next = pl.tile.gather_row(a_dst_lo_next, raw_a, [0, 0], [a_band, scale_byte], [row_tile // 16, 64])
-                    pl.tile.set_validshape(a_dst_lo_next, row_tile // 16, 64)
                     b_dst_lo_next = pl.tile.gather_row(b_dst_lo_next, raw_b, [0, 0], [b_band, scale_byte], [16, 64])
                     pl.tile.set_validshape(b_dst_lo_next, 16, 64)
-                    a_buf_hi_next: pl.Tile[[row_tile // 16, 64], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[2 * next_slot + 1], pl.Mem.Mat] = pl.tile.create([row_tile // 16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                    if row_major_input:
+                        a_buf_hi_next: pl.Tile[[row_tile, 4], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[2 * next_slot + 1], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.load(raw_a, [cube_row, cube_group * 64 + (step + 1) // 2 * 8 + (step + 1) % 2 * (LOCAL_H * 8) + 4], [row_tile, 4], valid_shape=[scale_rows, 4], target_memory=pl.Mem.Mat)
+                        a_hi_next = a_buf_hi_next
+                    else:
+                        a_buf_hi_next: pl.Tile[[row_tile // 16, 64], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[2 * next_slot + 1], pl.Mem.Mat] = pl.tile.create([row_tile // 16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a_dst_hi_next = pl.tile.reshape(a_buf_hi_next, [row_tile // 16, 64])
+                        a_dst_hi_next = pl.tile.gather_row(a_dst_hi_next, raw_a, [0, 0], [a_band, scale_byte + 64], [row_tile // 16, 64])
+                        pl.tile.set_validshape(a_dst_hi_next, row_tile // 16, 64)
                     b_buf_hi_next: pl.Tile[[16, 64], pl.FP8E8M0, pl.MemRef("oa_sb", slots=4)[2 * next_slot + 1], pl.Mem.Mat] = pl.tile.create([16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
-                    a_dst_hi_next = pl.tile.reshape(a_buf_hi_next, [row_tile // 16, 64])
                     b_dst_hi_next = pl.tile.reshape(b_buf_hi_next, [16, 64])
-                    a_dst_hi_next = pl.tile.gather_row(a_dst_hi_next, raw_a, [0, 0], [a_band, scale_byte + 64], [row_tile // 16, 64])
-                    pl.tile.set_validshape(a_dst_hi_next, row_tile // 16, 64)
                     b_dst_hi_next = pl.tile.gather_row(b_dst_hi_next, raw_b, [0, 0], [b_band, scale_byte + 64], [16, 64])
                     pl.tile.set_validshape(b_dst_hi_next, 16, 64)
                     pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, next_slot, core_type=pl.KernelType.AIC)
@@ -678,14 +710,18 @@ def _o_proj_a_mixed(
                 left_lo: pl.Tile[[row_tile, 128], pl.FP8E4M3FN, pl.MemRef("oa_left", slots=2)[0], pl.Mem.Left] = pl.tile.extract(a, 0, 0, [row_tile, 128], target_memory=pl.Mem.Left)
                 right_lo: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("oa_right", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b, 0, 0, [128, 256], target_memory=pl.Mem.Right)
                 # Read each L1 slot through its fixed A or B MX layout.
+                if row_major_input:
+                    left_scale_lo = pl.tile.move(a_lo, target_memory=pl.Mem.LeftScale)
                 if panel_slot == 0:
                     a_scale_lo: pl.Tile[[row_tile, 4], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[0], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([row_tile, 4], pl.FP8E8M0, target_memory=pl.Mem.Mat)
-                    left_scale_lo = pl.tile.move(a_scale_lo, target_memory=pl.Mem.LeftScale)
+                    if not row_major_input:
+                        left_scale_lo = pl.tile.move(a_scale_lo, target_memory=pl.Mem.LeftScale)
                     b_scale_lo: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("oa_sb", slots=4)[0], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([4, 256], pl.FP8E8M0, target_memory=pl.Mem.Mat)
                     right_scale_lo = pl.tile.move(b_scale_lo, target_memory=pl.Mem.RightScale)
                 else:
                     a_scale_lo: pl.Tile[[row_tile, 4], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[2], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([row_tile, 4], pl.FP8E8M0, target_memory=pl.Mem.Mat)
-                    left_scale_lo = pl.tile.move(a_scale_lo, target_memory=pl.Mem.LeftScale)
+                    if not row_major_input:
+                        left_scale_lo = pl.tile.move(a_scale_lo, target_memory=pl.Mem.LeftScale)
                     b_scale_lo: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("oa_sb", slots=4)[2], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([4, 256], pl.FP8E8M0, target_memory=pl.Mem.Mat)
                     right_scale_lo = pl.tile.move(b_scale_lo, target_memory=pl.Mem.RightScale)
                 pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0, core_type=pl.KernelType.AIC)
@@ -693,14 +729,18 @@ def _o_proj_a_mixed(
                     pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1, core_type=pl.KernelType.AIC)
                 left_hi: pl.Tile[[row_tile, 128], pl.FP8E4M3FN, pl.MemRef("oa_left", slots=2)[1], pl.Mem.Left] = pl.tile.extract(a, 0, 128, [row_tile, 128], target_memory=pl.Mem.Left)
                 right_hi: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("oa_right", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                if row_major_input:
+                    left_scale_hi = pl.tile.move(a_hi, target_memory=pl.Mem.LeftScale)
                 if panel_slot == 0:
                     a_scale_hi: pl.Tile[[row_tile, 4], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[1], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([row_tile, 4], pl.FP8E8M0, target_memory=pl.Mem.Mat)
-                    left_scale_hi = pl.tile.move(a_scale_hi, target_memory=pl.Mem.LeftScale)
+                    if not row_major_input:
+                        left_scale_hi = pl.tile.move(a_scale_hi, target_memory=pl.Mem.LeftScale)
                     b_scale_hi: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("oa_sb", slots=4)[1], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([4, 256], pl.FP8E8M0, target_memory=pl.Mem.Mat)
                     right_scale_hi = pl.tile.move(b_scale_hi, target_memory=pl.Mem.RightScale)
                 else:
                     a_scale_hi: pl.Tile[[row_tile, 4], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[3], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([row_tile, 4], pl.FP8E8M0, target_memory=pl.Mem.Mat)
-                    left_scale_hi = pl.tile.move(a_scale_hi, target_memory=pl.Mem.LeftScale)
+                    if not row_major_input:
+                        left_scale_hi = pl.tile.move(a_scale_hi, target_memory=pl.Mem.LeftScale)
                     b_scale_hi: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("oa_sb", slots=4)[3], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([4, 256], pl.FP8E8M0, target_memory=pl.Mem.Mat)
                     right_scale_hi = pl.tile.move(b_scale_hi, target_memory=pl.Mem.RightScale)
                 pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1, core_type=pl.KernelType.AIC)
@@ -719,6 +759,9 @@ def _o_proj_a_mixed(
                     pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1, core_type=pl.KernelType.AIC)
                 a = a_next
                 b = b_next
+                if row_major_input:
+                    a_lo = a_lo_next
+                    a_hi = a_hi_next
             # Publish the completed accumulator to the two quantization lanes.
             pl.system.set_flag(pl.PipeType.M, pl.PipeType.FIX, 0, core_type=pl.KernelType.AIC)
             pl.system.wait_flag(pl.PipeType.M, pl.PipeType.FIX, 0, core_type=pl.KernelType.AIC)
@@ -840,9 +883,9 @@ def _o_proj_a_stream(
 
 @pl.jit.inline(auto_scope=False)
 def o_proj_a_pypto(
-    payload: pl.Tensor[[O_GROUP_ROWS, O_GROUP_IN], pl.FP8E4M3FN],
+    payload: pl.Tensor,
     weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    activation_scale: pl.Tensor[[LOCAL_O_GROUPS, O_IN_SCALE_COLS], pl.FP8E8M0],
+    activation_scale: pl.Tensor,
     weight_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     output: pl.Out[pl.Tensor[[O_PAD_ROWS, LOCAL_O_WIDTH], pl.FP8E4M3FN]],
     output_scale: pl.Out[pl.Tensor[[1, O_OUT_SCALE_COLS], pl.FP8E8M0]],
@@ -850,17 +893,18 @@ def o_proj_a_pypto(
     active_rows: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
     row_tile: pl.Scalar[pl.INDEX] = 80,
+    row_major_input: pl.constexpr = False,
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Project and quantize full attention weights with one worker per column tile."""
     if row_tile == 128:
         output, output_scale = _o_proj_a_mixed(
             payload, weight, activation_scale, weight_scale, output, output_scale,
-            output_width, active_rows, padded_rows, row_tile=128,
+            output_width, active_rows, padded_rows, row_tile=128, row_major_input=row_major_input,
         )
     else:
         output, output_scale = _o_proj_a_mixed(
             payload, weight, activation_scale, weight_scale, output, output_scale,
-            output_width, active_rows, padded_rows, row_tile=80,
+            output_width, active_rows, padded_rows, row_tile=80, row_major_input=row_major_input,
         )
     return output, output_scale
 
@@ -1330,6 +1374,43 @@ o_proj_b_hc_post = o_proj_b_hc_post_native
 
 
 @pl.jit.inline(auto_scope=False)
+def _project_attention_mxfp8(
+    payload_all: pl.Tensor,
+    scales_all: pl.Tensor,
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+    oa_tile: pl.Scalar[pl.INDEX],
+    ob_row_tile: pl.constexpr,
+    row_major_input: pl.constexpr,
+):
+    """Run O-A and O-B on quantized activation storage."""
+    total_rows = pl.tensor.dim(output, 0)
+    payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
+    activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
+    payload, activation_scale = o_proj_a_pypto(
+        payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
+        LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile, row_major_input=row_major_input,
+    )
+    ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * ((D + O_B_N_TILE - 1) // O_B_N_TILE)
+    ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
+    output, ready = o_proj_b_hc_post(
+        payload, wo_b, activation_scale, wo_b_scale,
+        residual, post_mix, residual_mix,
+        output,
+        total_rows, ob_row_tile, ob_workers,
+    )
+    return output, ready
+
+
+@pl.jit.inline(auto_scope=False)
 def o_proj_hc_post(
     attn_out: pl.Tensor,
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
@@ -1372,7 +1453,7 @@ def o_proj_hc_post(
     else:
         payload, activation_scale = o_proj_a_pypto(
             payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
-            LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
+            LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile, row_major_input=False,
         )
     ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * ((D + O_B_N_TILE - 1) // O_B_N_TILE)
     ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
@@ -1383,6 +1464,45 @@ def o_proj_hc_post(
         total_rows, ob_row_tile, ob_workers,
     )
     return output, ready
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_project_hc_post(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    sink: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    """Gather attention directly into the MXFP8 inputs of the output projection."""
+    rows = pl.tensor.dim(output, 0)
+    oa_tile = 80
+    if rows > 80:
+        oa_tile = 128
+    padded_rows = ((rows + oa_tile - 1) // oa_tile) * oa_tile
+    payload = pl.create_tensor([padded_rows, LOCAL_H * HEAD_DIM], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([padded_rows, LOCAL_H * (HEAD_DIM // 32)], dtype=pl.FP8E8M0)
+    gather_sparse_attention_mxfp8(
+        query, window_indices, window, compressed_indices, compressed,
+        sink, payload, scales, rope_cos, rope_sin, padded_rows, num_tokens, compressed_keys,
+    )
+    return _project_attention_mxfp8(
+        payload, scales, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        residual, post_mix, residual_mix, output, num_tokens, padded_rows, oa_tile, 128, True,
+    )
 
 
 def grouped_mxfp8_linear(

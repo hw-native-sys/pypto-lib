@@ -22,8 +22,7 @@ from config import (
 from hc import hc_head_norm, hc_project, hc_sinkhorn
 from decode_indexer import c1a_index, plan_reindex_pool, score_reindex_pool
 from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
-from o_proj import o_proj_hc_post
-from sparse_attention import gather_sparse_attention
+from o_proj import gather_project_hc_post
 
 
 # model config
@@ -133,15 +132,10 @@ def decode_c1a_reindex(
         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
         runs, dense_width, topk_indices, num_tokens,
     )
-    attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    gather_sparse_attention(
+    gather_project_hc_post(
         query, window_indices, window_cache, topk_indices, compressed_cache,
-        attn_sink, attn_out, num_tokens, compressed_keys=INDEX_TOPK,
-    )
-    o_proj_hc_post(
-        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        x_hc, post_mix, residual_mix, output, num_tokens,
-        oa_row_tile=80, ob_row_tile=128,
+        attn_sink, rope_cos, rope_sin, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        x_hc, post_mix, residual_mix, output, num_tokens, compressed_keys=INDEX_TOPK,
     )
     return output
 
