@@ -184,10 +184,10 @@ def prefill_c2a_full(
             chunk_request_ids = pl.slice(q_request_ids, [active], [start])
             chunk_compressed_lens = pl.slice(q_compressed_lens, [active], [start])
             chunk_topk_indices = pl.slice(q_topk_indices, [active, INDEX_TOPK], [start, 0])
-            q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
-            q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            q_input_payload_padded_rows = (active + 255) // 256 * 256
+            q_latent = pl.create_tensor([q_input_payload_padded_rows, Q_LORA], dtype=pl.BF16)
+            q = pl.create_tensor([q_input_payload_padded_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             # Q and KV consume the same M16-packed activations on the unsharded path.
-            q_input_payload_padded_rows = ((active + 255) // 256) * 256
             q_input_payload = pl.slice(kv_input_payload, [q_input_payload_padded_rows, D], [start, 0])
             scale_columns = q_input_payload_padded_rows * (D // 32)
             q_input_scales = pl.slice(kv_input_scales, [1, scale_columns], [0, start * (D // 32)])
@@ -201,7 +201,7 @@ def prefill_c2a_full(
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
-            attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            attn_out = pl.create_tensor([q_input_payload_padded_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             _index_ready = prefill_indexer(
                 qb_payload, qb_scales,
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
@@ -578,15 +578,16 @@ def prefill_c2a_full_cp(
             compressed_write_slots, index_cache, index_cache_scale, kv_token_count, compressed_published, gathered,
         )
         compressed_publication[0] = compressed_ready
-        chunk_hidden = pl.create_tensor([Q_TILE, D], dtype=pl.BF16)
-        chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_window_indices = pl.create_tensor([Q_TILE, 128], dtype=pl.INT32)
-        chunk_request_ids = pl.create_tensor([Q_TILE], dtype=pl.INT32)
-        chunk_compressed_lens = pl.create_tensor([Q_TILE], dtype=pl.INT32)
-        chunk_topk_indices = pl.create_tensor([Q_TILE, INDEX_TOPK], dtype=pl.INT32)
-        q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
-        q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        chunk_rows = (pl.min(Q_TILE, pl.max(1, q_token_count)) + 255) // 256 * 256
+        chunk_hidden = pl.create_tensor([chunk_rows, D], dtype=pl.BF16)
+        chunk_rope_cos = pl.create_tensor([chunk_rows, ROPE_DIM // 2], dtype=pl.FP32)
+        chunk_rope_sin = pl.create_tensor([chunk_rows, ROPE_DIM // 2], dtype=pl.FP32)
+        chunk_window_indices = pl.create_tensor([chunk_rows, 128], dtype=pl.INT32)
+        chunk_request_ids = pl.create_tensor([chunk_rows], dtype=pl.INT32)
+        chunk_compressed_lens = pl.create_tensor([chunk_rows], dtype=pl.INT32)
+        chunk_topk_indices = pl.create_tensor([chunk_rows, INDEX_TOPK], dtype=pl.INT32)
+        q_latent = pl.create_tensor([chunk_rows, Q_LORA], dtype=pl.BF16)
+        q = pl.create_tensor([chunk_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
 
         chunk_done = gathered
         for start in pl.range(0, q_token_count, Q_TILE):
@@ -619,7 +620,7 @@ def prefill_c2a_full_cp(
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
-            attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            attn_out = pl.create_tensor([chunk_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             index_inputs_ready = pl.system.task_dummy(deps=[stage_tid, compressed_ready])
             _index_ready = prefill_indexer(
                 qb_payload, qb_scales,

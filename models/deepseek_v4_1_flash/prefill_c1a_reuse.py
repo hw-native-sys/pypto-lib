@@ -371,12 +371,13 @@ def prefill_c1a_reuse_cp(
         q_projection_payload, q_projection_scales, q_projection_padded_rows = qkv_quant(
             q_hidden, q_token_count, row_tile=256,
         )
-        chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_window_indices = pl.create_tensor([Q_TILE, 128], dtype=pl.INT32)
-        chunk_compressed_indices = pl.create_tensor([Q_TILE, INDEX_TOPK], dtype=pl.INT32)
-        q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
-        q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        chunk_rows = (pl.min(Q_TILE, pl.max(1, q_token_count)) + 255) // 256 * 256
+        chunk_rope_cos = pl.create_tensor([chunk_rows, ROPE_DIM // 2], dtype=pl.FP32)
+        chunk_rope_sin = pl.create_tensor([chunk_rows, ROPE_DIM // 2], dtype=pl.FP32)
+        chunk_window_indices = pl.create_tensor([chunk_rows, 128], dtype=pl.INT32)
+        chunk_compressed_indices = pl.create_tensor([chunk_rows, INDEX_TOPK], dtype=pl.INT32)
+        q_latent = pl.create_tensor([chunk_rows, Q_LORA], dtype=pl.BF16)
+        q = pl.create_tensor([chunk_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
 
         chunk_done = gathered
         for start in pl.range(0, q_token_count, Q_TILE):
@@ -406,7 +407,7 @@ def prefill_c1a_reuse_cp(
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
-            attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            attn_out = pl.create_tensor([chunk_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             gather_sparse_attention(
                 q, chunk_window_indices, window_cache, chunk_compressed_indices, compressed_cache,
                 attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,

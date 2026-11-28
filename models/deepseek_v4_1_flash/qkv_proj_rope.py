@@ -792,8 +792,12 @@ def proj_q_a_pypto(
     rows: pl.Scalar[pl.INDEX],
     worker_limit: pl.constexpr = 32,
 ):
-    """Project a narrow decode tile."""
-    return _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output, rows, worker_limit, 80, 64, 256)
+    """Project narrow decode batches with a single M16 tile when it covers all rows."""
+    if rows <= 16:
+        output = _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output, rows, worker_limit, 16, 64, 256)
+    else:
+        output = _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output, rows, worker_limit, 80, 64, 256)
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2335,6 +2339,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = {"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device}
     cases = (
+        (1, 80, 80), (16, 80, 80), (17, 80, 80),
         (72, 80, 80), (127, 160, 128), (129, 320, 256),
         (127, 160, 256), (511, 560, 256), (1023, 1040, 256),
     )
