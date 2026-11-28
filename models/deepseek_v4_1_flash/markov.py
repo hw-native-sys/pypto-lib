@@ -152,8 +152,8 @@ def _markov_score_vector(
                     valid_shape=[valid, VOCAB_TILE], target_memory=pl.Mem.Vec,
                 )
                 product = pl.system.tpop_from_aic(shape=[8, VOCAB_TILE], dtype=pl.FP32, split=1, id=0)
-                full = pl.tile.set_validshape(logit, 8, VOCAB_TILE)
-                summed = pl.add(full, product)
+                valid_product = pl.tile.set_validshape(product, valid, VOCAB_TILE)
+                summed = pl.add(logit, valid_product)
                 pl.system.tfree_to_aic(product, id=0)
                 scores = pl.store(pl.tile.set_validshape(summed, valid, VOCAB_TILE), [row, col], scores)
             else:
@@ -478,7 +478,8 @@ def build_tensor_specs(batch=2):
 def build_proposal_specs():
     from golden import TensorSpec
 
-    batch = 3
+    # Exercise both AIV subblocks and a partial second 16-row group.
+    batch = 17
     specs = build_tensor_specs(batch)
     by_name = {spec.name: spec for spec in specs}
     logits = by_name["base_logits"].init_value
@@ -486,24 +487,34 @@ def build_proposal_specs():
     for step, token in enumerate([0, ARGMAX_BLOCK_TILE - 1, ARGMAX_BLOCK_TILE, VOCAB - 1, 1]):
         logits[0, step, token] = 16.0
     logits[0, -1, ARGMAX_BLOCK_TILE + 1] = 16.0
-    logits[1].fill_(-4.0)
+    logits[1].fill_(-24.0)
     logits[1, :, 5:9] = torch.tensor([0.1, 0.3, 0.2, 0.4])
+    logits[8].fill_(-24.0)
+    logits[8, :, [255, 1280, VOCAB - 1]] = torch.tensor([1.0, 0.5, 0.1])
     # The unfiltered row puts mass on both sides of a shard boundary and at
     # the last vocabulary ID. Its large offset requires a stable softmax.
-    logits[2].fill_(900.0)
-    boundary_ids = [ARGMAX_BLOCK_TILE - 1, ARGMAX_BLOCK_TILE, VOCAB - 1]
-    logits[2, :, boundary_ids] = torch.tensor([999.0, 999.5, 1000.0])
+    logits[-1].fill_(900.0)
+    boundary_ids = [
+        CATEGORICAL_WIDTH_TILE - 1, CATEGORICAL_WIDTH_TILE,
+        PROPOSAL_PANEL_WIDTH - 1, PROPOSAL_PANEL_WIDTH, VOCAB - 1,
+    ]
+    logits[-1, :, boundary_ids] = torch.tensor([999.0, 999.25, 999.5, 999.75, 1000.0])
     by_name["markov_w2"].init_value.div_(128)
     rows = batch * DECODE_SEQ
-    temperatures = torch.tensor([0.0, 0.7, 0.8]).repeat_interleave(DECODE_SEQ)
-    top_ks = torch.tensor([3, 3, 0]).repeat_interleave(DECODE_SEQ)
-    top_ps = torch.tensor([0.75, 0.75, 1.0]).repeat_interleave(DECODE_SEQ)
+    temperatures = torch.zeros(batch)
+    temperatures[[1, 8, batch - 1]] = torch.tensor([0.7, 0.9, 0.8])
+    top_ks = torch.zeros(batch, dtype=torch.int32)
+    top_ks[[1, 8]] = torch.tensor([3, 2], dtype=torch.int32)
+    top_ps = torch.ones(batch)
+    top_ps[1] = 0.45
+    positions = torch.arange(51, 51 + batch, dtype=torch.int32)
+    positions[1], positions[-1] = 73, 97
     params = [
-        TensorSpec("temperatures", [rows], torch.float32, temperatures),
-        TensorSpec("top_ks", [rows], torch.int32, top_ks),
-        TensorSpec("top_ps", [rows], torch.float32, top_ps),
+        TensorSpec("temperatures", [rows], torch.float32, temperatures.repeat_interleave(DECODE_SEQ)),
+        TensorSpec("top_ks", [rows], torch.int32, top_ks.repeat_interleave(DECODE_SEQ)),
+        TensorSpec("top_ps", [rows], torch.float32, top_ps.repeat_interleave(DECODE_SEQ)),
         TensorSpec("seeds", [rows], torch.int32, 71),
-        TensorSpec("first_positions", [batch], torch.int32, torch.tensor([51, 73, 97])),
+        TensorSpec("first_positions", [batch], torch.int32, positions),
     ]
     return specs[:-2] + params + specs[-2:] + [
         TensorSpec("proposal_probs", [batch, DSPARK_QUERY_WIDTH * VOCAB], torch.float32),
