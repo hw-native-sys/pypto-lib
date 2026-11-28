@@ -13,7 +13,7 @@ operators.
 | --- | --- |
 | Performance target | 72-token decode and 1,024-token standalone prefill attention (DP1/CP1), using full attention weights. Apply optimizations to the shared implementation across all attention layers and adapt all affected callers. |
 | Deferred performance work | Performance tuning for other token counts and prefill parallel configurations remains secondary to these targets; correctness and the shared fused output projection / HC-post implementation remain required. |
-| Compatibility requirements | Preserve correctness and interface contracts for already supported paths, including other token counts and DP/CP configurations. Update affected callers to use revised shared implementations. The optimized C++ routed FFN requires A5 device execution; simulation requests fail explicitly rather than selecting a different numerical implementation. |
+| Compatibility requirements | Preserve correctness and interface contracts for already supported paths, including other token counts and DP/CP configurations. Update affected callers to use revised shared implementations. The routed MXFP4 FFN requires A5 device execution; simulation requests fail explicitly rather than selecting a different numerical implementation. |
 
 ## Model configuration
 
@@ -131,6 +131,11 @@ shards, and return results to the row owners.
 | Text forward | [`prefill_fwd.py`](../../../models/deepseek_v4_1_flash/prefill_fwd.py), [`decode_fwd.py`](../../../models/deepseek_v4_1_flash/decode_fwd.py) |
 | Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
 | Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, `lm_head.py`, and `sample.py` |
+
+The standalone `expert_routed.py` check runs the model's default token capacity
+and a 1024-token prefill. Run the prefill alone with `--case sparse --num-tokens 1024`.
+Its four experts receive 0, 1, 65 and 257 rows. The check compares the active rows
+with the Torch reference and verifies that the padding retains its sentinel value.
 
 MegaMoE uploads routed FP4 weights in ZN order with per-expert DN scales.
 The upload adds six to finite supported weight exponents to compensate the
