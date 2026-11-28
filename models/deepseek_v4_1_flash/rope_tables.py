@@ -47,28 +47,13 @@ def precompute_rope_tables(
     return angles.cos(), angles.sin()
 
 
-def prepare_forward_rope_tables(
-    sequence_length: int,
-    tables: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prepare or reuse full FP32 tables with profile order base, compressed."""
+def prepare_forward_rope_tables(sequence_length: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build FP32 RoPE tables in base, compressed profile order."""
     if not 1 <= sequence_length <= M.max_position_embeddings:
         raise ValueError("RoPE capacity must fit the model position range")
-    if tables is None:
-        base_cos, base_sin = precompute_rope_tables(sequence_length, False)
-        compressed_cos, compressed_sin = precompute_rope_tables(sequence_length, True)
-        return torch.stack((base_cos, compressed_cos)), torch.stack((base_sin, compressed_sin))
-    freqs_cos, freqs_sin = tables
-    for value in (freqs_cos, freqs_sin):
-        if value.device.type != "cpu" or value.dtype != torch.float32 or not value.is_contiguous():
-            raise ValueError("full RoPE tables must be contiguous CPU FP32 tensors")
-        if value.ndim != 3 or value.shape[0] != 2 or value.shape[2] != ROPE_DIM // 2:
-            raise ValueError("full RoPE tables must have shape [2, rows, rope_dim // 2]")
-        if not sequence_length <= value.shape[1] <= M.max_position_embeddings:
-            raise ValueError("full RoPE tables must cover the retained history capacity")
-    if freqs_cos.shape != freqs_sin.shape:
-        raise ValueError("full RoPE cosine and sine tables must have the same shape")
-    return freqs_cos, freqs_sin
+    base_cos, base_sin = precompute_rope_tables(sequence_length, False)
+    compressed_cos, compressed_sin = precompute_rope_tables(sequence_length, True)
+    return torch.stack((base_cos, compressed_cos)), torch.stack((base_sin, compressed_sin))
 
 
 ROPE_ROWS_DYN = pl.dynamic("ROPE_ROWS_DYN")

@@ -56,7 +56,7 @@ from input_pack import prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from engram import (
     ENGRAM_K, ENGRAM_LOOKUPS_DYN, ENGRAM_ROWS, ENGRAM_SHARD_ROWS, KV_OUT, N_HASH_COLS,
-    EngramPayloadSource, build_random_engram_ids, engram, write_forward_engram_layout,
+    build_random_engram_ids, engram, zero_engram_window_sources,
 )
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from mega_moe import FP4_PANEL_ROWS, forward_routed_weight_spec, use_packed_decode_weights, workspace_bytes
@@ -1253,7 +1253,6 @@ def build_tensor_specs(*, sparse_zero_routed=False):
 
 
 if __name__ == "__main__":
-    from contextlib import ExitStack
 
     from golden import run
     from pypto.ir import DistributedConfig
@@ -1302,7 +1301,7 @@ if __name__ == "__main__":
             num_sub_workers=0,
         ),
     )
-    with ExitStack() as sources:
+    with zero_engram_window_sources(len(devices), ENGRAM_SHARD_ROWS, compile_only=args.compile_only) as sources:
         result = run(
             a5_default_runtime="host_build_graph",
             fn=l3_decode_fwd,
@@ -1311,23 +1310,11 @@ if __name__ == "__main__":
             golden_fn=None,
             compile_only=args.compile_only,
             runtime_dir=args.runtime_dir,
-            # The prepared worker binds the Host window source before dispatch.
-            window_sources=None if args.compile_only else {
-                "engram_payload": [
-                    sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
-                    for _ in devices
-                ],
-                "engram_scale": [
-                    sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 8)]))
-                    for _ in devices
-                ],
-            },
+            window_sources=sources,
             persistent=True,
             reset_persistent_windows=False,
             return_tensors=True,
         )
-    if result.passed:
-        write_forward_engram_layout(result.work_dir)
     if result.passed and not args.compile_only:
         for name in ("x_hc", "pre_mix", "dspark_target_hidden"):
             if not torch.isfinite(result.tensors[name]).all():
