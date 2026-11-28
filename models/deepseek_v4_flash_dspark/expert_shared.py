@@ -53,7 +53,8 @@ W2_INNER = 2
 QUANT_TILE = 2048
 
 
-def _expert_shared(
+@pl.jit.inline
+def expert_shared_tile(
     x_local_i8: pl.Tensor[[T, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
@@ -63,28 +64,31 @@ def _expert_shared(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    M_ROWS: pl.constexpr,
+    VALID_M: pl.constexpr,
+    M_TILES: pl.constexpr,
 ):
-    # One M-tile of SH_M_TILE rows per iteration.
-    for mt in pl.parallel(N_MTILES):
-        ts0 = mt * SH_M_TILE
-        valid_m = SH_VALID_M
-        if T > SH_M_TILE and T % SH_M_TILE != 0:
-            valid_m = pl.min(SH_M_TILE, T - ts0)
+    # One M-tile of M_ROWS rows per iteration.
+    for mt in pl.parallel(M_TILES):
+        ts0 = mt * M_ROWS
+        valid_m = VALID_M
+        if T > M_ROWS and T % M_ROWS != 0:
+            valid_m = pl.min(M_ROWS, T - ts0)
 
-        gate_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
-        up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
+        gate_i32 = pl.create_tensor([M_ROWS, MOE_INTER], dtype=pl.INT32)
+        up_i32 = pl.create_tensor([M_ROWS, MOE_INTER], dtype=pl.INT32)
 
         # Paired gate/up projections with a shared input tile.
         for nb_idx in pl.spmd(SH_MM_BLOCKS, name_hint="sh_gate_up_mm", allow_early_resolve=True):
             for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
                 n0 = ng * MM_INTER_TILE
-                xs_first = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, 0], valid_shape=[valid_m, K_TILE])
+                xs_first = pl.slice(x_local_i8, [M_ROWS, K_TILE], [ts0, 0], valid_shape=[valid_m, K_TILE])
                 sw1_first = shared_w1[n0 : n0 + MM_INTER_TILE, 0:K_TILE]
                 sw3_first = shared_w3[n0 : n0 + MM_INTER_TILE, 0:K_TILE]
                 gate_acc = pl.matmul(xs_first, sw1_first, b_trans=True, out_dtype=pl.INT32)
                 up_acc = pl.matmul(xs_first, sw3_first, b_trans=True, out_dtype=pl.INT32)
                 for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[valid_m, K_TILE])
+                    xs_k = pl.slice(x_local_i8, [M_ROWS, K_TILE], [ts0, k0], valid_shape=[valid_m, K_TILE])
                     sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                     sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                     gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
@@ -94,12 +98,12 @@ def _expert_shared(
 
         # Each AIV block owns SH_ROWS_PER_BLOCK rows across the intermediate axis.
         # Activation, row-amax, scale, and requant share one task.
-        h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
-        h_tile_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8)
+        h_tile_fp32 = pl.create_tensor([M_ROWS, MOE_INTER], dtype=pl.FP32)
+        h_tile_i8 = pl.create_tensor([M_ROWS, MOE_INTER], dtype=pl.INT8)
         h_tile_scale_dq = pl.create_tensor(
-            [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
+            [M_ROWS, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
         )
-        for init_block in pl.spmd(SH_M_TILE // 16, name_hint="sh_h_tile_i8_init"):
+        for init_block in pl.spmd(M_ROWS // 16, name_hint="sh_h_tile_i8_init"):
             init_row = init_block * 16
             h_tile_i8[init_row : init_row + 16, :] = pl.cast(
                 pl.full([16, MOE_INTER], dtype=pl.FP16, value=0.0),
@@ -222,25 +226,25 @@ def _expert_shared(
             d_base = db_idx * (W2_INNER * D_OUT_TILE)
             for dg in pl.range(W2_INNER):
                 d0 = d_base + dg * D_OUT_TILE
-                y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
+                y_acc = pl.create_tensor([M_ROWS, D_OUT_TILE], dtype=pl.INT32)
                 for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
                     hs_k = h_tile_i8[:, k0 : k0 + INTER_K]
                     sw2_k = shared_w2[
                         d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
                     ]
                     y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=(k0 == 0))
-                if T % SH_M_TILE == 0:
+                if T % M_ROWS == 0:
                     for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                         y_shard = pl.aiv_shard(y_acc)
-                        row = lane * (SH_M_TILE // 2)
+                        row = lane * (M_ROWS // 2)
                         out_row = ts0 + row
-                        h_scale = pl.row_max(h_tile_scale_dq[row : row + SH_M_TILE // 2, :])
+                        h_scale = pl.row_max(h_tile_scale_dq[row : row + M_ROWS // 2, :])
                         w2_scale = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE], [1, D_OUT_TILE])
                         y_fp32 = pl.cast(y_shard, target_type=pl.FP32, mode="none")
                         y_scaled = pl.row_expand_mul(y_fp32, h_scale)
                         y_dequant = pl.col_expand_mul(y_scaled, w2_scale)
                         y_bf16 = pl.cast(y_dequant, target_type=pl.BF16, mode="rint")
-                        sh[out_row : out_row + SH_M_TILE // 2, d0 : d0 + D_OUT_TILE] = y_bf16
+                        sh[out_row : out_row + M_ROWS // 2, d0 : d0 + D_OUT_TILE] = y_bf16
                 else:
                     h_scale_full = pl.row_max(h_tile_scale_dq[:, :])
                     w2_scale_full = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE], [1, D_OUT_TILE])
@@ -248,15 +252,32 @@ def _expert_shared(
                     y_scaled_full = pl.row_expand_mul(y_fp32_full, h_scale_full)
                     y_dequant_full = pl.col_expand_mul(y_scaled_full, w2_scale_full)
                     y_bf16_full = pl.cast(y_dequant_full, target_type=pl.BF16, mode="rint")
-                    if T > SH_M_TILE:
-                        y_valid = pl.slice(y_bf16_full, [SH_M_TILE, D_OUT_TILE], [0, 0], valid_shape=[valid_m, D_OUT_TILE])
+                    if T > M_ROWS:
+                        y_valid = pl.slice(y_bf16_full, [M_ROWS, D_OUT_TILE], [0, 0], valid_shape=[valid_m, D_OUT_TILE])
                         sh = pl.assemble(sh, y_valid, [ts0, d0])
                     else:
-                        sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE] = y_bf16_full[0:SH_VALID_M, :]
+                        sh[ts0 : ts0 + VALID_M, d0 : d0 + D_OUT_TILE] = y_bf16_full[0:VALID_M, :]
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; sh is convenient because it's already pl.Out.
     return sh
+
+
+def _expert_shared(
+    x_local_i8: pl.Tensor[[T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+):
+    return expert_shared_tile(
+        x_local_i8, x_local_scale_dq, shared_w1, shared_w1_scale, shared_w3,
+        shared_w3_scale, shared_w2, shared_w2_scale, sh, SH_M_TILE, SH_VALID_M, N_MTILES,
+    )
 
 
 expert_shared = pl.jit.inline(_expert_shared)

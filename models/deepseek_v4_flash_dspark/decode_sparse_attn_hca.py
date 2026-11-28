@@ -118,6 +118,23 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
 
 
 @pl.jit.inline(auto_scope=False)
+def hca_visible_cmp_columns(
+    table: pl.Tensor,
+    kv_seq_lens: pl.Tensor,
+    active_requests: pl.Scalar[pl.INDEX],
+):
+    """Retain the logical pages that any active HCA query can read."""
+    max_length = pl.cast(0, pl.INT32)
+    for request in pl.range(active_requests):
+        length = pl.read(kv_seq_lens, [request])
+        if length > max_length:
+            max_length = length
+    compressed_rows = pl.cast(max_length, pl.INDEX) // COMPRESS_RATIO
+    visible_pages = (compressed_rows + CMP_STORAGE_BLOCK_SIZE - 1) // CMP_STORAGE_BLOCK_SIZE
+    return pl.min(pl.tensor.dim(table, 1), pl.max(visible_pages, 1))
+
+
+@pl.jit.inline(auto_scope=False)
 def _cmp_query_kv(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     token: pl.Scalar[pl.INDEX],
@@ -273,7 +290,7 @@ def _cmp_single_work(
 
 
 @pl.jit.inline(auto_scope=False)
-def sparse_attn_hca(
+def sparse_attn_hca_bounded(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -287,6 +304,7 @@ def sparse_attn_hca(
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     ori_cache_ready_dep: pl.Scalar[pl.TASK_ID],
     cmp_cache_ready_dep: pl.Scalar[pl.TASK_ID],
+    cmp_table_blocks: pl.Scalar[pl.INDEX],
 ):
     """Compute raw and compressed HCA states and inverse-RoPE metadata."""
     t_dim = pl.tensor.dim(q, 0)
@@ -294,7 +312,6 @@ def sparse_attn_hca(
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    cmp_table_blocks = pl.tensor.dim(cmp_block_table, 1)
     cmp_work_count = (cmp_table_blocks + CMP_PAGES_PER_WORK - 1) // CMP_PAGES_PER_WORK
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
@@ -608,8 +625,10 @@ def sparse_attn_hca(
         li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
         ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
         cmp_qk_workers = pl.min(NUM_QK_CORES, pl.max(attn_clusters - attn_clusters // 2, 1))
-        if cmp_work_count == 1:
-            if cmp_table_blocks * CMP_STORAGE_BLOCK_SIZE <= CMP_SINGLE_K_TILE:
+        # Keep the original FP32 softmax update and PV tile for each physical table.
+        physical_columns = pl.tensor.dim(cmp_block_table, 1)
+        if physical_columns <= CMP_PAGES_PER_WORK:
+            if physical_columns * CMP_STORAGE_BLOCK_SIZE <= CMP_SINGLE_K_TILE:
                 cmp_partial_m, cmp_partial_l, cmp_partial_o, cmp_qk_tid = _cmp_single_work(
                     q_flat, cmp_work_kv, cmp_work_valid, cmp_block_table, position_ids, kv_seq_lens,
                     attn_sink_col, score_transfer, probability_transfer, cmp_partial_m, cmp_partial_l,
@@ -798,7 +817,38 @@ def sparse_attn_hca(
 
 
 @pl.jit.inline(auto_scope=False)
-def sparse_attn_hca_tp1(
+def sparse_attn_hca(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    ori_cache_ready_dep: pl.Scalar[pl.TASK_ID],
+    cmp_cache_ready_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Use the full compressed-page table for this standalone entry point."""
+    (
+        raw_m, raw_l, raw_o, cmp_m, cmp_l, cmp_o,
+        cos_il, sin_signed, raw_ready, cmp_ready, rope_ready,
+    ) = sparse_attn_hca_bounded(
+        q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table, position_ids,
+        kv_seq_lens, attn_sink, freqs_cos, freqs_sin, ori_cache_ready_dep, cmp_cache_ready_dep,
+        pl.tensor.dim(cmp_block_table, 1),
+    )
+    return (
+        raw_m, raw_l, raw_o, cmp_m, cmp_l, cmp_o,
+        cos_il, sin_signed, raw_ready, cmp_ready, rope_ready,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_hca_tp1_bounded(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -813,6 +863,7 @@ def sparse_attn_hca_tp1(
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     raw_cache_ready_dep: pl.Scalar[pl.TASK_ID],
     cmp_cache_ready_dep: pl.Scalar[pl.TASK_ID],
+    cmp_visible_columns: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write HCA heads as grouped ``[T_PAD, O_GROUP_IN]`` slabs."""
     (
@@ -820,9 +871,9 @@ def sparse_attn_hca_tp1(
         cmp_partial_m, cmp_partial_l, cmp_partial_o,
         rope_cos_il, rope_sin_signed,
         raw_tid, cmp_tid, rope_tid,
-    ) = sparse_attn_hca(
+    ) = sparse_attn_hca_bounded(
         q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table, position_ids, kv_seq_lens, attn_sink, freqs_cos,
-        freqs_sin, raw_cache_ready_dep, cmp_cache_ready_dep,
+        freqs_sin, raw_cache_ready_dep, cmp_cache_ready_dep, cmp_visible_columns,
     )
     t_dim = pl.tensor.dim(stream_state_m, 0) // H
     stream_block_count = t_dim * (H // H_TILE)
@@ -901,6 +952,32 @@ def sparse_attn_hca_tp1(
             pl.store(stream_pack_second, [stream_pack_row1, 0], o_packed_heads)
 
     return o_packed_heads, heads_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_hca_tp1(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_TABLE_BLOCKS_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    raw_cache_ready_dep: pl.Scalar[pl.TASK_ID],
+    cmp_cache_ready_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16], pl.Scalar[pl.TASK_ID]]:
+    """Use the full compressed-page table for this standalone entry point."""
+    heads, ready = sparse_attn_hca_tp1_bounded(
+        q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table, position_ids,
+        kv_seq_lens, attn_sink, freqs_cos, freqs_sin, o_packed_heads, raw_cache_ready_dep,
+        cmp_cache_ready_dep, pl.tensor.dim(cmp_block_table, 1),
+    )
+    return o_packed_heads, ready
 
 
 @pl.jit

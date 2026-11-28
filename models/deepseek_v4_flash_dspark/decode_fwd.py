@@ -60,6 +60,7 @@ if not any(arg == "--ep" or arg.startswith("--ep=") for arg in sys.argv):
 
 try:
     import decode_csa as csa
+    from decode_sparse_attn_hca import hca_visible_cmp_columns
     import decode_hca as hca
     import decode_swa as swa
     import moe as moe_module
@@ -71,7 +72,7 @@ try:
         DECODE_GROUP_CAP,
     )
     from decode_csa import decode_csa, decode_csa_tp1
-    from decode_hca import decode_hca, decode_hca_tp1
+    from decode_hca import decode_hca, decode_hca_tp1_bounded
     from decode_swa import decode_swa, decode_swa_tp1
     from hc_head import hc_head
     from lm_head import (
@@ -151,6 +152,7 @@ N_ROUTES = moe_module.N_ROUTES
 HCA_B_DYN = hca.B_DYN
 HCA_CMP_TABLE_BLOCKS_DYN = hca.CMP_TABLE_BLOCKS_DYN
 HCA_B = hca.B
+HCA_QUERY_WIDTH = hca.S
 HCA_MAIN_OUT_DIM = hca.MAIN_OUT_DIM
 HCA_COMPRESS_RATIO = hca.COMPRESS_RATIO
 HCA_COMPRESS_STATE_BLOCK_SIZE = hca.COMPRESS_STATE_BLOCK_SIZE
@@ -755,6 +757,13 @@ def _decode_fwd(
                 pl.const(1, pl.INT32), owner_tokens, my_rank, pl.const(2, pl.INT32), owner_tokens,
             )
 
+    if TP_SIZE == 1:
+        # Cache lengths are shared by all HCA layers in this decode step.
+        hca_requests = (pl.cast(owner_tokens, pl.INDEX) + HCA_QUERY_WIDTH - 1) // HCA_QUERY_WIDTH
+        hca_cmp_columns = hca_visible_cmp_columns(hca_cmp_block_table, hca_kv_seq_lens, hca_requests)
+    else:
+        hca_cmp_columns = pl.tensor.dim(hca_cmp_block_table, 1)
+
     for ordinal in pl.range(HCA_LAYER_COUNT):
         csa_model_layer = pl.cast(ordinal * 2 + 2, pl.INT32)
         hca_model_layer = pl.cast(ordinal * 2 + 3, pl.INT32)
@@ -816,10 +825,10 @@ def _decode_fwd(
             shared_w2_layer_csa = shared_w2[csa_weight_layer]
             shared_w2_scale_layer_csa = pl.slice(shared_w2_scale, [D], [csa_weight_layer * D])
             x_attn_moe_csa = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-            x_attn_view_csa = pl.slice(x_attn_moe_csa, [local_t, HC_MULT, D], [0, 0, 0])
             with pl.scope():
                 if group_tokens > 0:
                     if TP_SIZE == 1:
+                        x_attn_view_csa = pl.slice(x_attn_moe_csa, [owner_tokens, HC_MULT, D], [0, 0, 0])
                         decode_csa_tp1(
                             x_ping,
                             hc_attn_fn_layer_csa, hc_attn_scale_layer_csa, hc_attn_base_layer_csa,
@@ -845,6 +854,7 @@ def _decode_fwd(
                             x_attn_view_csa,
                         )
                     else:
+                        x_attn_view_csa_tp = pl.slice(x_attn_moe_csa, [local_t, HC_MULT, D], [0, 0, 0])
                         gather_signal_step_csa = gather_signal
                         attention_signal_step_csa = attention_signal
                         o_signal_step_csa = o_signal
@@ -870,7 +880,7 @@ def _decode_fwd(
                             csa_state_slot_mapping, csa_inner_state_slot_mapping,
                             position_ids_local, position_ids, csa_kv_seq_lens,
                             attn_sink_layer_csa, wo_a_layer_csa, wo_b_layer_csa, wo_b_scale_layer_csa,
-                            x_attn_view_csa,
+                            x_attn_view_csa_tp,
                             gather_window, gather_signal_step_csa,
                             attention_window, attention_signal_step_csa,
                             o_window, o_signal_step_csa,
@@ -939,11 +949,11 @@ def _decode_fwd(
             shared_w2_layer_hca = shared_w2[hca_weight_layer]
             shared_w2_scale_layer_hca = pl.slice(shared_w2_scale, [D], [hca_weight_layer * D])
             x_attn_moe_hca = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-            x_attn_view_hca = pl.slice(x_attn_moe_hca, [local_t, HC_MULT, D], [0, 0, 0])
             with pl.scope():
                 if group_tokens > 0:
                     if TP_SIZE == 1:
-                        decode_hca_tp1(
+                        x_attn_view_hca = pl.slice(x_attn_moe_hca, [owner_tokens, HC_MULT, D], [0, 0, 0])
+                        decode_hca_tp1_bounded(
                             x_pong,
                             hc_attn_fn_layer_hca, hc_attn_scale_layer_hca, hc_attn_base_layer_hca,
                             attn_norm_w_layer_hca, wq_a_layer_hca, wq_b_layer_hca, wq_b_scale_layer_hca,
@@ -958,9 +968,10 @@ def _decode_fwd(
                             hca_cmp_slot_mapping, hca_state_slot_mapping,
                             position_ids_local, hca_kv_seq_lens,
                             attn_sink_layer_hca, wo_a_layer_hca, wo_b_layer_hca, wo_b_scale_layer_hca,
-                            x_attn_view_hca,
+                            x_attn_view_hca, hca_cmp_columns,
                         )
                     else:
+                        x_attn_view_hca_tp = pl.slice(x_attn_moe_hca, [local_t, HC_MULT, D], [0, 0, 0])
                         gather_signal_step_hca = gather_signal
                         attention_signal_step_hca = attention_signal
                         o_signal_step_hca = o_signal
@@ -979,7 +990,7 @@ def _decode_fwd(
                             hca_cmp_slot_mapping, hca_state_slot_mapping,
                             position_ids_local, position_ids, hca_kv_seq_lens,
                             attn_sink_layer_hca, wo_a_layer_hca, wo_b_layer_hca, wo_b_scale_layer_hca,
-                            x_attn_view_hca,
+                            x_attn_view_hca_tp,
                             gather_window, gather_signal_step_hca,
                             attention_window, attention_signal_step_hca,
                             o_window, o_signal_step_hca,
@@ -1065,6 +1076,7 @@ def _decode_fwd(
         with pl.scope():
             if group_tokens > 0:
                 if TP_SIZE == 1:
+                    x_attn_view_last = pl.slice(x_attn_active, [owner_tokens, HC_MULT, D], [0, 0, 0])
                     decode_csa_tp1(
                         x_ping,
                         hc_attn_fn_layer_last, hc_attn_scale_layer_last, hc_attn_base_layer_last,
@@ -1087,7 +1099,7 @@ def _decode_fwd(
                         csa_state_slot_mapping, csa_inner_state_slot_mapping,
                         position_ids_local, csa_kv_seq_lens,
                         attn_sink_layer_last, wo_a_layer_last, wo_b_layer_last, wo_b_scale_layer_last,
-                        x_attn_active,
+                        x_attn_view_last,
                     )
                 else:
                     gather_signal_step_last = gather_signal
