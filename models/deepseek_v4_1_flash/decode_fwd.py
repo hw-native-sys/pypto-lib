@@ -519,6 +519,8 @@ def decode_decoder(
     pool_block_capacity = pl.min(CANDIDATE_TOPK_BLOCKS, pl.max(32, (pool_blocks_raw + 31) // 32 * 32))
     pool_block_ids = pl.create_tensor([tokens, pool_block_capacity], dtype=pl.INT32)
     pool_block_counts = pl.create_tensor([tokens], dtype=pl.INT32)
+    # Layers 24, 28, 32, and 36 score the same candidate pool from layer 20.
+    reindex_runs = pl.create_tensor([5, tokens + 1], dtype=pl.INT32)
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
@@ -618,7 +620,7 @@ def decode_decoder(
                     pool_block_ids, pool_block_counts,
                     reindex_index_wq_b, reindex_index_wq_b_scale, reindex_index_weights_proj,
                     topk_indices,
-                    attention_hidden, attention_pre_mix, attention_count,
+                    attention_hidden, attention_pre_mix, attention_count, reindex_runs, layer == 24,
                 )
             else:
                 decode_c1a_reuse(

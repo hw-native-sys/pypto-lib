@@ -39,7 +39,7 @@ SOFTWARE.
 #include "intrinsic.h"
 
 namespace {
-enum Stage : int64_t { kMetadata = 0, kAttention = 1, kScore = 2, kPool = 3, kScoreCandidates = 4 };
+enum Stage : int64_t { kMetadata = 0, kAttention = 1, kScore = 2, kAttentionWithPool = 3, kScoreCandidates = 4 };
 
 template <typename T>
 __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int slot) {
@@ -3037,6 +3037,8 @@ __aicore__ inline void topk_select_run(uint32_t valid_len, uint32_t topk, __gm__
 // PyPTO attention and candidate-pool writeback.
 namespace {
 enum Argument { kScoresArg, kLengthsArg, kIndicesArg, kTableArg, kRequestsArg, kCountsArg, kModeArg, kActiveArg, kSortedArg, kPageRowsArg };
+enum AttentionPoolArgument { kBlockScoresArg = kModeArg, kPoolIndicesArg, kAttentionPoolModeArg };
+constexpr int kAttentionPoolScalarOffset = kAttentionPoolModeArg - kModeArg;
 template <typename T>
 __aicore__ inline __gm__ T* tensor_data(__gm__ int64_t* args, int slot) {
     auto tensor = reinterpret_cast<__gm__ Tensor*>(args[slot]);
@@ -3128,11 +3130,12 @@ struct DirectOutputStore {
     uint32_t visible;
     int32_t request;
     __ubuf__ int32_t* prefetched_table;
+    uint32_t page_rows;
+    int64_t output_width;
 
     __aicore__ inline void operator()(__gm__ int32_t* target, __ubuf__ int32_t* source,
                                       uint32_t topk) const {
         if constexpr (kAttentionOutput) {
-            const uint32_t page_rows = args[kPageRowsArg];
             auto table = reinterpret_cast<__gm__ Tensor*>(args[kTableArg]);
             auto table_row = reinterpret_cast<__ubuf__ int32_t*>(0);
             if (prefetched_table != nullptr) {
@@ -3157,22 +3160,24 @@ struct DirectOutputStore {
             wait_flag(PIPE_V, PIPE_MTE3, event_t(7));
             store_indices(target, source, topk);
         } else {
-            auto pool = reinterpret_cast<__gm__ Tensor*>(args[kIndicesArg]);
             store_indices(target, source, topk);
             store_count(tensor_row<int32_t>(args, kCountsArg, row), visible < topk ? visible : topk);
-            if (pool->shapes[1] > topk) clear_pool(target + topk, pool->shapes[1] - topk);
+            if (output_width > topk) clear_pool(target + topk, output_width - topk);
         }
     }
 };
 
-template <typename Policy, bool kAttentionOutput, bool kSortedIndex>
+template <typename Policy, bool kAttentionOutput, bool kSortedIndex, int kScalarOffset = 0>
 static __aicore__ __attribute__((noinline)) void select_rows(__gm__ int64_t* args, uint32_t topk) {
     using namespace topk_select_ascend;
-    auto scores_tensor = reinterpret_cast<__gm__ Tensor*>(args[kScoresArg]);
-    auto indices_tensor = reinterpret_cast<__gm__ Tensor*>(args[kIndicesArg]);
-    auto scores = tensor_data<bfloat16_t>(args, kScoresArg);
-    auto indices = tensor_data<int32_t>(args, kIndicesArg);
-    const int64_t active = args[kActiveArg];
+    constexpr int kScores = kAttentionOutput ? int(kScoresArg) : int(kBlockScoresArg);
+    constexpr int kIndices = kAttentionOutput ? int(kIndicesArg) : int(kPoolIndicesArg);
+    auto scores_tensor = reinterpret_cast<__gm__ Tensor*>(args[kScores]);
+    auto indices_tensor = reinterpret_cast<__gm__ Tensor*>(args[kIndices]);
+    auto scores = tensor_data<bfloat16_t>(args, kScores);
+    auto indices = tensor_data<int32_t>(args, kIndices);
+    const int64_t active = args[kActiveArg + kScalarOffset];
+    const uint32_t page_rows = kAttentionOutput ? args[kPageRowsArg + kScalarOffset] : 0;
     const int64_t tokens = scores_tensor->shapes[0];
     const int64_t score_stride = scores_tensor->strides[0];
     const int64_t index_stride = indices_tensor->strides[0];
@@ -3196,7 +3201,6 @@ static __aicore__ __attribute__((noinline)) void select_rows(__gm__ int64_t* arg
             constexpr uintptr_t kTableOffset = LowerPlan::kUbEnd > UpperPlan::kUbEnd
                 ? LowerPlan::kUbEnd : UpperPlan::kUbEnd;
             constexpr uint32_t kTableCapacity = (TOPK_UB_LIMIT_BYTES - kTableOffset) / sizeof(int32_t);
-            const uint32_t page_rows = args[kPageRowsArg];
             uint32_t pages = (visible + page_rows - 1) >> (page_rows == 64 ? 6 : 7);
             if (pages > 0 && pages <= kTableCapacity) {
                 auto table = reinterpret_cast<__gm__ Tensor*>(args[kTableArg]);
@@ -3210,7 +3214,8 @@ static __aicore__ __attribute__((noinline)) void select_rows(__gm__ int64_t* arg
                 set_flag(PIPE_MTE2, PIPE_V, event_t(7));
             }
         }
-        DirectOutputStore<kAttentionOutput> store{args, row, static_cast<uint32_t>(visible), request, prefetched_table};
+        DirectOutputStore<kAttentionOutput> store{args, row, static_cast<uint32_t>(visible), request,
+                                                  prefetched_table, page_rows, indices_tensor->shapes[1]};
         if (visible <= Policy::pivot) {
             topk_select_run<typename Policy::LowerConfig, kSortedIndex, bfloat16_t, int32_t>(
                 visible, topk, row_scores, nullptr, row_indices, false, nullptr, -1, 0, store);
@@ -3570,6 +3575,7 @@ static __aicore__ __attribute__((noinline)) void prepare_metadata(__gm__ int64_t
 #endif  // __DAV_VEC__
 // Externs pack Tensor pointers before scalar arguments. A shorter signature
 // stores its mode where longer signatures have a non-null Tensor pointer.
+// The combined selector has two extra tensor pointers before its mode.
 // Both scoring signatures place the mode in slot 11.
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
@@ -3582,12 +3588,16 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
         else select_rows<topk_select_ascend::Topk512Config, true, false>(args, 512);
         return;
     }
-    if (args[kModeArg] == kPool) {
+    if (args[kAttentionPoolModeArg] == kAttentionWithPool) {
         using namespace topk_select_ascend;
-        const int64_t capacity = reinterpret_cast<__gm__ Tensor*>(args[kIndicesArg])->shapes[1];
-        if (capacity <= 512) select_rows<Topk512Config, false, true>(args, capacity);
-        else if (capacity <= 1024) select_rows<Topk1024Config, false, true>(args, capacity);
-        else select_rows<Topk4096Config, false, true>(args, capacity < 2048 ? capacity : 2048);
+        constexpr int kOffset = kAttentionPoolScalarOffset;
+        if (args[kSortedArg + kOffset]) select_rows<Topk512Config, true, true, kOffset>(args, 512);
+        else select_rows<Topk512Config, true, false, kOffset>(args, 512);
+
+        const int64_t capacity = reinterpret_cast<__gm__ Tensor*>(args[kPoolIndicesArg])->shapes[1];
+        if (capacity <= 512) select_rows<Topk512Config, false, true, kOffset>(args, capacity);
+        else if (capacity <= 1024) select_rows<Topk1024Config, false, true, kOffset>(args, capacity);
+        else select_rows<Topk4096Config, false, true, kOffset>(args, capacity < 2048 ? capacity : 2048);
         return;
     }
 #endif

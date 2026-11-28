@@ -19,10 +19,9 @@ from config import (
     FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, WINDOW_CACHE_BYTES,
     COMPRESSED_CACHE_BYTES,
 )
-from hc import hc_head_norm, hc_project, hc_sinkhorn
-from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
-from o_proj import o_proj_hc_post
-from sparse_attention import gather_sparse_attention
+from hc import hc_project, hc_sinkhorn
+from qkv_proj_rope import hc_qkv_quant, q_proj_rope, kv_proj, window_publish
+from o_proj import gather_project_hc_post
 
 
 
@@ -75,8 +74,9 @@ def decode_c1a_reuse(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x_hc, 0)
-    x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm, worker_limit=64)
+    proj_payload, proj_scales, proj_payload_padded_rows = hc_qkv_quant(
+        x_hc, pre_mix, attn_norm_weight, num_tokens, projection_tile=80, emit_normalized=False,
+    )
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -85,7 +85,6 @@ def decode_c1a_reuse(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = qkv_quant(x_norm, num_tokens, row_tile=80)
     q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
@@ -106,15 +105,10 @@ def decode_c1a_reuse(
         window_slots, window_cache,
         num_tokens,
     )
-    attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    gather_sparse_attention(
+    gather_project_hc_post(
         query, window_indices, window_cache, compressed_indices, compressed_cache,
-        attn_sink, attn_out, num_tokens, compressed_keys=INDEX_TOPK,
-    )
-    o_proj_hc_post(
-        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        x_hc, post_mix, residual_mix, output, num_tokens,
-        oa_row_tile=80, ob_row_tile=128,
+        attn_sink, rope_cos, rope_sin, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        x_hc, post_mix, residual_mix, output, num_tokens, compressed_keys=INDEX_TOPK,
     )
     return output
 

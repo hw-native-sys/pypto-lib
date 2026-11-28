@@ -35,9 +35,11 @@ HC_PAD = 8
 T_TILE = 8
 LINEAR_T_TILE = 16
 HF32_LINEAR_T_TILE = 80
+HF32_NARROW_T_TILE = 32
+HF32_MIN_T_TILE = 16
 HF32_LINEAR_K_L1_TILE = 512
 HF32_LINEAR_K_L0_TILE = 64
-SINKHORN_T_TILE = 6
+SINKHORN_T_TILE = 16
 SINKHORN_WIDE_T_TILE = 16
 SINKHORN_WORKER_TILE = 12
 RMS_K_TILE = 1024
@@ -54,12 +56,16 @@ PRE_NORM_STORE_T_TILE = 2
 POST_WORKER_TILE = 64
 
 
+_NORM_ONLY = 1
+_NORM_AND_COLLAPSED = 2
+_NORM_COLLAPSED_AND_INV_RMS = 3
+
 @pl.jit.inline
 def hc_sinkhorn(
     inv_rms: pl.Tensor, partials: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
     pre_mix: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
 ):
-    """Normalize six HC matrices per worker, keeping all four rows in registers."""
+    """Normalize HC matrices in sixteen-row tiles, keeping all four rows in registers."""
     tokens = pl.tensor.dim(pre_mix, 0)
     padded_rows = pl.tensor.dim(inv_rms, 0)
     inverse_flat = pl.reshape(inv_rms, [1, padded_rows])
@@ -73,10 +79,10 @@ def hc_sinkhorn(
         for block in pl.range(worker, blocks, workers):
             start = block * SINKHORN_T_TILE
             rows = pl.min(SINKHORN_T_TILE, tokens - start)
-            p0 = pl.load(partials, [start, 0], [6, 32], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
-            p1 = pl.load(partials, [padded_rows + start, 0], [6, 32], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
-            p2 = pl.load(partials, [2 * padded_rows + start, 0], [6, 32], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
-            p3 = pl.load(partials, [3 * padded_rows + start, 0], [6, 32], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
+            p0 = pl.load(partials, [start, 0], [SINKHORN_T_TILE, MIX_PAD], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
+            p1 = pl.load(partials, [padded_rows + start, 0], [SINKHORN_T_TILE, MIX_PAD], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
+            p2 = pl.load(partials, [2 * padded_rows + start, 0], [SINKHORN_T_TILE, MIX_PAD], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
+            p3 = pl.load(partials, [3 * padded_rows + start, 0], [SINKHORN_T_TILE, MIX_PAD], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
             inverse = pl.load(inverse_flat, [0, start], [1, 32], valid_shape=[1, rows], target_memory=pl.MemorySpace.Vec)
             bias = pl.load(bias_flat, [0, 0], [1, 32], valid_shape=[1, MIX_HC], target_memory=pl.MemorySpace.Vec)
             scales = pl.load(scale_flat, [0, 0], [1, 8], valid_shape=[1, 3], target_memory=pl.MemorySpace.Vec)
@@ -85,9 +91,9 @@ def hc_sinkhorn(
             s2_scalar = pl.tile.read(scales, [0, 2])
             # Scatter overwrites every valid output element before it is stored.
             # Allocate UB without initializing padding, matching the C++ kernel.
-            pre = pl.create_tile([48], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            post = pl.create_tile([48], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            comb = pl.create_tile([96], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            pre = pl.create_tile([SINKHORN_T_TILE * HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            post = pl.create_tile([SINKHORN_T_TILE * HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            comb = pl.create_tile([SINKHORN_T_TILE * HC_MULT * HC_MULT], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             with pl.reg_scope():
                 full = pl.reg.full_mask(lanes=64)
                 lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
@@ -297,9 +303,9 @@ def hc_sinkhorn(
                 comb = pl.reg.scatter(comb, comb_index4, m1, mask)
                 comb = pl.reg.scatter(comb, comb_index8, m2, mask)
                 comb = pl.reg.scatter(comb, comb_index12, m3, mask)
-            pre = pl.reshape(pre, [6, 8])
-            post = pl.reshape(post, [6, 8])
-            comb = pl.reshape(comb, [6, 16])
+            pre = pl.reshape(pre, [SINKHORN_T_TILE, HC_PAD])
+            post = pl.reshape(post, [SINKHORN_T_TILE, HC_PAD])
+            comb = pl.reshape(comb, [SINKHORN_T_TILE, HC_MULT * HC_MULT])
             pre = pl.set_validshape(pre, rows, HC_MULT)
             post = pl.set_validshape(post, rows, HC_MULT)
             comb = pl.set_validshape(comb, rows, HC_MULT * HC_MULT)
@@ -310,8 +316,72 @@ def hc_sinkhorn(
 
 
 
+@pl.jit.inline(auto_scope=False)
+def _hc_rms_blocks(
+    x_flat: pl.Tensor, inv_rms: pl.Tensor, t_dim: pl.Scalar[pl.INDEX], rms_blocks: pl.Scalar[pl.INDEX],
+    worker: pl.Scalar[pl.INDEX], workers: pl.Scalar[pl.INDEX],
+):
+    for block in pl.range(worker, rms_blocks, workers):
+        t0 = block * T_TILE
+        valid_rows = pl.min(T_TILE, t_dim - t0)
+        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(HC_DIM // RMS_K_TILE, stage=4):
+            k0 = kb * RMS_K_TILE
+            rms_x_tile = pl.slice(
+                x_flat,
+                [T_TILE, RMS_K_TILE],
+                [t0, k0],
+                valid_shape=[valid_rows, RMS_K_TILE],
+            )
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_tile, rms_x_tile)), [1, T_TILE]))
+        rms_arg = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
+        inv_rms[t0 : t0 + T_TILE, 0:1] = pl.reshape(
+            pl.rsqrt(rms_arg, high_precision=True), [T_TILE, 1]
+        )
+
+
+@pl.jit.inline(auto_scope=False)
+def _hc_linear_blocks(
+    x_flat: pl.Tensor, function: pl.Tensor, mixes_partials: pl.Tensor, t_dim: pl.Scalar[pl.INDEX],
+    t_linear: pl.Scalar[pl.INDEX], worker: pl.Scalar[pl.INDEX], tasks: pl.Scalar[pl.INDEX], row_tile: pl.constexpr,
+):
+    for task in pl.range(worker, tasks, pl.tile.get_block_num()):
+        t0 = (task // LINEAR_OK) * row_tile
+        split = task % LINEAR_OK
+        k_base = split * (HC_DIM // LINEAR_OK)
+        valid_rows = pl.min(row_tile, t_dim - t0)
+        acc = pl.tile.create([row_tile, MIX_PAD], pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+        acc = pl.set_validshape(acc, valid_rows, MIX_HC)
+        for kb in pl.pipeline((HC_DIM // LINEAR_OK) // HF32_LINEAR_K_L1_TILE, stage=2):
+            k0 = k_base + kb * HF32_LINEAR_K_L1_TILE
+            a_l1 = pl.load(
+                x_flat, [t0, k0], [row_tile, HF32_LINEAR_K_L1_TILE],
+                valid_shape=[valid_rows, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat,
+            )
+            b_l1 = pl.load(
+                function, [0, k0], [MIX_PAD, HF32_LINEAR_K_L1_TILE],
+                valid_shape=[MIX_HC, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat,
+            )
+            b_l1_t = pl.tile.transpose_view(b_l1)
+            for inner in pl.pipeline(HF32_LINEAR_K_L1_TILE // HF32_LINEAR_K_L0_TILE, stage=2):
+                k_l0 = inner * HF32_LINEAR_K_L0_TILE
+                left = pl.tile.extract(
+                    a_l1, 0, k_l0, [row_tile, HF32_LINEAR_K_L0_TILE], target_memory=pl.Mem.Left,
+                )
+                right = pl.tile.extract(
+                    b_l1_t, k_l0, 0, [HF32_LINEAR_K_L0_TILE, MIX_PAD], target_memory=pl.Mem.Right,
+                )
+                first = kb * (HF32_LINEAR_K_L1_TILE // HF32_LINEAR_K_L0_TILE) + inner == 0
+                acc = pl.tile.matmul_acc(acc, left, right, init_cond=first, tf32_mode="round_away")
+        partial = split * t_linear + t0
+        pl.store(acc, [partial, 0], mixes_partials)
+
+
 @pl.jit.inline
-def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.constexpr):
+def hc_project_tiled(
+    x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.constexpr,
+    projection_row_tile: pl.constexpr,
+):
     """Compute FP32 inverse RMS and split-K HC projection coefficients."""
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
@@ -319,28 +389,30 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
 
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     rms_blocks = (t_dim + T_TILE - 1) // T_TILE
-    rms_workers = pl.max(pl.min(rms_blocks, rms_worker_limit), 1)
-    for worker in pl.spmd(rms_workers, name_hint="hc_rms"):
-        for block in pl.range(worker, rms_blocks, rms_workers):
-            t0 = block * T_TILE
-            valid_rows = pl.min(T_TILE, t_dim - t0)
-            sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.pipeline(HC_DIM // RMS_K_TILE, stage=4):
-                k0 = kb * RMS_K_TILE
-                rms_x_tile = pl.slice(
-                    x_flat,
-                    [T_TILE, RMS_K_TILE],
-                    [t0, k0],
-                    valid_shape=[valid_rows, RMS_K_TILE],
-                )
-                sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_tile, rms_x_tile)), [1, T_TILE]))
-            rms_arg = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
-            inv_rms[t0 : t0 + T_TILE, 0:1] = pl.reshape(
-                pl.rsqrt(rms_arg, high_precision=True), [T_TILE, 1]
-            )
-
-    partials = hc_linear(x_hc, function, HF32_LINEAR_T_TILE, HF32_LINEAR_K_L0_TILE)
-    return inv_rms, partials
+    mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
+    clusters = pl.system.available_cluster_count()
+    narrow_tasks = ((t_dim + HF32_NARROW_T_TILE - 1) // HF32_NARROW_T_TILE) * LINEAR_OK
+    # Use narrower row tiles within one Cube wave.
+    small_tasks = ((t_dim + HF32_MIN_T_TILE - 1) // HF32_MIN_T_TILE) * LINEAR_OK
+    if projection_row_tile == HF32_MIN_T_TILE and t_dim > HF32_NARROW_T_TILE and small_tasks <= clusters:
+        workers = pl.max(1, pl.min(small_tasks, rms_worker_limit))
+        for worker in pl.spmd(workers, name_hint="hc_project_coefficients_16"):
+            _hc_rms_blocks(x_flat, inv_rms, t_dim, rms_blocks, worker, workers)
+            _hc_linear_blocks(x_flat, function, mixes_partials, t_dim, t_linear, worker, small_tasks, HF32_MIN_T_TILE)
+    elif t_dim > HF32_NARROW_T_TILE and narrow_tasks <= clusters:
+        workers = pl.max(1, pl.min(narrow_tasks, rms_worker_limit))
+        for worker in pl.spmd(workers, name_hint="hc_project_coefficients"):
+            _hc_rms_blocks(x_flat, inv_rms, t_dim, rms_blocks, worker, workers)
+            _hc_linear_blocks(x_flat, function, mixes_partials, t_dim, t_linear, worker, narrow_tasks, HF32_NARROW_T_TILE)
+    else:
+        rms_workers = pl.max(pl.min(rms_blocks, rms_worker_limit), 1)
+        for worker in pl.spmd(rms_workers, name_hint="hc_rms"):
+            _hc_rms_blocks(x_flat, inv_rms, t_dim, rms_blocks, worker, rms_workers)
+        tasks = ((t_dim + HF32_LINEAR_T_TILE - 1) // HF32_LINEAR_T_TILE) * LINEAR_OK
+        workers = pl.min(tasks, clusters)
+        for worker in pl.spmd(workers, name_hint="hc_linear"):
+            _hc_linear_blocks(x_flat, function, mixes_partials, t_dim, t_linear, worker, tasks, HF32_LINEAR_T_TILE)
+    return inv_rms, mixes_partials
 
 
 @pl.jit.inline
@@ -390,9 +462,41 @@ def hc_linear(
     return mixes_partials
 
 
-_NORM_ONLY = 1
-_NORM_AND_COLLAPSED = 2
-_NORM_COLLAPSED_AND_INV_RMS = 3
+
+@pl.jit.inline
+def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.constexpr):
+    return hc_project_tiled(x_hc, function, rms_worker_limit, HF32_NARROW_T_TILE)
+
+
+@pl.jit.inline(auto_scope=False)
+def _hc_collapse_row(
+    source: pl.Tile[[HC_DIM], pl.FP32, pl.Mem.Vec],
+    mix: pl.Tile[[MIX_PAD], pl.FP32, pl.Mem.Vec],
+    local: pl.Scalar[pl.INDEX],
+):
+    """Collapse one row and round it to BF16 in UB."""
+    collapsed = pl.create_tile([D], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        mix0 = pl.reg.load(mix, offset=local * HC_MULT, lanes=1)
+        mix1 = pl.reg.load(mix, offset=local * HC_MULT + 1, lanes=1)
+        mix2 = pl.reg.load(mix, offset=local * HC_MULT + 2, lanes=1)
+        mix3 = pl.reg.load(mix, offset=local * HC_MULT + 3, lanes=1)
+        p0 = pl.reg.broadcast(mix0, lanes=64, dtype=pl.FP32)
+        p1 = pl.reg.broadcast(mix1, lanes=64, dtype=pl.FP32)
+        p2 = pl.reg.broadcast(mix2, lanes=64, dtype=pl.FP32)
+        p3 = pl.reg.broadcast(mix3, lanes=64, dtype=pl.FP32)
+        for chunk in pl.hardware_loop(D // 64):
+            offset = chunk * 64
+            x0 = pl.reg.mul(pl.reg.load(source, offset=offset, lanes=64), p0, full)
+            x1 = pl.reg.mul(pl.reg.load(source, offset=D + offset, lanes=64), p1, full)
+            x2 = pl.reg.mul(pl.reg.load(source, offset=2 * D + offset, lanes=64), p2, full)
+            x3 = pl.reg.mul(pl.reg.load(source, offset=3 * D + offset, lanes=64), p3, full)
+            value = pl.reg.add(pl.reg.add(pl.reg.add(x0, x1, full), x2, full), x3, full)
+            rounded = pl.reg.convert(value, dtype=pl.BF16, rounding="R", saturate=False)
+            _stored = pl.reg.store(collapsed, offset=offset, value=rounded, mask=full)
+    collapsed = pl.reshape(collapsed, [1, D])
+    return collapsed
 
 
 @pl.jit.inline
@@ -427,9 +531,10 @@ def _hc_collapse_rows(
                 mix_flat, [0, start * HC_MULT], [1, MIX_PAD],
                 valid_shape=[1, rows * HC_MULT], target_memory=pl.MemorySpace.Vec,
             )
+            mix = pl.reshape(mix, [MIX_PAD])
             for local in pl.pipeline(rows, stage=2):
                 row = start + local
-                source = pl.load(x_flat, [row, 0], [1, HC_DIM], target_memory=pl.MemorySpace.Vec)
+                source = pl.load(x_flat, [row, 0], [1, HC_DIM], target_memory=pl.Mem.Vec)
                 source = pl.reshape(source, [HC_DIM])
                 collapsed = pl.create_tile([D], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
                 rms_row = pl.create_tile([64], dtype=pl.FP32, target_memory=pl.Mem.Vec)

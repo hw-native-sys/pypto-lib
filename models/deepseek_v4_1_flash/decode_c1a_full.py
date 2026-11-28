@@ -20,8 +20,7 @@ from decode_indexer import (
     c1a_index, golden_select_qli, prepare_score_metadata, select_qli,
     publish_index_rows, project_index_key,
 )
-from o_proj import o_proj_hc_post
-from sparse_attention import gather_sparse_attention
+from o_proj import gather_project_hc_post
 from hc import hc_project, hc_sinkhorn, hc_head_norm
 from config import CACHE_ROWS_DYN
 from config import (
@@ -158,15 +157,10 @@ def decode_c1a_full(
         topk_indices, pool_block_ids, pool_block_counts,
         num_tokens, True, False,
     )
-    attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    gather_sparse_attention(
+    gather_project_hc_post(
         query, window_indices, window_cache, topk_indices, compressed_cache,
-        attn_sink, attn_out, num_tokens, compressed_keys=INDEX_TOPK,
-    )
-    o_proj_hc_post(
-        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        x_hc, post_mix, residual_mix, output, num_tokens,
-        oa_row_tile=80, ob_row_tile=128,
+        attn_sink, rope_cos, rope_sin, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        x_hc, post_mix, residual_mix, output, num_tokens, compressed_keys=INDEX_TOPK,
     )
     return output
 

@@ -18,7 +18,8 @@ from gemm import (
     MX_M_TILE, MX_K_TILE,
     golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum,
 )
-from rmsnorm import EPS, golden_rms_norm
+from hc import HC_DIM, HC_MULT, MIX_PAD, _hc_collapse_row
+from rmsnorm import EPS, _rms_norm_rows, golden_rms_norm
 
 
 # Dynamic shape variables.
@@ -38,6 +39,8 @@ Q_B_N_TILE = 256
 Q_B_RECEIVER_READY = 7
 KV_N_TILE = 64
 QKV_SCALE_TILE = MX_M_TILE * MX_K_TILE // 32
+HC_QKV_ROW_TILE = 2
+HC_QKV_NORM_FOLD = D * 4 // 5
 PROJ_M_TILE = 80
 PROJ_WIDE_M_TILE = 128
 WINDOW_PUBLISH_WORKER_TILE = 12
@@ -473,6 +476,214 @@ def qkv_quant(
             pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
             pl.system.barrier(pipe=pl.PipeType.ALL)
     return payload, scales, padded_rows
+
+
+@pl.jit.inline(auto_scope=False)
+def _normalize_quantize_hc_qkv_row(
+    collapsed: pl.Tile[[1, D], pl.BF16, pl.Mem.Vec],
+    gamma: pl.Tile[[D], pl.BF16, pl.Mem.Vec],
+    scale_words: pl.Tile[[HC_QKV_ROW_TILE * (D // 64)], pl.UINT32, pl.Mem.Vec],
+    local: pl.Scalar[pl.INDEX],
+    emit_normalized: pl.constexpr,
+):
+    """Normalize one collapsed row and quantize the BF16-rounded values in registers."""
+    if not emit_normalized:
+        source_fp32 = pl.cast(collapsed, pl.FP32)
+        squares = pl.mul(source_fp32, source_fp32)
+        folded = squares[:1, :HC_QKV_NORM_FOLD]
+        leading = squares[:1, :D - HC_QKV_NORM_FOLD]
+        trailing = squares[:1, HC_QKV_NORM_FOLD:D]
+        combined = pl.add(leading, trailing)
+        folded[:1, :D - HC_QKV_NORM_FOLD] = combined
+        folded = pl.reshape(folded, [HC_QKV_NORM_FOLD])
+        source_fp32 = pl.reshape(source_fp32, [D])
+    payload_bytes = pl.create_tile([D], dtype=pl.INT8, target_memory=pl.Mem.Vec)
+    payload_words = pl.reinterpret_view(payload_bytes, pl.UINT32, shape=[D // 4])
+    if emit_normalized:
+        normalized = pl.reshape(_rms_norm_rows(collapsed, gamma, D, 1, HC_QKV_NORM_FOLD), [1, D])
+        normalized_flat = pl.reshape(normalized, [D])
+    with pl.reg_scope():
+        if not emit_normalized:
+            reduce_mask = pl.reg.full_mask(lanes=64)
+            lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+            partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+            for chunk in pl.hardware_loop(HC_QKV_NORM_FOLD // 64):
+                square = pl.reg.load(folded, chunk * 64, lanes=64)
+                partial = pl.reg.reduce_sum(square, reduce_mask, reassoc=True)
+                partial_values = pl.reg.broadcast(partial, lanes=64, dtype=pl.FP32)
+                slot = pl.reg.compares(lane, pl.cast(chunk, pl.UINT32), reduce_mask, predicate="eq")
+                partials = pl.reg.select(slot, partial_values, partials)
+            partial_mask = pl.reg.active_mask(HC_QKV_NORM_FOLD // 64, lanes=64)
+            total = pl.reg.reduce_sum(partials, partial_mask, reassoc=True)
+            scalar_mask = pl.reg.full_mask(lanes=1)
+            mean_square = pl.reg.muls(total, 1.0 / D, scalar_mask)
+            variance = pl.reg.adds(mean_square, EPS, scalar_mask)
+            one = pl.reg.broadcast(1.0, lanes=1, dtype=pl.FP32)
+            inverse_variance = pl.reg.div(one, variance, scalar_mask)
+            root = pl.reg.sqrt(inverse_variance, scalar_mask)
+            negative_half = pl.reg.muls(variance, -0.5, scalar_mask)
+            product = pl.reg.mul(negative_half, root, scalar_mask)
+            three_halves = pl.reg.broadcast(1.5, lanes=1, dtype=pl.FP32)
+            factor = pl.reg.mula(three_halves, product, root, scalar_mask)
+            inverse = pl.reg.mul(root, factor, scalar_mask)
+            negative_variance = pl.reg.muls(variance, -1.0, scalar_mask)
+            correction = pl.reg.mula(one, negative_variance, inverse_variance, scalar_mask)
+            negative_inverse = pl.reg.muls(inverse, -1.0, scalar_mask)
+            error = pl.reg.mula(inverse_variance, negative_inverse, inverse, scalar_mask)
+            correction = pl.reg.mula(correction, variance, error, scalar_mask)
+            correction = pl.reg.mul(correction, inverse, scalar_mask)
+            half = pl.reg.broadcast(0.5, lanes=1, dtype=pl.FP32)
+            inverse = pl.reg.mula(inverse, correction, half, scalar_mask)
+            variance_bits = pl.reg.interpret_cast(variance, dtype=pl.UINT32)
+            is_infinite = pl.reg.compares(variance_bits, 2139095040, scalar_mask, predicate="eq")
+            zero = pl.reg.broadcast(0.0, lanes=1, dtype=pl.FP32)
+            inverse = pl.reg.select(is_infinite, zero, inverse)
+            inverse_wide = pl.reg.broadcast(inverse, lanes=MX_K_TILE, dtype=pl.FP32)
+        full = pl.reg.full_mask(lanes=MX_K_TILE)
+        groups = pl.reg.full_mask(lanes=MX_K_TILE // 32)
+        scale_mask = pl.reg.active_mask(4, lanes=64)
+        lanes = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+        first_scale = pl.reg.shift_lefts(lanes, 4, scale_mask)
+        second_scale = pl.reg.adds(first_scale, 8, scale_mask)
+        for chunk in pl.hardware_loop(D // MX_K_TILE):
+            column = chunk * MX_K_TILE
+            if emit_normalized:
+                raw = pl.reg.load(normalized_flat, column, lanes=MX_K_TILE)
+            else:
+                expanded = pl.reg.load(source_fp32, column, lanes=MX_K_TILE)
+                gamma_raw = pl.reg.load(gamma, column, lanes=MX_K_TILE)
+                gain = pl.reg.convert(gamma_raw, dtype=pl.FP32)
+                scaled = pl.reg.mul(expanded, inverse_wide, full)
+                result = pl.reg.mul(scaled, gain, full)
+                raw = pl.reg.convert(result, dtype=pl.BF16, rounding="R", saturate=False)
+            value = pl.reg.convert(raw, dtype=pl.FP32)
+            magnitude = pl.reg.abs(value, full)
+            maximum = pl.reg.reduce_max(magnitude, full, group_size=32)
+            maximum_bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
+            exponent = pl.reg.shift_rights(maximum_bits, 23, groups)
+            exponent = pl.reg.adds(exponent, -8, groups)
+            exponent = pl.reg.maximums(exponent, 0, groups)
+            nonzero = pl.reg.minimums(exponent, 1, groups)
+            reciprocal_code = pl.reg.muls(exponent, -1, groups)
+            reciprocal_code = pl.reg.adds(reciprocal_code, 254, groups)
+            reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, groups)
+            reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, groups)
+            reciprocal = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
+            reciprocal = pl.reg.group_broadcast(reciprocal, lanes=MX_K_TILE)
+            value = pl.reg.mul(value, reciprocal, full)
+            value = pl.reg.maximums(value, -448.0, full)
+            value = pl.reg.minimums(value, 448.0, full)
+            fp8 = pl.reg.convert(value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+            words = pl.reg.interpret_cast(fp8, dtype=pl.UINT32)
+            _payload_written = pl.reg.store(payload_words, chunk * (MX_K_TILE // 4), words)
+            expanded_codes = pl.reg.interpret_cast(exponent, dtype=pl.UINT32)
+            expanded_codes = pl.reg.group_broadcast(expanded_codes, lanes=64)
+            low = pl.reg.gather_lanes(expanded_codes, first_scale)
+            high = pl.reg.gather_lanes(expanded_codes, second_scale)
+            high = pl.reg.shift_lefts(high, 8, scale_mask)
+            scale_pairs = pl.reg.bitwise_or(low, high, scale_mask)
+            scale_offset = pl.cast(local * (D // 64) + chunk * 4, pl.UINT32)
+            dst = pl.reg.adds(lanes, scale_offset, scale_mask)
+            _scale_written = pl.reg.scatter(scale_words, dst, scale_pairs, scale_mask)
+    payload = pl.reinterpret_view(payload_bytes, pl.FP8E4M3FN, shape=[1, D])
+    if emit_normalized:
+        return payload, scale_words, normalized
+    else:
+        return payload, scale_words
+
+
+@pl.jit.inline(auto_scope=False)
+def hc_qkv_quant(
+    x_hc: pl.Tensor,
+    pre_mix: pl.Tensor,
+    norm_weight: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    projection_tile: pl.constexpr,
+    emit_normalized: pl.constexpr,
+):
+    """Collapse, normalize, and quantize the shared Q/KV input in one Vector wave."""
+    capacity = pl.tensor.dim(x_hc, 0)
+    projection_rows = ((capacity + projection_tile - 1) // projection_tile) * projection_tile
+    index_rows = ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+    padded_rows = pl.max(projection_rows, index_rows)
+    payload = pl.create_tensor([padded_rows, D], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([1, padded_rows * (D // 32)], dtype=pl.FP8E8M0)
+    scale_blocks = pl.reshape(scales, [padded_rows // MX_M_TILE * (D // 64), MX_M_TILE * 2])
+    if emit_normalized:
+        normalized_output = pl.create_tensor([capacity, D], dtype=pl.BF16)
+    source = pl.reshape(x_hc, [capacity, HC_DIM])
+    mix_flat = pl.reshape(pre_mix, [1, capacity * HC_MULT])
+    workers = pl.min(padded_rows // HC_QKV_ROW_TILE, 2 * pl.system.available_cluster_count())
+    with pl.spmd(workers, name_hint="hc_qkv_quant", allow_early_resolve=True):
+        worker = pl.tile.get_block_idx()
+        stride = pl.tile.get_block_num() * HC_QKV_ROW_TILE
+        gamma = pl.load(norm_weight, [0], [D], target_memory=pl.Mem.Vec)
+        active_rows = pl.min(num_tokens, capacity)
+        for first in pl.range(worker * HC_QKV_ROW_TILE, padded_rows, stride):
+            scale_words = pl.tile.full([HC_QKV_ROW_TILE * (D // 64)], dtype=pl.UINT32, value=0)
+            valid_rows = pl.max(0, pl.min(active_rows - first, HC_QKV_ROW_TILE))
+            input_rows = valid_rows
+            if emit_normalized:
+                input_rows = pl.max(0, pl.min(capacity - first, HC_QKV_ROW_TILE))
+            if input_rows > 0:
+                mix = pl.load(
+                    mix_flat, [0, first * HC_MULT], [1, MIX_PAD], valid_shape=[1, input_rows * HC_MULT],
+                    target_memory=pl.Mem.Vec,
+                )
+                mix = pl.reshape(mix, [MIX_PAD])
+                for local in pl.range(valid_rows):
+                    row = first + local
+                    input_row = pl.load(source, [row, 0], [1, HC_DIM], target_memory=pl.Mem.Vec)
+                    input_row = pl.reshape(input_row, [HC_DIM])
+                    collapsed = _hc_collapse_row(input_row, mix, local)
+                    if emit_normalized:
+                        quantized, scale_words, normalized = _normalize_quantize_hc_qkv_row(
+                            collapsed, gamma, scale_words, local, True,
+                        )
+                    else:
+                        quantized, scale_words = _normalize_quantize_hc_qkv_row(
+                            collapsed, gamma, scale_words, local, False,
+                        )
+                    pl.store(quantized, [row, 0], payload)
+                    if emit_normalized:
+                        pl.store(normalized, [row, 0], normalized_output)
+                if emit_normalized:
+                    for local in pl.range(valid_rows, input_rows):
+                        row = first + local
+                        input_row = pl.load(source, [row, 0], [1, HC_DIM], target_memory=pl.Mem.Vec)
+                        collapsed = _hc_collapse_row(pl.reshape(input_row, [HC_DIM]), mix, local)
+                        padded_normalized = _rms_norm_rows(collapsed, gamma, D, 1, HC_QKV_NORM_FOLD)
+                        pl.store(pl.reshape(padded_normalized, [1, D]), [row, 0], normalized_output)
+            for local in pl.range(valid_rows, HC_QKV_ROW_TILE):
+                padding = pl.tile.full([1, D], dtype=pl.INT8, value=0)
+                padding_fp8 = pl.reinterpret_view(padding, pl.FP8E4M3FN)
+                pl.store(padding_fp8, [first + local, 0], payload)
+            packed = pl.create_tile([D // 64 * MX_M_TILE // 2], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+            with pl.reg_scope():
+                lanes = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                for row_pair in pl.hardware_loop(HC_QKV_ROW_TILE // 2):
+                    for group in pl.hardware_loop((D // 64 + 63) // 64):
+                        count = pl.min(64, D // 64 - group * 64)
+                        active = pl.reg.active_mask(count, lanes=64)
+                        offset = row_pair * 2 * (D // 64) + group * 64
+                        low = pl.reg.gather(scale_words, lanes, active, base_offset=offset)
+                        high = pl.reg.gather(scale_words, lanes, active, base_offset=offset + D // 64)
+                        high = pl.reg.shift_lefts(high, 16, active)
+                        combined = pl.reg.bitwise_or(low, high, active)
+                        group_offsets = pl.reg.shift_lefts(lanes, 3, active)
+                        base = pl.cast(group * 64 * (MX_M_TILE // 2) + row_pair, pl.UINT32)
+                        offsets = pl.reg.adds(group_offsets, base, active)
+                        _scales_written = pl.reg.scatter(packed, offsets, combined, active)
+            scale_bytes = pl.reinterpret_view(packed, pl.UINT8, shape=[D // 64, MX_M_TILE * 2])
+            scale_codes = pl.reinterpret_view(scale_bytes, pl.FP8E8M0)
+            valid = pl.tile.slice(scale_codes, [D // 64, MX_M_TILE * 2], [0, 0], valid_shape=[D // 64, HC_QKV_ROW_TILE * 2])
+            scale_row = first // MX_M_TILE * (D // 64)
+            scale_column = first % MX_M_TILE * 2
+            pl.store(valid, [scale_row, scale_column], scale_blocks)
+    if emit_normalized:
+        return payload, scales, padded_rows, normalized_output
+    else:
+        return payload, scales, padded_rows
 
 
 @pl.jit.inline(auto_scope=False)
