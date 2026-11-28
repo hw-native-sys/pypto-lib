@@ -376,7 +376,7 @@ def hc_linear(
                 )
                 b_l1 = pl.load(
                     function, [0, k0], [MIX_PAD, HF32_LINEAR_K_L1_TILE],
-                    valid_shape=[MIX_HC, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat,
+                    valid_shape=[MIX_HC, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP
                 )
                 b_l1_t = pl.tile.transpose_view(b_l1)
                 for inner in pl.pipeline(HF32_LINEAR_K_L1_TILE // k_tile, stage=2):

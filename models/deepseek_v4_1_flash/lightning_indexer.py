@@ -181,7 +181,7 @@ def _project_index_query_tiles(
         for wave in pl.range(waves):
             block = wave * block_num + worker
             if block < INDEX_H // 2:
-                full_b = pl.tile.load(nz_weight, [0, block * 256], [Q_LORA, 256], target_memory=pl.MemorySpace.Mat)
+                full_b = pl.tile.load(nz_weight, [0, block * 256], [Q_LORA, 256], target_memory=pl.MemorySpace.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 full_sb = pl.tile.load(b_scale, [0, block * 256], [scale_width, 256], target_memory=pl.MemorySpace.Mat)
                 for begin in pl.range(0, num_tokens, row_tile):
                     full_a = pl.tile.load(payload, [begin, 0], [row_tile, Q_LORA], target_memory=pl.MemorySpace.Mat)

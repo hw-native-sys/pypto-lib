@@ -119,7 +119,7 @@ def _markov_score_cube(
         col = panel * VOCAB_TILE
         for row in pl.range(0, padded, 16):
             left = pl.load(embedding, [row, 0], [16, MARKOV_RANK], target_memory=pl.Mem.Mat)
-            right = pl.load(w2, [col, 0], [VOCAB_TILE, MARKOV_RANK], target_memory=pl.Mem.Mat)
+            right = pl.load(w2, [col, 0], [VOCAB_TILE, MARKOV_RANK], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
             product = pl.matmul(left, pl.tile.transpose_view(right), out_dtype=pl.FP32)
             pl.system.tpush_to_aiv(product, split=1, id=0)
     return scores

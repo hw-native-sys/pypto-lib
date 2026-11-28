@@ -89,7 +89,7 @@ def prefill_publish_decoder(
     tokens = pl.tensor.dim(x, 0)
     compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     c1a_compressor_project(
-        x, w_compressor_kv, compressed_projection, num_tokens, m_tile=80, n_tile=128,
+        x, w_compressor_kv, compressed_projection, num_tokens, m_tile=80, n_tile=128, weight_cache=pl.CachePolicy.DEFAULT,
     )
     compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     c1a_compressor_publish(

@@ -133,6 +133,7 @@ def decode_c1a_full(
     c1a_compressor_project(
         x_norm, compressor_wkv, projected, num_tokens,
         m_tile=C1A_PROJ_M_TILE, n_tile=C1A_PROJ_N_TILE,
+        weight_cache=pl.CachePolicy.NOT_ALLOC_KEEP,
     )
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     c1a_compressor_publish(

@@ -2046,7 +2046,7 @@ AICORE inline void load_shared_columns(uint32_t destination, __gm__ const uint8_
     Global source(reinterpret_cast<__gm__ float8_e4m3_t*>(const_cast<__gm__ uint8_t*>(weights)) +
                       static_cast<uint64_t>(column) * input_k + k_begin * 32,
                   Shape(), Base(input_k, output_n));
-    pto::TLOAD(target, source);
+    pto::TLOAD<pto::TLoadL2Hint::NotAllocKeep>(target, source);
 }
 
 template <uint32_t BlockK>

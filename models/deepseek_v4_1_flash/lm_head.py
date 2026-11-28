@@ -518,7 +518,7 @@ def lm_head_project(
                 a = pl.load(hidden_states, [row, k], [LM_HEAD_M_TILE, LM_HEAD_K_TILE], valid_shape=[source_rows, LM_HEAD_K_TILE])
                 a = pl.fillpad(a, pad_value=pl.PadValue.zero)
                 a = pl.set_validshape(a, LM_HEAD_M_TILE, LM_HEAD_K_TILE)
-                w = pl.load(lm_head_weight, [k, column], [LM_HEAD_K_TILE, LM_HEAD_N_TILE], target_memory=pl.MemorySpace.Mat)
+                w = pl.load(lm_head_weight, [k, column], [LM_HEAD_K_TILE, LM_HEAD_N_TILE], target_memory=pl.MemorySpace.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
             rounded = pl.cast(acc, pl.BF16, mode="rint")
             result = pl.cast(rounded, pl.FP32)

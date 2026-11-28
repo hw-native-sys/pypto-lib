@@ -618,7 +618,7 @@ def _o_proj_a_mixed(
             acc = pl.create_tile([row_tile, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc)
             # Preload the first K256 panel.
             a = pl.load(payload, [input_row, 0], [row_tile, 256], target_memory=pl.Mem.Mat)
-            weight_panel = pl.load(w, [cube_group, 0, cube_col], [1, 256, 256], target_memory=pl.Mem.Mat)
+            weight_panel = pl.load(w, [cube_group, 0, cube_col], [1, 256, 256], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
             b = pl.reshape(weight_panel, [256, 256])
             a_band = input_row // 16
             b_band = (cube_group * O_LORA + cube_col) // 16
@@ -652,7 +652,7 @@ def _o_proj_a_mixed(
                     next_k = (step + 1) * 256
                     scale_byte = (step + 1) * 128
                     a_next = pl.load(payload, [input_row, next_k], [row_tile, 256], target_memory=pl.Mem.Mat)
-                    weight_panel_next = pl.load(w, [cube_group, next_k, cube_col], [1, 256, 256], target_memory=pl.Mem.Mat)
+                    weight_panel_next = pl.load(w, [cube_group, next_k, cube_col], [1, 256, 256], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                     b_next = pl.reshape(weight_panel_next, [256, 256])
                     a_buf_lo_next: pl.Tile[[row_tile // 16, 64], pl.FP8E8M0, pl.MemRef("oa_sa", slots=4)[2 * next_slot], pl.Mem.Mat] = pl.tile.create([row_tile // 16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
                     b_buf_lo_next: pl.Tile[[16, 64], pl.FP8E8M0, pl.MemRef("oa_sb", slots=4)[2 * next_slot], pl.Mem.Mat] = pl.tile.create([16, 64], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
@@ -906,19 +906,19 @@ def _o_b_hc_decode(
                 pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 3, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 0, core_type=pl.KernelType.AIC)
                 a0: pl.Tile[[row_tile, 256], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=4)[0], pl.Mem.Mat] = pl.load(payload, [row, 0], [row_tile, 256], target_memory=pl.Mem.Mat)
-                b0: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[0], pl.Mem.Mat] = pl.load(weight_nz, [0, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                b0: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[0], pl.Mem.Mat] = pl.load(weight_nz, [0, col], [256, n_tile], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 1, core_type=pl.KernelType.AIC)
                 a1: pl.Tile[[row_tile, 256], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=4)[1], pl.Mem.Mat] = pl.load(payload, [row, 256], [row_tile, 256], target_memory=pl.Mem.Mat)
-                b1: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[1], pl.Mem.Mat] = pl.load(weight_nz, [256, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                b1: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[1], pl.Mem.Mat] = pl.load(weight_nz, [256, col], [256, n_tile], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 1, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 2, core_type=pl.KernelType.AIC)
                 a2: pl.Tile[[row_tile, 256], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=4)[2], pl.Mem.Mat] = pl.load(payload, [row, 512], [row_tile, 256], target_memory=pl.Mem.Mat)
-                b2: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[2], pl.Mem.Mat] = pl.load(weight_nz, [512, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                b2: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[2], pl.Mem.Mat] = pl.load(weight_nz, [512, col], [256, n_tile], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 2, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 3, core_type=pl.KernelType.AIC)
                 a3: pl.Tile[[row_tile, 256], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=4)[3], pl.Mem.Mat] = pl.load(payload, [row, 768], [row_tile, 256], target_memory=pl.Mem.Mat)
-                b3: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[3], pl.Mem.Mat] = pl.load(weight_nz, [768, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                b3: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[3], pl.Mem.Mat] = pl.load(weight_nz, [768, col], [256, n_tile], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 3, core_type=pl.KernelType.AIC)
                 for panel in pl.unroll(LOCAL_O_WIDTH // 256):
                     bank = panel % 4
@@ -957,16 +957,16 @@ def _o_b_hc_decode(
                         pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, bank, core_type=pl.KernelType.AIC)
                         if bank == 0:
                             a0: pl.Tile[[row_tile, 256], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=4)[0], pl.Mem.Mat] = pl.load(payload, [row, next_k], [row_tile, 256], target_memory=pl.Mem.Mat)
-                            b0: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[0], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                            b0: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[0], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [256, n_tile], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                         if bank == 1:
                             a1: pl.Tile[[row_tile, 256], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=4)[1], pl.Mem.Mat] = pl.load(payload, [row, next_k], [row_tile, 256], target_memory=pl.Mem.Mat)
-                            b1: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[1], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                            b1: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[1], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [256, n_tile], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                         if bank == 2:
                             a2: pl.Tile[[row_tile, 256], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=4)[2], pl.Mem.Mat] = pl.load(payload, [row, next_k], [row_tile, 256], target_memory=pl.Mem.Mat)
-                            b2: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[2], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                            b2: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[2], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [256, n_tile], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                         if bank == 3:
                             a3: pl.Tile[[row_tile, 256], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=4)[3], pl.Mem.Mat] = pl.load(payload, [row, next_k], [row_tile, 256], target_memory=pl.Mem.Mat)
-                            b3: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[3], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                            b3: pl.Tile[[256, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=4)[3], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [256, n_tile], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, bank, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1, core_type=pl.KernelType.AIC)
