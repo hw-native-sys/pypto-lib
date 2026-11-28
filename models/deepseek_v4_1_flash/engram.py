@@ -11,13 +11,8 @@
 """V4.1 Engram Host FP8 lookup, dequantization, projection and residual gating."""
 
 import argparse
-from bisect import bisect_right
-from contextlib import ExitStack
-import io
-import json
-import math
-import os
-from pathlib import Path
+from contextlib import contextmanager
+from tempfile import TemporaryFile
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -54,11 +49,8 @@ SCALE_TILE = 32
 
 # Host-window shape.
 _shape_parser = argparse.ArgumentParser(add_help=False)
-_shape_parser.add_argument("--checkpoint")
-_shape_parser.add_argument("--engram-table-rows", type=int)
+_shape_parser.add_argument("--engram-table-rows", type=int, default=4096)
 _shape_options = _shape_parser.parse_known_args()[0]
-if _shape_options.engram_table_rows is None:
-    _shape_options.engram_table_rows = max(M.engram_num_embeddings) if _shape_options.checkpoint else 4096
 if _shape_options.engram_table_rows <= 0:
     _shape_parser.error("--engram-table-rows must be positive")
 ENGRAM_ROWS = (_shape_options.engram_table_rows + EP_SIZE - 1) // EP_SIZE * EP_SIZE
@@ -600,256 +592,17 @@ def engram(
     return result
 
 
-def write_forward_engram_layout(directory):
-    """Record compile-time Host-window layout beside the integrated forward artifact."""
-    layout = {
-        "abi_version": 2, "ranks": EP_SIZE, "rows_per_layer": ENGRAM_ROWS,
-    }
-    path = Path(directory) / "engram_layout.json"
-    path.write_text(json.dumps(layout, indent=2) + "\n")
-
-
-def validate_forward_engram_layout(directory, ranks, rows):
-    """Reject artifacts compiled for different Host-window ownership or table extents."""
-    path = Path(directory) / "engram_layout.json"
-    expected = {"abi_version": 2, "ranks": ranks, "rows_per_layer": rows}
-    if not path.is_file() or json.loads(path.read_text()) != expected:
-        raise ValueError("forward Engram layout is missing or mismatched; recompile with matching --ep and --engram-table-rows")
-
-
-class EngramPayloadSource(io.RawIOBase):
-    """Expose checkpoint slices and zero padding as one seekable Host-window source."""
-
-    def __init__(self, segments):
-        super().__init__()
-        self._files = ExitStack()
-        self._segments = []
-        self._ends = []
-        self._position = 0
-        total = 0
-        try:
-            for path, offset, count in segments:
-                if offset < 0 or count < 0:
-                    raise ValueError("Engram source ranges must be nonnegative")
-                if count:
-                    file = None if path is None else self._files.enter_context(Path(path).open("rb"))
-                    self._segments.append((file, offset, count))
-                    total += count
-                    self._ends.append(total)
-        except BaseException:
-            self.close()
-            raise
-        self._size = total
-
-    def readable(self):
-        return not self.closed
-
-    def seekable(self):
-        return not self.closed
-
-    def tell(self):
-        if self.closed:
-            raise ValueError("Engram source is closed")
-        return self._position
-
-    def seek(self, offset, whence=io.SEEK_SET):
-        if self.closed:
-            raise ValueError("Engram source is closed")
-        if whence == io.SEEK_CUR:
-            offset += self._position
-        elif whence == io.SEEK_END:
-            offset += self._size
-        elif whence != io.SEEK_SET:
-            raise ValueError("invalid Engram seek origin")
-        if offset < 0:
-            raise ValueError("negative Engram source position")
-        self._position = offset
-        return offset
-
-    def readinto(self, buffer):
-        if self.closed:
-            raise ValueError("Engram source is closed")
-        destination = memoryview(buffer).cast("B")
-        copied = 0
-        while copied < len(destination) and self._position < self._size:
-            segment = bisect_right(self._ends, self._position)
-            start = 0 if segment == 0 else self._ends[segment - 1]
-            file, offset, length = self._segments[segment]
-            local = self._position - start
-            count = min(length - local, len(destination) - copied)
-            target = destination[copied:copied + count]
-            if file is None:
-                target[:] = bytes(count)
-            else:
-                file.seek(offset + local)
-                count = file.readinto(target)
-                if not count:
-                    raise EOFError("truncated Engram checkpoint payload")
-            copied += count
-            self._position += count
-        return copied
-
-    def close(self):
-        self._files.close()
-        super().close()
-
-
-class EngramHostTables:
-    """Own the streamed ENP payload and scale Host shards."""
-
-    def __init__(self, checkpoint, ranks, *, num_embeddings=M.engram_num_embeddings, program_count=1):
-        if ranks not in (2, 4, 8):
-            raise ValueError("Engram ENP offload requires two, four, or eight ranks")
-        if program_count < 1:
-            raise ValueError("Engram Host-window program count must be positive")
-        self.ranks = ranks
-        self.payload_spans = []
-        self.scale_spans = []
-        if len(num_embeddings) != len(M.engram_layer_ids) or any(rows <= 0 for rows in num_embeddings):
-            raise ValueError("Engram table sizes must contain one positive row count per layer")
-        for slot, layer in enumerate(M.engram_layer_ids):
-            prefix = f"layers.{layer}.engram.embed."
-            payload = checkpoint.tensor_span(prefix + "weight")
-            scale = checkpoint.tensor_span(prefix + "scale")
-            if payload[2] != (num_embeddings[slot], HEAD_DIM) or payload[3] != torch.float8_e4m3fn:
-                raise ValueError(f"unsupported Engram payload layout: {prefix}weight")
-            if scale[2] != (payload[2][0], HEAD_DIM // 32) or scale[3] != torch.float8_e8m0fnu:
-                raise ValueError(f"unsupported Engram scale layout: {prefix}scale")
-            self.payload_spans.append(payload)
-            self.scale_spans.append(scale)
-        self.rows_per_layer = (max(span[2][0] for span in self.payload_spans) + ranks - 1) // ranks * ranks
-        self.shard_rows = self.rows_per_layer // ranks
-        self.program_count = program_count
-        self.host_payload_bytes_per_program = ranks * 2 * self.shard_rows * HEAD_DIM
-        self.host_scale_bytes_per_program = ranks * 2 * self.shard_rows * (HEAD_DIM // 32)
-        self.host_payload_bytes = program_count * self.host_payload_bytes_per_program
-        self.host_scale_bytes = program_count * self.host_scale_bytes_per_program
-        self.sources = []
-        self.scale_sources = []
-
-    def __enter__(self):
-        try:
-            available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        except (AttributeError, OSError, ValueError):
-            available = None
-        host_bytes = self.host_payload_bytes + self.host_scale_bytes
-        if available is not None and host_bytes > available:
-            raise MemoryError(
-                f"ENP requires {host_bytes} Host table bytes, "
-                f"only {available} are available"
-            )
-        try:
-            for rank in range(self.ranks):
-                row = rank * self.shard_rows
-                segments = []
-                for path, offset, shape, _dtype in self.payload_spans:
-                    count = max(0, min(self.shard_rows, shape[0] - row))
-                    segments.append((path, offset + row * HEAD_DIM, count * HEAD_DIM))
-                    segments.append((None, 0, (self.shard_rows - count) * HEAD_DIM))
-                self.sources.append(EngramPayloadSource(segments))
-                scale_segments = []
-                width = HEAD_DIM // 32
-                for path, offset, shape, _dtype in self.scale_spans:
-                    count = max(0, min(self.shard_rows, shape[0] - row))
-                    scale_segments.append((path, offset + row * width, count * width))
-                    scale_segments.append((None, 0, (self.shard_rows - count) * width))
-                self.scale_sources.append(EngramPayloadSource(scale_segments))
-        except BaseException:
-            self.__exit__(None, None, None)
-            raise
-        return self
-
-    def __exit__(self, *_exception):
-        for source in (*self.sources, *self.scale_sources):
-            source.close()
-        self.sources.clear()
-        self.scale_sources.clear()
-
-
-class HostEngram:
-    """Normalize tokenizer text and hash the compressed token history of each request."""
-
-    def __init__(self, tokenizer):
-        import numpy as np
-        from tokenizers import Regex, normalizers
-
-        sentinel = "\ue000"
-        normalizer = normalizers.Sequence([
-            normalizers.NFKC(), normalizers.NFD(), normalizers.StripAccents(), normalizers.Lowercase(),
-            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "), normalizers.Replace(Regex(r"^ $"), sentinel),
-            normalizers.Strip(), normalizers.Replace(sentinel, " "),
-        ])
-        keys = {}
-        token_map = []
-        for token in range(tokenizer.get_vocab_size(with_added_tokens=True)):
-            text = tokenizer.decode([token], skip_special_tokens=False)
-            key = tokenizer.id_to_token(token) if "\ufffd" in text else normalizer.normalize_str(text) or text
-            token_map.append(keys.setdefault(key, len(keys)))
-        if len(keys) != M.engram_compressed_vocab_size:
-            raise ValueError(f"Engram compressed vocabulary has {len(keys)} entries")
-        primes, seen = [], set()
-        for layer in M.engram_layer_ids:
-            buckets = []
-            for _ in range(M.engram_max_ngram_size - 1):
-                candidate = M.engram_vocab_size - 1
-                for _ in range(M.engram_n_heads):
-                    candidate += 1
-                    while candidate in seen or any(candidate % d == 0 for d in range(2, math.isqrt(candidate) + 1)):
-                        candidate += 1
-                    seen.add(candidate)
-                    buckets.append(candidate)
-            primes.append(buckets)
-        if tuple(map(sum, primes)) != M.engram_num_embeddings:
-            raise ValueError("Engram prime buckets do not match checkpoint table sizes")
-        bound = max(1, (np.iinfo(np.int64).max // len(keys)) // 2)
-        self.multipliers = torch.stack([
-            torch.from_numpy(np.random.default_rng(10007 * layer).integers(
-                0, bound, size=M.engram_max_ngram_size, dtype=np.int64,
-            ) * 2 + 1)
-            for layer in M.engram_layer_ids
-        ])
-        self.token_map = torch.tensor(token_map, dtype=torch.int64, device="cpu")
-        self.pad_id = token_map[M.engram_pad_token_id]
-        self.primes = torch.tensor(primes, dtype=torch.int64, device="cpu")
-        self.offsets = self.primes.cumsum(-1) - self.primes
-        self.history = {}
-
-    def hash_ids(self, token_ids, start_pos=0, *, request_id=0, token_mask=None):
-        """Return [layer, token, hash column] IDs and commit the current text history."""
-        ids = torch.as_tensor(token_ids, device="cpu")
-        if ids.numel() and ids.dtype not in (torch.int32, torch.int64):
-            raise ValueError("Engram token IDs must have an integer dtype")
-        ids = ids.long()
-        if ids.ndim != 1 or bool(((ids < 0) | (ids >= self.token_map.numel())).any()):
-            raise ValueError("Engram requires a one-dimensional sequence of valid token IDs")
-        history = self.history.get(request_id, torch.empty(0, dtype=torch.int64))
-        if isinstance(start_pos, bool) or not isinstance(start_pos, int) or not 0 <= start_pos <= history.numel():
-            raise ValueError("Engram continuation requires all preceding token history")
-        current = self.token_map[ids]
-        if token_mask is not None:
-            mask = torch.as_tensor(token_mask, device="cpu")
-            if mask.dtype != torch.bool or mask.shape != ids.shape:
-                raise ValueError("Engram token_mask must be a boolean vector matching token IDs")
-            current = torch.where(mask, current, -1)
-        compressed = torch.cat((history[:start_pos], current))
-        positions = torch.arange(start_pos, compressed.numel())
-        lookback = []
-        blocked = torch.zeros_like(positions, dtype=torch.bool)
-        for shift in range(M.engram_max_ngram_size):
-            source = (positions - shift).clamp_min(0)
-            values = compressed[source]
-            blocked |= (positions < shift) | (values == -1)
-            lookback.append(torch.where(blocked, self.pad_id, values))
-        tokens = torch.stack(lookback, dim=-1)
-        products = tokens.unsqueeze(0) * self.multipliers.unsqueeze(1)
-        rolling, hashes = products[..., 0], []
-        for shift in range(1, M.engram_max_ngram_size):
-            rolling = torch.bitwise_xor(rolling, products[..., shift])
-            begin = (shift - 1) * M.engram_n_heads
-            primes = self.primes[:, begin:begin + M.engram_n_heads].unsqueeze(1)
-            hashes.append(rolling.unsqueeze(-1) % primes)
-        self.history[request_id] = compressed
-        return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
+@contextmanager
+def zero_engram_window_sources(rank_count, shard_rows, *, compile_only=False):
+    """Bind a sparse zero-filled payload and scale shard to each smoke rank."""
+    if compile_only:
+        yield None
+        return
+    rows = len(M.engram_layer_ids) * shard_rows
+    with TemporaryFile() as payload, TemporaryFile() as scales:
+        payload.truncate(rows * HEAD_DIM)
+        scales.truncate(rows * (HEAD_DIM // 32))
+        yield {"engram_payload": [payload] * rank_count, "engram_scale": [scales] * rank_count}
 
 
 def build_random_engram_ids(ranks, capacity, active_tokens, table_rows):

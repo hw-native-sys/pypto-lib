@@ -858,7 +858,6 @@ def build_tensor_specs(active_requests=1):
 
 if __name__ == "__main__":
     import argparse
-    from contextlib import ExitStack
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
@@ -890,7 +889,7 @@ if __name__ == "__main__":
         parser.error(f"need {EP_SIZE} distinct non-negative device IDs")
     from golden import run
     from pypto.ir import DistributedConfig
-    from engram import EngramPayloadSource
+    from engram import zero_engram_window_sources
 
     config = dict(
         backend_type="a5", execution_mode=False,
@@ -899,7 +898,7 @@ if __name__ == "__main__":
         ring_heap=(2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2), ring_dep_pool=131072,
     )
     specs = build_tensor_specs(args.active_requests)
-    with ExitStack() as sources:
+    with zero_engram_window_sources(len(devices), TARGET_FWD_ENGRAM_SHARD_ROWS, compile_only=args.compile_only) as sources:
         result = run(
             a5_default_runtime="host_build_graph",
             fn=l3_decode_fwd_dspark,
@@ -908,17 +907,7 @@ if __name__ == "__main__":
             config=config,
             compile_only=args.compile_only,
             runtime_dir=args.runtime_dir,
-            # The prepared worker binds the Host window source before dispatch.
-            window_sources=None if args.compile_only else {
-                "engram_payload": [
-                    sources.enter_context(EngramPayloadSource([(None, 0, 2 * TARGET_FWD_ENGRAM_SHARD_ROWS * 256)]))
-                    for _ in devices
-                ],
-                "engram_scale": [
-                    sources.enter_context(EngramPayloadSource([(None, 0, 2 * TARGET_FWD_ENGRAM_SHARD_ROWS * 8)]))
-                    for _ in devices
-                ],
-            },
+            window_sources=sources,
             persistent=True,
             reset_persistent_windows=False,
         )
