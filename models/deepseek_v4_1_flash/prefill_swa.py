@@ -17,7 +17,7 @@ from config import (
     FLASH as M, RANKS_DYN, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN,
     CP_SIZE, PREFILL_MAX_TOKENS, WINDOW_CACHE_BYTES,
 )
-from sparse_attention import gather_sparse_attention
+from sparse_attention import attend_window, gather_sparse_attention
 from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post, retire_prefill_signals
 from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
@@ -130,10 +130,7 @@ def prefill_swa(
         # Keep the full query and attention output in separate scope-depth rings.
         with pl.scope():
             attn_out = pl.create_tensor([padded_query_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-            gather_sparse_attention(
-                q, active_window_indices, window_cache, active_window_indices, window_cache,
-                attn_sink, attn_out, active, compressed_keys=0,
-            )
+            attend_window(q, active_window_indices, window_cache, attn_sink, attn_out, active)
             _output, _output_ready = o_proj_hc_post(
                 attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, active_rope_cos, active_rope_sin,
                 hc_input[0:active, :, :], post_mix[0:active, :],
