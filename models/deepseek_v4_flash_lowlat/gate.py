@@ -142,33 +142,42 @@ def gate(
             xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
             x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
             pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
-            pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
+            if T == 6:
+                scale = pl.tile.read(xg_sq, [0, 0])
+                scaled = pl.mul(xg, scale)
+                q_i32 = pl.cast(scaled, pl.INT32, mode="rint")
+                q_f16 = pl.cast(q_i32, pl.FP16, mode="round")
+                q_i8 = pl.cast(q_f16, pl.INT8, mode="trunc", saturation_mode="on")
+                pl.tile.store(q_i8, [tok, 0], x_norm_i8, shapes=[1, D])
+            else:
+                pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
 
-    seed_dummy = pl.system.task_dummy(deps=[])
+    if T != 6:
+        seed_dummy = pl.system.task_dummy(deps=[])
 
-    # Per-token symmetric INT8 quant of xg: scale precomputed in ffn_norm. inv_rms
-    # cancels here (symmetric quant is invariant to a positive per-token scalar),
-    # so x_norm_i8 = quant(xg). Early resolution lets the shared-expert chain
-    # pre-stage before dispatch_push.
-    for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="x_norm_quant",
-            deps=[seed_dummy],
-            allow_early_resolve=True,
-        ):
-            quant_rows = pl.min(T_TILE, active_gate_tokens - t0)
-            xn_sq_col = pl.slice(xn_scale_buf, [T_TILE, 1], [t0, 0], valid_shape=[quant_rows, 1])
-            for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
-                xn_input = pl.slice(
-                    xg_buf, [T_TILE, QUANT_TILE], [t0, xq_b_k], valid_shape=[quant_rows, QUANT_TILE]
-                )
-                xn_q_scaled = pl.row_expand_mul(xn_input, xn_sq_col)
-                xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
-                xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
-                xn_q_i8 = pl.cast(xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
-                xn_q_valid = pl.set_validshape(xn_q_i8, quant_rows, QUANT_TILE)
-                x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = xn_q_valid
+        # Per-token symmetric INT8 quant of xg: scale precomputed in ffn_norm. inv_rms
+        # cancels here (symmetric quant is invariant to a positive per-token scalar),
+        # so x_norm_i8 = quant(xg). Early resolution lets the shared-expert chain
+        # pre-stage before dispatch_push.
+        for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                name_hint="x_norm_quant",
+                deps=[seed_dummy],
+                allow_early_resolve=True,
+            ):
+                quant_rows = pl.min(T_TILE, active_gate_tokens - t0)
+                xn_sq_col = pl.slice(xn_scale_buf, [T_TILE, 1], [t0, 0], valid_shape=[quant_rows, 1])
+                for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+                    xn_input = pl.slice(
+                        xg_buf, [T_TILE, QUANT_TILE], [t0, xq_b_k], valid_shape=[quant_rows, QUANT_TILE]
+                    )
+                    xn_q_scaled = pl.row_expand_mul(xn_input, xn_sq_col)
+                    xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
+                    xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
+                    xn_q_i8 = pl.cast(xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
+                    xn_q_valid = pl.set_validshape(xn_q_i8, quant_rows, QUANT_TILE)
+                    x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = xn_q_valid
 
     gate_logits_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
@@ -253,6 +262,341 @@ def gate(
                 indices = pl.assemble(indices, nm_indices_valid, [t1, 0])
                 weights = pl.assemble(weights, nm_weight_mat, [t1, 0])
 
+    return weights
+
+
+import pypto.language.distributed as pld
+
+if __package__:
+    from .expert_routed import IDX_PAD, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT, WORK_SLOTS_PAD
+    from .hc_pre import (
+        HC_DIM_INV as HC_MIX_DIM_INV,
+        HC_EPS,
+        HC_PAD as HC_MIX_PAD,
+        LINEAR_OK as HC_MIX_SPLITS,
+        NORM_EPS as HC_MIX_NORM_EPS,
+        RMS_CHUNKS as HC_MIX_RMS_CHUNKS,
+        T_TILE as HC_MIX_TILE,
+    )
+    from .moe_same_wave import publish_group, publish_sort_row, wait_for_group, wait_for_sort_rows
+else:
+    from expert_routed import IDX_PAD, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT, WORK_SLOTS_PAD
+    from hc_pre import (
+        HC_DIM_INV as HC_MIX_DIM_INV,
+        HC_EPS,
+        HC_PAD as HC_MIX_PAD,
+        LINEAR_OK as HC_MIX_SPLITS,
+        NORM_EPS as HC_MIX_NORM_EPS,
+        RMS_CHUNKS as HC_MIX_RMS_CHUNKS,
+        T_TILE as HC_MIX_TILE,
+    )
+    from moe_same_wave import publish_group, publish_sort_row, wait_for_group, wait_for_sort_rows
+
+N_ROUTES = T * TOPK
+HC_MIX_PARTIAL_ROWS=pl.dynamic("WAVE15_HC_MIX_PARTIAL_ROWS")
+HC_MIX_RMS_ROWS=pl.dynamic("WAVE15_HC_MIX_RMS_ROWS")
+
+
+@pl.jit.inline
+def gate_and_plan(
+    hcx: pl.Tensor[[T,4,D],pl.FP32],
+    hc_scale: pl.Tensor[[3],pl.FP32],
+    hc_base: pl.Tensor[[24],pl.FP32],
+    mixes_partials: pl.Tensor[[HC_MIX_PARTIAL_ROWS,32],pl.FP32],
+    rms_partials: pl.Tensor[[HC_MIX_RMS_ROWS,HC_MIX_TILE],pl.FP32],
+    t_linear: pl.Scalar[pl.INDEX],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
+    x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
+    indices: pl.Tensor[[T, ROUTE_ROW_PAD], pl.INT32],
+    weights: pl.Tensor[[T, ROUTE_ROW_PAD], pl.FP32],
+    recv_scale: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_w: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    work_slot: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    work_rows: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    route_slot_row: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    local_ready: pld.DistributedTensor[[2, 32], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+):
+    # Routing outputs and x_norm_scale are valid only for active tokens.
+    # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
+    # the per-token positive scalar inv_rms factors out of everything downstream:
+    #   - gate logits: inv_rms * (xg @ gate_w.T)  -> applied as a [16,1] row-scale
+    #   - int8 quant : symmetric per-token quant of xg CANCELS inv_rms exactly;
+    #                  inv_rms rides only x_norm_scale (= inv_rms * amax(xg)/127).
+    # This lets sq_sum (needs raw x) and xg share ONE pass over x_mixed instead of
+    # a sqsum pass followed by a separate normalize pass.
+    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
+    inv_rms_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    # per-token int8 quant scale (= INT8_SCALE_MAX / amax(xg)), computed in ffn_norm
+    # and consumed by x_norm_quant so quant skips its own amax pass.
+    xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+    active_gate_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
+    active_gate_tokens = active_gate_tiles * GATE_M_TILE
+    if active_gate_tokens > T:
+        active_gate_tokens = pl.cast(T, pl.INDEX)
+
+    # One token per core with two-level full-row reductions.
+    x_flat = pl.reshape(hcx,[T,4*D])
+    norm_w_2d = pl.reshape(norm_w, [1, D])
+    if active_gate_tokens > 0:
+        for tok in pl.spmd(active_gate_tokens, name_hint="hc_mix_ffn_norm", allow_early_resolve=True):
+            mix_base = tok // HC_MIX_TILE * HC_MIX_TILE
+            gate_block = mix_base // HC_MIX_TILE
+            mixes_total = mixes_partials[mix_base:mix_base + HC_MIX_TILE, 0:HC_MIX_PAD]
+            for split in pl.range(1, HC_MIX_SPLITS):
+                offset = split * t_linear + mix_base
+                mixes_total = pl.add(mixes_total, mixes_partials[offset:offset + HC_MIX_TILE, 0:HC_MIX_PAD])
+            rms_chunks = pl.slice(rms_partials, [HC_MIX_RMS_CHUNKS, HC_MIX_TILE], [gate_block * HC_MIX_RMS_CHUNKS, 0])
+            sq_sum = pl.full([1, HC_MIX_TILE], dtype=pl.FP32, value=0.0)
+            for chunk in pl.range(HC_MIX_RMS_CHUNKS):
+                sq_sum = pl.add(sq_sum, pl.slice(rms_chunks, [1, HC_MIX_TILE], [chunk, 0]))
+            sq_mean = pl.add(pl.mul(sq_sum, HC_MIX_DIM_INV), HC_MIX_NORM_EPS)
+            inv_col = pl.reshape(pl.rsqrt(sq_mean, high_precision=True), [HC_MIX_TILE, 1])
+            scale0 = pl.read(hc_scale, [0])
+            pre_base = pl.reshape(hc_base[0:HC_MIX_PAD], [1, HC_MIX_PAD])
+            pre_input = mixes_total[0:HC_MIX_TILE, 0:HC_MIX_PAD]
+            pre_norm = pl.row_expand_mul(pre_input, inv_col)
+            pre_scaled = pl.mul(pre_norm, scale0)
+            pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+            pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
+            pre_val = pl.add(pre_sig, HC_EPS)
+            pre0 = pl.read(pre_val, [tok-mix_base, 0])
+            pre1 = pl.read(pre_val, [tok-mix_base, 1])
+            pre2 = pl.read(pre_val, [tok-mix_base, 2])
+            pre3 = pl.read(pre_val, [tok-mix_base, 3])
+            y0 = pl.mul(pl.tile.load(x_flat, [tok, 0], [1, D]), pre0)
+            y1 = pl.mul(pl.tile.load(x_flat, [tok, D], [1, D]), pre1)
+            pair01 = pl.add(y0, y1)
+            y2 = pl.mul(pl.tile.load(x_flat, [tok, 2 * D], [1, D]), pre2)
+            y3 = pl.mul(pl.tile.load(x_flat, [tok, 3 * D], [1, D]), pre3)
+            y = pl.add(pair01, pl.add(y2, y3))
+            mixed_bf16 = pl.cast(y, target_type=pl.BF16, mode="rint")
+            rms_x = pl.cast(mixed_bf16, pl.FP32)
+            rms_w = pl.cast(pl.tile.load(norm_w_2d, [0, 0], [1, D]), pl.FP32)
+            xg = pl.mul(rms_x, rms_w)
+            pl.tile.store(xg, [tok, 0], xg_buf, shapes=[1, D])
+
+            sq_rows = pl.reshape(pl.mul(rms_x, rms_x), [ROW_PAD, FFN_REDUCE_TILE])
+            sq_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
+            sq_partial = pl.row_sum(sq_rows, sq_partial_tmp)
+            sq_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+            sq_reduce[0:1, :] = pl.reshape(sq_partial, [1, ROW_PAD])
+            sq_reduce = pl.set_validshape(sq_reduce, 1, ROW_PAD)
+            sq_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+            sq_sum = pl.row_sum(sq_reduce, sq_sum_tmp)
+            sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
+            inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
+            pl.tile.store(inv_rms, [tok, 0], inv_rms_buf, shapes=[1, 1])
+
+            xg_abs_rows = pl.reshape(pl.abs(xg), [ROW_PAD, FFN_REDUCE_TILE])
+            amax_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
+            amax_partial = pl.row_max(xg_abs_rows, amax_partial_tmp)
+            amax_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+            amax_reduce[0:1, :] = pl.reshape(amax_partial, [1, ROW_PAD])
+            amax_reduce = pl.set_validshape(amax_reduce, 1, ROW_PAD)
+            amax_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+            xg_amax = pl.row_max(amax_reduce, amax_tmp)
+            xg_amax = pl.set_validshape(pl.reshape(xg_amax, [1, ROW_PAD]), 1, 1)
+            xg_amax = pl.maximum(xg_amax, INT8_AMAX_EPS)
+            # quant scale = INT8_SCALE_MAX / amax(xg); dequant scale rides inv_rms.
+            scale_max = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
+            scale_max = pl.set_validshape(scale_max, 1, 1)
+            xg_sq = pl.div(scale_max, xg_amax)
+            xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
+            x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
+            pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
+            if T == 6:
+                scale = pl.tile.read(xg_sq, [0, 0])
+                scaled = pl.mul(xg, scale)
+                q_i32 = pl.cast(scaled, pl.INT32, mode="rint")
+                q_f16 = pl.cast(q_i32, pl.FP16, mode="round")
+                q_i8 = pl.cast(q_f16, pl.INT8, mode="trunc", saturation_mode="on")
+                pl.tile.store(q_i8, [tok, 0], x_norm_i8, shapes=[1, D])
+            else:
+                pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
+
+    if T != 6:
+        seed_dummy = pl.system.task_dummy(deps=[])
+
+        # Per-token symmetric INT8 quant of xg: scale precomputed in ffn_norm. inv_rms
+        # cancels here (symmetric quant is invariant to a positive per-token scalar),
+        # so x_norm_i8 = quant(xg). Early resolution lets the shared-expert chain
+        # pre-stage before dispatch_push.
+        for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                name_hint="x_norm_quant",
+                deps=[seed_dummy],
+                allow_early_resolve=True,
+            ):
+                quant_rows = pl.min(T_TILE, active_gate_tokens - t0)
+                xn_sq_col = pl.slice(xn_scale_buf, [T_TILE, 1], [t0, 0], valid_shape=[quant_rows, 1])
+                for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+                    xn_input = pl.slice(
+                        xg_buf, [T_TILE, QUANT_TILE], [t0, xq_b_k], valid_shape=[quant_rows, QUANT_TILE]
+                    )
+                    xn_q_scaled = pl.row_expand_mul(xn_input, xn_sq_col)
+                    xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
+                    xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
+                    xn_q_i8 = pl.cast(xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
+                    xn_q_valid = pl.set_validshape(xn_q_i8, quant_rows, QUANT_TILE)
+                    x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = xn_q_valid
+
+    gate_logits_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
+    if active_gate_tiles > 0:
+        for gb_idx in pl.spmd(
+            active_gate_tiles * GATE_N_BLOCKS, name_hint="gate_mm", allow_early_resolve=True
+        ):
+            tg = gb_idx // GATE_N_BLOCKS
+            nb = gb_idx % GATE_N_BLOCKS
+            t1 = tg * GATE_M_TILE
+            n0 = nb * GATE_N_TILE
+            gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
+                gd_kd = kb * GATE_D_TILE
+                gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                gate_logits_tile = pl.matmul_acc(
+                    gate_logits_tile, gd_x, gd_w, b_trans=True, init_cond=(kb == 0)
+                )
+            gate_logits_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gate_logits_tile
+
+    # Full residency lets the dedicated group block wait without
+    # serializing the six original independent row sorts.
+    work_slot_2d = pl.reshape(work_slot, [1, WORK_SLOTS_PAD])
+    work_rows_2d = pl.reshape(work_rows, [1, WORK_SLOTS_PAD])
+    recv_flat = pl.reshape(recv_x,[N_SLOTS_B*RECV_MAX,D])
+    for wave in pl.spmd(T+1, name_hint="route_sort_and_group", sync_start=True, allow_early_resolve=True):
+        if wave < T:
+            if wave < active_tokens:
+                if layer_id < N_HASH_LAYERS:
+                    t1 = wave * GATE_T_TILE
+                    route_logits = pl.slice(gate_logits_buf, [GATE_T_TILE, N_EXPERTS], [t1, 0])
+                    route_inv_rms = pl.read(inv_rms_buf, [t1, 0])
+                    route_logits = pl.mul(route_logits, route_inv_rms)
+                    gp_score = _router_scores(route_logits)
+                    # Load the selected expert row into an aligned UB tile.
+                    hs_token = pl.cast(pl.read(input_ids, [t1]), pl.INDEX)
+                    hs_idx_tile = pl.slice(
+                        tid2eid, [GATE_T_TILE, TOPK_PAD], [hs_token, 0], valid_shape=[GATE_T_TILE, TOPK]
+                    )
+                    # Normalize only the selected scores.
+                    gather_all = pl.gather(gp_score, dim=-1, index=hs_idx_tile)
+                    hs_reduce = pl.create_tensor([ROW_PAD, TOPK_PAD], dtype=pl.FP32)
+                    hs_reduce[0:GATE_T_TILE, :] = gather_all
+                    hs_reduce = pl.set_validshape(hs_reduce, GATE_T_TILE, TOPK)
+                    hs_denom = pl.row_sum(hs_reduce)
+                    hs_weight_mat = pl.mul(pl.row_expand_div(hs_reduce, hs_denom), ROUTE_SCALE)
+                    hs_indices_valid = pl.set_validshape(hs_idx_tile, GATE_T_TILE, TOPK)
+                    indices[t1:t1+1, :TOPK_PAD] = hs_indices_valid
+                    weights[t1:t1+1, :TOPK_PAD] = pl.slice(hs_weight_mat, [1, TOPK_PAD], [0, 0], valid_shape=[1, TOPK])
+                else:
+                    t1 = wave * GATE_T_TILE
+                    route_logits = pl.slice(gate_logits_buf, [GATE_T_TILE, N_EXPERTS], [t1, 0])
+                    route_inv_rms = pl.read(inv_rms_buf, [t1, 0])
+                    route_logits = pl.mul(route_logits, route_inv_rms)
+                    gp_score = _router_scores(route_logits)
+                    gp_bias_row = pl.reshape(gate_bias, [1, N_EXPERTS])
+                    gp_biased = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
+                    gp_biased[:, :] = pl.full([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
+                    gp_biased[:, 0:N_EXPERTS] = pl.add(gp_score, gp_bias_row)
+                    # topk_idx_tile stays Tensor (created here, not a pl.full Tile) so
+                    # the batched pl.gather below accepts it — Tile-against-Tensor src
+                    # is rejected.
+                    topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+                    # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
+                    # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
+                    # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
+                    for sr_tt in pl.range(GATE_T_TILE):
+                        sr_row = gp_biased[sr_tt : sr_tt + 1, :]
+                        sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
+                        sr_sorted = pl.sort32(sr_row, sr_idx_init)
+                        sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
+                        sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
+                        sr_pairs = sr_sorted[:, 0:SORT_PAD]
+                        sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                        topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
+                    # Normalize only the selected scores.
+                    gather_all = pl.gather(gp_score, dim=-1, index=topk_idx_tile)
+                    nm_reduce = pl.create_tensor([ROW_PAD, TOPK_PAD], dtype=pl.FP32)
+                    nm_reduce[0:GATE_T_TILE, :] = gather_all
+                    nm_reduce = pl.set_validshape(nm_reduce, GATE_T_TILE, TOPK)
+                    nm_denom = pl.row_sum(nm_reduce)
+                    nm_weight_mat = pl.mul(pl.row_expand_div(nm_reduce, nm_denom), ROUTE_SCALE)
+                    nm_indices_valid = pl.set_validshape(topk_idx_tile, GATE_T_TILE, TOPK)
+                    indices[t1:t1+1, :TOPK_PAD] = nm_indices_valid
+                    weights[t1:t1+1, :TOPK_PAD] = pl.slice(nm_weight_mat, [1, TOPK_PAD], [0, 0], valid_shape=[1, TOPK])
+            publish_sort_row(local_ready, my_rank)
+            wait_for_group(local_ready, epoch)
+            if wave < active_tokens:
+                for k in pl.range(TOPK):
+                    dst=pl.cast(pl.read(route_slot_row,[wave*TOPK+k,0]),pl.INDEX)
+                    recv_flat[dst:dst+1,:]=x_norm_i8[wave:wave+1,:]
+        else:
+            wait_for_sort_rows(local_ready, epoch)
+            expert_slot = pl.tile.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
+            slots = pl.tile.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+            rows = pl.tile.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+            experts = pl.tile.full([N_SLOTS_B, IDX_PAD], dtype=pl.INT32, value=0)
+            scales = pl.tile.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
+            route_weights = pl.tile.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
+            route_rows = pl.tile.full([N_ROUTES, IDX_PAD], dtype=pl.INT32, value=0)
+            route_ids = pl.load(indices, [0, 0], [T, ROUTE_ROW_PAD])
+            input_weights = pl.load(weights, [0, 0], [T, ROUTE_ROW_PAD])
+            for col in pl.range(IDX_PAD):
+                pl.tile.write(experts, [SH_SLOT, col], pl.cast(SHARED_EID, pl.INT32))
+
+            next_slot = pl.cast(0, pl.INDEX)
+            for token in pl.range(active_tokens):
+                token_scale = pl.read(x_norm_scale, [token, 0])
+                for k in pl.range(TOPK):
+                    expert_id = pl.tile.read(route_ids, [token, k])
+                    expert_col = pl.cast(expert_id, pl.INDEX)
+                    slot = pl.tile.read(expert_slot, [0, expert_col])
+                    if slot < 0:
+                        slot = pl.cast(next_slot, pl.INT32)
+                        pl.tile.write(expert_slot, [0, expert_col], slot)
+                        pl.tile.write(experts, [next_slot, 0], expert_id)
+                        pl.tile.write(slots, [0, next_slot], slot)
+                        next_slot = next_slot + 1
+                    slot_row = pl.cast(slot, pl.INDEX)
+                    count = pl.tile.read(rows, [0, slot_row])
+                    count_col = pl.cast(count, pl.INDEX)
+                    pl.tile.write(rows, [0, slot_row], pl.cast(count + 1, pl.INT32))
+                    pl.tile.write(scales, [slot_row, count_col], token_scale)
+                    pl.tile.write(route_weights, [slot_row, count_col], pl.tile.read(input_weights, [token, k]))
+                    route = token * TOPK + k
+                    pl.tile.write(route_rows, [route, 0], pl.cast(slot * RECV_MAX + count, pl.INT32))
+                # The shared expert takes this token ungated, at the same quant scale.
+                pl.tile.write(scales, [SH_SLOT, token], token_scale)
+                pl.tile.write(route_weights, [SH_SLOT, token], pl.cast(1.0, pl.FP32))
+            pl.tile.write(slots, [0, next_slot], pl.cast(SH_SLOT, pl.INT32))
+            pl.tile.write(rows, [0, next_slot], pl.cast(active_tokens, pl.INT32))
+            pl.store(slots, [0, 0], work_slot_2d)
+            pl.store(rows, [0, 0], work_rows_2d)
+            pl.store(experts, [0, 0], slot_expert)
+            pl.store(scales, [0, 0], recv_scale)
+            pl.store(route_weights, [0, 0], recv_w)
+            pl.store(route_rows, [0, 0], route_slot_row)
+            publish_group(local_ready,my_rank)
+            shared=SH_SLOT*RECV_MAX
+            recv_flat[shared:shared+T,:]=x_norm_i8[0:T,:]
     return weights
 
 

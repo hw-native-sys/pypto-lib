@@ -36,7 +36,16 @@ if __package__:
         compare_sampled_ids,
     )
 else:
-    from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, TP_SIZE as LM_HEAD_TP_SIZE, VOCAB as LM_HEAD_VOCAB, VOCAB_PER_TP, lm_head_with_sampling, compare_sampled_ids
+    from lm_head import (
+        GROUP_LOGIT_ROWS,
+        MAX_LOGIT_ROWS,
+        SAMPLED_IDS_PAD,
+        TP_SIZE as LM_HEAD_TP_SIZE,
+        VOCAB as LM_HEAD_VOCAB,
+        VOCAB_PER_TP,
+        lm_head_with_sampling,
+        compare_sampled_ids,
+    )
 from pypto.ir.distributed_compiled_program import DistributedConfig
 if __package__:
     from .rmsnorm import rms_norm
@@ -120,9 +129,11 @@ if __package__:
 else:
     from decode_csa import CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM, CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS, COMPRESS_RATIO as CSA_COMPRESS_RATIO, IDX_CACHE_BLOCK_NUM as CSA_IDX_CACHE_BLOCK_NUM, IDX_CACHE_MAX_BLOCKS as CSA_IDX_CACHE_MAX_BLOCKS, IDX_HEAD_DIM as CSA_IDX_HEAD_DIM, IDX_N_HEADS as CSA_IDX_N_HEADS, INNER_OUT_DIM as CSA_INNER_OUT_DIM, INNER_STATE_BLOCK_NUM as CSA_INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE as CSA_INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM as CSA_INNER_STATE_DIM, INNER_STATE_MAX_BLOCKS as CSA_INNER_STATE_MAX_BLOCKS, MAIN_OUT_DIM as CSA_MAIN_OUT_DIM, MAIN_STATE_BLOCK_NUM as CSA_MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE as CSA_MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM as CSA_MAIN_STATE_DIM, MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS, OPROJ_REDUCE_ROWS as CSA_OPROJ_REDUCE_ROWS, attention_csa, prepare_csa_metadata, CSA_ROPE_ROWS, IDX_ROPE_ROWS, build_tensor_specs as build_csa_tensor_specs, clear_csa_oproj_signals, TOK_Q_ROWS, TOK_O_COLS
 if __package__:
-    from .config import FLASH as MODEL_CONFIG, _parse_int_argv
+    from .decode_shapes import DECODE_CONFIG as MODEL_CONFIG
+    from .config import _parse_int_argv
 else:
-    from config import FLASH as MODEL_CONFIG, _parse_int_argv
+    from decode_shapes import DECODE_CONFIG as MODEL_CONFIG
+    from config import _parse_int_argv
 if __package__:
     from .utils import DECODE_START_POS
 else:
@@ -2932,9 +2943,9 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="Seed for reproducible generated fixtures.")
     parser.add_argument("--save-data", action="store_true", default=False, help="save inputs for replay")
     if __package__:
-        from .config import CONTEXT_CAPACITY
+        from .decode_shapes import CONTEXT_CAPACITY
     else:
-        from config import CONTEXT_CAPACITY
+        from decode_shapes import CONTEXT_CAPACITY
 
     parser.add_argument(
         "--max-seq-len",

@@ -20,9 +20,9 @@ if __package__:
 else:
     from qkv_proj_rope import prepare_qkv_rope_metadata
 if __package__:
-    from .decode_sparse_attn_hca import prepare_hca_output_rope, H_TILE as HCA_ROPE_ROWS
+    from .decode_sparse_attn import prepare_hca_output_rope, H_TILE as HCA_ROPE_ROWS
 else:
-    from decode_sparse_attn_hca import prepare_hca_output_rope, H_TILE as HCA_ROPE_ROWS
+    from decode_sparse_attn import prepare_hca_output_rope, H_TILE as HCA_ROPE_ROWS
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -31,14 +31,16 @@ if __package__:
 else:
     import o_proj_tp as OTP
 if __package__:
-    from .o_proj_tp import o_proj_tp_core
+    from .o_proj_tp import o_proj_hc_core
 else:
-    from o_proj_tp import o_proj_tp_core
+    from o_proj_tp import o_proj_hc_core
 
 if __package__:
-    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
 else:
-    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from decode_shapes import DECODE_CONFIG as M
+    from config import INT8_SCALE_MAX, INT8_AMAX_EPS
 if __package__:
     from .decode_shapes import (
         DECODE_BATCH,
@@ -54,13 +56,9 @@ if __package__:
 else:
     from decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, DECODE_CMP_BLOCK_NUM, DECODE_ORI_BLOCK_NUM, KV_CMP_MAX_BLOCKS, KV_ORI_MAX_BLOCKS, KV_ORI_TABLE_MAX_BLOCKS
 if __package__:
-    from .hc_pre import hc_pre
+    from .hc_pre import hc_pre, hc_pre_norm
 else:
-    from hc_pre import hc_pre
-if __package__:
-    from .hc_post import hc_post
-else:
-    from hc_post import hc_post
+    from hc_pre import hc_pre, hc_pre_norm
 if __package__:
     from .qkv_proj_rope import qkv_proj_rope
 else:
@@ -70,17 +68,17 @@ if __package__:
 else:
     from rmsnorm import rms_norm
 if __package__:
-    from .rope_interleave import rope_interleave
+    from .kv_proj_rope import rope_interleave
 else:
-    from rope_interleave import rope_interleave
+    from kv_proj_rope import rope_interleave
 if __package__:
-    from .decode_compressor_ratio128 import compressor_ratio128
+    from .decode_compressors import compressor_ratio128
 else:
-    from decode_compressor_ratio128 import compressor_ratio128
+    from decode_compressors import compressor_ratio128
 if __package__:
-    from .decode_sparse_attn_hca import sparse_attn_hca_packed, CMP_TOPK as HCA_SPARSE_CMP_TOPK
+    from .decode_sparse_attn import sparse_attn_hca_packed, HCA_CMP_TOPK as HCA_SPARSE_CMP_TOPK
 else:
-    from decode_sparse_attn_hca import sparse_attn_hca_packed, CMP_TOPK as HCA_SPARSE_CMP_TOPK
+    from decode_sparse_attn import sparse_attn_hca_packed, HCA_CMP_TOPK as HCA_SPARSE_CMP_TOPK
 
 
 # model config
@@ -134,6 +132,8 @@ COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic('LOWLAT_TARGET_HCA_STATE_BLOCK_NUM_DYN')
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash 128 (= 16384/128); max compressed positions
+if COMPRESS_TOPK == 0:
+    raise ValueError(f"HCA decode requires a context capacity of at least {COMPRESS_RATIO}")
 # HCA has no indexer: the compressed tail is every slot the cache holds, so the
 # only bound is the cache capacity (`index_topk` belongs to the ratio-4 indexer).
 # Longest context served = COMPRESS_TOPK * COMPRESS_RATIO = MAX_SEQ_LEN.
@@ -259,13 +259,15 @@ def attention_hca(
     out_rope_swap_idx: pl.Tensor[[HCA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
 ):
     """HCA decode orchestration for compress_ratio=128."""
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
+    if T == 6:
+        rms_tid = hc_pre_norm(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, x_normed, post_t, comb_t)
+    else:
+        x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+        hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+        rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
     # SDMA CMO L2 warm of this layer's attention weights, in deadline order.
     wq_a_flat = pl.reshape(wq_a, [D * Q_LORA])
     wkv_flat = pl.reshape(wkv, [D * HEAD_DIM])
@@ -334,7 +336,6 @@ def attention_hca(
         late_dep,
     )
 
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     group_merge = pl.array.create(GROUPS_PER_RANK, pl.TASK_ID)
     for local_group in pl.range(GROUPS_PER_RANK):
@@ -346,13 +347,16 @@ def attention_hca(
         )
         group_merge[local_group] = group_merge_tid
     merge_tid = pl.system.task_dummy(deps=[group_merge])
-    o_proj_tp_core(
+    o_proj_hc_core(
         o_packed,
         merge_tid,
         wo_a_shard,
         wo_b_shard,
         wo_b_scale,
-        attn_out,
+        x_hc,
+        post_t,
+        comb_t,
+        x_out,
         reduce_window,
         reduce_signal,
         sync_signal,
@@ -360,7 +364,6 @@ def attention_hca(
         oproj_epoch,
     )
 
-    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
@@ -582,17 +585,17 @@ def golden_attention_hca(tensors):
     else:
         from rmsnorm import golden_rms_norm
     if __package__:
-        from .decode_compressor_ratio128 import golden_compressor
+        from .decode_compressors import golden_compressor_ratio128 as golden_compressor
     else:
-        from decode_compressor_ratio128 import golden_compressor
+        from decode_compressors import golden_compressor_ratio128 as golden_compressor
     if __package__:
-        from .decode_sparse_attn_hca import golden_sparse_attn
+        from .decode_sparse_attn import golden_sparse_attn_hca as golden_sparse_attn
     else:
-        from decode_sparse_attn_hca import golden_sparse_attn
+        from decode_sparse_attn import golden_sparse_attn_hca as golden_sparse_attn
     if __package__:
-        from .hc_post import golden_hc_post
+        from .hc_post_common import golden_hc_post
     else:
-        from hc_post import golden_hc_post
+        from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post
 
     # ---- Block.hc_pre ----
     x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
@@ -1129,9 +1132,9 @@ if __name__ == "__main__":
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("--compile-only", action="store_true", default=False)
     if __package__:
-        from .config import CONTEXT_CAPACITY
+        from .decode_shapes import CONTEXT_CAPACITY
     else:
-        from config import CONTEXT_CAPACITY
+        from decode_shapes import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     parser.add_argument("--tp", type=int, default=OPROJ_N_RANKS, choices=[1, 2, 4, 8])

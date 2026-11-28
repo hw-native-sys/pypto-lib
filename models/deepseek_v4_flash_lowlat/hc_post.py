@@ -13,8 +13,12 @@ import pypto.language as pl
 
 if __package__:
     from .config import FLASH as M
+    from .hc_post_common import golden_hc_post
+    from .hc_post_common import hc_post as shared_hc_post
 else:
     from config import FLASH as M
+    from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post
+    from models.deepseek_v4_flash_lowlat.hc_post_common import hc_post as shared_hc_post
 if __package__:
     from .decode_shapes import DECODE_BATCH, DECODE_SEQ
 else:
@@ -88,25 +92,15 @@ def hc_post_test(
     return y
 
 
-def golden_hc_post(tensors):
-    """Torch reference, direct port of model.py Block.hc_post 684-687."""
-    import torch
-
-    x        = tensors["x"].float()
-    residual = tensors["residual"].float()
-    post     = tensors["post"].float()
-    comb     = tensors["comb"].float().reshape(-1, HC_MULT, HC_MULT)  # [B, S, HC, HC]
-
-    T = x.shape[0]
-    y_fp32 = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
-    for out_h in range(HC_MULT):
-        y_row = x * post[:, out_h:out_h + 1]
-        for in_h in range(HC_MULT):
-            y_row = y_row + residual[:, in_h, :] * comb[:, in_h, out_h:out_h + 1]
-        y_fp32[:, out_h, :] = y_row
-    y = y_fp32  # hc residual stream is FP32 end-to-end: no BF16 rounding
-
-    tensors["y"][:] = y
+@pl.jit
+def shared_hc_post_test(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+):
+    return shared_hc_post(x, residual, post, comb, y)
 
 
 def build_tensor_specs(B, S):
@@ -137,8 +131,6 @@ if __name__ == "__main__":
     import argparse
     from golden import run
 
-    MODES = {"decode": (DECODE_BATCH, DECODE_SEQ)}
-
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -153,29 +145,29 @@ if __name__ == "__main__":
     if args.tokens is not None and args.tokens <= 0:
         parser.error("--tokens must be positive")
 
-    modes_to_run = [args.mode]
+    token_counts = [args.tokens] if args.tokens is not None else list(dict.fromkeys([DECODE_BATCH * DECODE_SEQ, 1, 6, 9, 17]))
+    cases = [(args.mode, hc_post_test, tokens) for tokens in token_counts]
+    if args.tokens is None:
+        cases.append(("shared", shared_hc_post_test, 5))
 
-    for mode_name in modes_to_run:
-        B, S = MODES[mode_name]
-        token_counts = [args.tokens] if args.tokens is not None else list(dict.fromkeys([B * S, 1, 6, 9, 17]))
-        for tokens in token_counts:
-            print(f"--- hc_post {mode_name}: T={tokens} ---")
-            result = run(
-                fn=hc_post_test,
-                specs=build_tensor_specs(1, tokens),
-                golden_fn=golden_hc_post,
-                config=dict(
-                    dump_passes=args.dump_passes,
-                    backend_type=args.platform.removesuffix("sim"),
-                    execution_mode=args.sim or args.platform.endswith("sim"),
-                    device_id=args.device,
-                    enable_chip_swimlane=args.enable_chip_swimlane,
-                ),
-                rtol=1e-3,
-                atol=1e-3,
-                compile_only=args.compile_only,
-            )
-            if not result.passed:
-                if result.error:
-                    print(result.error)
-                raise SystemExit(1)
+    for mode_name, fn, tokens in cases:
+        print(f"--- hc_post {mode_name}: T={tokens} ---")
+        result = run(
+            fn=fn,
+            specs=build_tensor_specs(1, tokens),
+            golden_fn=golden_hc_post,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.platform.removesuffix("sim"),
+                execution_mode=args.sim or args.platform.endswith("sim"),
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)

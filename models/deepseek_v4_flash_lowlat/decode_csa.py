@@ -15,13 +15,17 @@ if __package__:
 else:
     from qkv_proj_rope import prepare_qkv_rope_metadata
 if __package__:
-    from .decode_sparse_attn_csa import (
+    from .decode_sparse_attn import (
         prepare_csa_output_rope,
         H_TILE as CSA_ROPE_ROWS,
         sparse_attn_csa_head_packed,
     )
 else:
-    from decode_sparse_attn_csa import prepare_csa_output_rope, H_TILE as CSA_ROPE_ROWS, sparse_attn_csa_head_packed
+    from decode_sparse_attn import (
+        prepare_csa_output_rope,
+        H_TILE as CSA_ROPE_ROWS,
+        sparse_attn_csa_head_packed,
+    )
 if __package__:
     from .decode_indexer import prepare_indexer_rope_indices, ROPE_ROW_TILE as IDX_ROPE_ROWS
 else:
@@ -30,9 +34,11 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 if __package__:
-    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
 else:
-    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from decode_shapes import DECODE_CONFIG as M
+    from config import INT8_SCALE_MAX, INT8_AMAX_EPS
 if __package__:
     from .decode_shapes import (
         DECODE_BATCH,
@@ -50,17 +56,13 @@ if __package__:
 else:
     from decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, DECODE_CMP_BLOCK_NUM, DECODE_IDX_BLOCK_NUM, DECODE_ORI_BLOCK_NUM, IDX_CACHE_MAX_BLOCKS, KV_CMP_MAX_BLOCKS, KV_ORI_MAX_BLOCKS, KV_ORI_TABLE_MAX_BLOCKS
 if __package__:
-    from .decode_compressor_ratio4 import compressor_ratio4
+    from .decode_compressors import compressor_ratio4
 else:
-    from decode_compressor_ratio4 import compressor_ratio4
+    from decode_compressors import compressor_ratio4
 if __package__:
-    from .hc_post import hc_post
+    from .hc_pre import hc_pre, hc_pre_norm
 else:
-    from hc_post import hc_post
-if __package__:
-    from .hc_pre import hc_pre
-else:
-    from hc_pre import hc_pre
+    from hc_pre import hc_pre, hc_pre_norm
 if __package__:
     from .decode_indexer import indexer
 else:
@@ -74,17 +76,17 @@ if __package__:
 else:
     from rmsnorm import rms_norm
 if __package__:
-    from .rope_interleave import rope_interleave
+    from .kv_proj_rope import rope_interleave
 else:
-    from rope_interleave import rope_interleave
+    from kv_proj_rope import rope_interleave
 if __package__:
-    from .decode_sparse_attn_csa import csa_q_all_to_all, csa_o_all_to_all_wait, sparse_attn_csa_packed
+    from .decode_sparse_attn import csa_q_all_to_all, csa_o_all_to_all_wait, sparse_attn_csa_packed
 else:
-    from decode_sparse_attn_csa import csa_q_all_to_all, csa_o_all_to_all_wait, sparse_attn_csa_packed
+    from decode_sparse_attn import csa_q_all_to_all, csa_o_all_to_all_wait, sparse_attn_csa_packed
 if __package__:
-    from . import decode_sparse_attn_csa as CSA
+    from . import decode_sparse_attn as CSA
 else:
-    import decode_sparse_attn_csa as CSA
+    import decode_sparse_attn as CSA
 # Imported by name, not via the module: the DSL parser needs a bare callee,
 # and an "import ... as" alias on a @pl.jit.inline callee fails specialization.
 if __package__:
@@ -92,9 +94,9 @@ if __package__:
 else:
     import o_proj_tp as OTP
 if __package__:
-    from .o_proj_tp import o_proj_tp_core
+    from .o_proj_tp import o_proj_hc_core
 else:
-    from o_proj_tp import o_proj_tp_core
+    from o_proj_tp import o_proj_hc_core
 
 # model config
 
@@ -176,6 +178,15 @@ CSA_WB_TOKEN_TILE = 8
 
 TOKEN_SHARDED = T == O_GROUPS
 
+
+if __package__:
+    from .c4_epilogues import merge_leaf_and_plan
+    from .decode_indexer import TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH, TOPK_RUN_SCORES, indexer_original_leaves
+    from .decode_sparse_attn import C4_PLAN_COLS, CSA_CMP_TOPK, CSA_PADDED_TOPK, sparse_attn_csa_head_with_plan
+else:
+    from c4_epilogues import merge_leaf_and_plan
+    from decode_indexer import TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH, TOPK_RUN_SCORES, indexer_original_leaves
+    from decode_sparse_attn import C4_PLAN_COLS, CSA_CMP_TOPK, CSA_PADDED_TOPK, sparse_attn_csa_head_with_plan
 
 @pl.jit.inline
 def prepare_csa_metadata(freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16], freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16], position_ids: pl.Tensor[[T], pl.INT32], rope_cos_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]], rope_sin_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]], step_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], step_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], cmp_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], cmp_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], q_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], q_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], q_rope_swap_idx: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32]], out_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], out_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], out_rope_swap_idx: pl.Out[pl.Tensor[[CSA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32]], idx_rope_swap_idx: pl.Out[pl.Tensor[[IDX_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32]]):
@@ -277,10 +288,13 @@ def attention_csa_packed(
     out_rope_swap_idx: pl.Tensor[[CSA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
     idx_rope_swap_idx: pl.Tensor[[IDX_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    if T == 6:
+        rms_tid = hc_pre_norm(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, x_normed_t, post_t, comb_t)
+    else:
+        x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+        hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+        rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
     wq_a_flat = pl.reshape(wq_a, [D * Q_LORA])
     wkv_flat = pl.reshape(wkv, [D * HEAD_DIM])
     cmp_wkv_flat = pl.reshape(cmp_wkv, [MAIN_OUT_DIM * D])
@@ -366,93 +380,149 @@ def attention_csa_packed(
         kv_dep,
     )
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
-    idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
-    idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
-    indexer(
-        x_normed,
-        qr,
-        qr_scale,
-        idx_wq_b,
-        idx_wq_b_scale,
-        weights_proj,
-        step_cos_il,
-        step_sin_signed,
-        cmp_cos_il,
-        cmp_sin_signed,
-        hadamard_idx,
-        idx_kv_unused,
-        inner_compress_state,
-        inner_compress_state_block_table,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        idx_kv_cache,
-        idx_kv_scale,
-        idx_block_table,
-        idx_score_unused,
-        idx_topk_full,
-        position_ids_bsd,
-        idx_slot_mapping_bsd,
-        inner_state_slot_mapping_bsd,
-        kv_seq_lens,
-        0,
-        late_dep,
-        my_rank,
-        idx_rope_swap_idx,
-        pl.const(0, pl.INT32),
-    )
-    idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
-    position_ids_t1 = pl.reshape(position_ids, [T, 1])
-    if TOKEN_SHARDED:
-        token_done = pl.array.create(TOKENS_PER_RANK, pl.TASK_ID)
-        for local_token in pl.range(TOKENS_PER_RANK):
-            token_id = pl.cast(my_rank, pl.INT32) * TOKENS_PER_RANK + pl.cast(local_token, pl.INT32)
-            token_tid = sparse_attn_csa_packed(
-                q_window,
-                q_signal,
-                q_push_tid,
-                kv_cache,
-                window_swa_indices,
-                cmp_kv,
-                cmp_block_table,
-                idx_topk_flat,
-                position_ids_t1,
-                attn_sink,
-                rope_cos_t,
-                rope_sin_t,
-                o_packed,
-                o_window,
-                o_signal,
-                token_id,
-                tok_epoch,
-                out_rope_cos_il,
-                out_rope_sin_signed,
-                out_rope_swap_idx,
-            )
-            token_done[local_token] = token_tid
-        merge_tid = csa_o_all_to_all_wait(o_window, o_signal, o_packed, my_rank, tok_epoch, token_done)
+    packed_ok=pl.cast(0,pl.INT32)
+    if B==1 and S==6 and GROUPS_PER_RANK==1 and INDEXER_SCORE_LEN>4096:
+        packed_ok=pl.cast(1,pl.INT32)
+        end=pl.read(kv_seq_lens,[0])//4
+        for row in pl.unroll(T):
+            v=pl.min(end,(pl.read(position_ids_bsd,[0,row])+1)//4)
+            if v<=2*TOPK_RUN_SCORES or v>3*TOPK_RUN_SCORES:
+                packed_ok=pl.cast(0,pl.INT32)
+    if packed_ok!=0:
+        leaf_pairs=pl.create_tensor([T*TOPK_ARENA_ROWS,TOPK_PAIR_WIDTH],dtype=pl.FP32)
+        original_score=pl.create_tensor([B,S,INDEXER_SCORE_LEN],dtype=pl.FP32)
+        indexer_original_leaves(
+            x_normed,
+            qr,
+            qr_scale,
+            idx_wq_b,
+            idx_wq_b_scale,
+            weights_proj,
+            step_cos_il,
+            step_sin_signed,
+            cmp_cos_il,
+            cmp_sin_signed,
+            hadamard_idx,
+            idx_kv_unused,
+            inner_compress_state,
+            inner_compress_state_block_table,
+            inner_wkv,
+            inner_wgate,
+            inner_ape,
+            inner_norm_w,
+            idx_kv_cache,
+            idx_kv_scale,
+            idx_block_table,
+            original_score,
+            leaf_pairs,
+            position_ids_bsd,
+            idx_slot_mapping_bsd,
+            inner_state_slot_mapping_bsd,
+            kv_seq_lens,
+            late_dep,
+            my_rank,
+            idx_rope_swap_idx,
+            False,  # owned_s6
+        )
+        cmp_sorted=pl.create_tensor([T,CSA_CMP_TOPK],dtype=pl.INT32)
+        csa_bias=pl.create_tensor([T,CSA_PADDED_TOPK],dtype=pl.FP32)
+        per_query=pl.create_tensor([T,C4_PLAN_COLS],dtype=pl.INT32)
+        plan_ready=merge_leaf_and_plan(leaf_pairs,position_ids_bsd,window_swa_indices,
+                                       cmp_sorted,csa_bias,per_query)
+        packed_group_id=pl.cast(my_rank,pl.INT32)
+        packed_positions_t1=pl.reshape(position_ids,[T,1])
+        merge_tid=sparse_attn_csa_head_with_plan(
+            q,kv_cache,window_swa_indices,cmp_kv,cmp_block_table,csa_bias,cmp_sorted,per_query,packed_positions_t1,plan_ready,
+            attn_sink,o_packed,packed_group_id,out_rope_cos_il,out_rope_sin_signed,out_rope_swap_idx,
+        )
     else:
-        group_done = pl.array.create(GROUPS_PER_RANK, pl.TASK_ID)
-        for local_group in pl.range(GROUPS_PER_RANK):
-            group_id = pl.cast(my_rank, pl.INDEX) * GROUPS_PER_RANK + local_group
-            group_tid = sparse_attn_csa_head_packed(
-                q,
-                kv_cache,
-                window_swa_indices,
-                cmp_kv,
-                cmp_block_table,
-                idx_topk_flat,
-                position_ids_t1,
-                attn_sink,
-                o_packed,
-                pl.cast(group_id, pl.INT32),
-                out_rope_cos_il,
-                out_rope_sin_signed,
-                out_rope_swap_idx,
-            )
-            group_done[local_group] = group_tid
-        merge_tid = pl.system.task_dummy(deps=[group_done])
+        idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
+        idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
+        indexer(
+            x_normed,
+            qr,
+            qr_scale,
+            idx_wq_b,
+            idx_wq_b_scale,
+            weights_proj,
+            step_cos_il,
+            step_sin_signed,
+            cmp_cos_il,
+            cmp_sin_signed,
+            hadamard_idx,
+            idx_kv_unused,
+            inner_compress_state,
+            inner_compress_state_block_table,
+            inner_wkv,
+            inner_wgate,
+            inner_ape,
+            inner_norm_w,
+            idx_kv_cache,
+            idx_kv_scale,
+            idx_block_table,
+            idx_score_unused,
+            idx_topk_full,
+            position_ids_bsd,
+            idx_slot_mapping_bsd,
+            inner_state_slot_mapping_bsd,
+            kv_seq_lens,
+            0,
+            late_dep,
+            my_rank,
+            idx_rope_swap_idx,
+            pl.const(0, pl.INT32),
+        )
+        idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
+        position_ids_t1 = pl.reshape(position_ids, [T, 1])
+        if TOKEN_SHARDED:
+            token_done = pl.array.create(TOKENS_PER_RANK, pl.TASK_ID)
+            for local_token in pl.range(TOKENS_PER_RANK):
+                token_id = pl.cast(my_rank, pl.INT32) * TOKENS_PER_RANK + pl.cast(local_token, pl.INT32)
+                token_tid = sparse_attn_csa_packed(
+                    q_window,
+                    q_signal,
+                    q_push_tid,
+                    kv_cache,
+                    window_swa_indices,
+                    cmp_kv,
+                    cmp_block_table,
+                    idx_topk_flat,
+                    position_ids_t1,
+                    attn_sink,
+                    rope_cos_t,
+                    rope_sin_t,
+                    o_packed,
+                    o_window,
+                    o_signal,
+                    token_id,
+                    tok_epoch,
+                    out_rope_cos_il,
+                    out_rope_sin_signed,
+                    out_rope_swap_idx,
+                )
+                token_done[local_token] = token_tid
+            merge_tid = csa_o_all_to_all_wait(o_window, o_signal, o_packed, my_rank, tok_epoch, token_done)
+        else:
+            group_done = pl.array.create(GROUPS_PER_RANK, pl.TASK_ID)
+            for local_group in pl.range(GROUPS_PER_RANK):
+                group_id = pl.cast(my_rank, pl.INDEX) * GROUPS_PER_RANK + local_group
+                group_tid = sparse_attn_csa_head_packed(
+                    q,
+                    kv_cache,
+                    window_swa_indices,
+                    cmp_kv,
+                    cmp_block_table,
+                    idx_topk_flat,
+                    position_ids_t1,
+                    attn_sink,
+                    o_packed,
+                    pl.cast(group_id, pl.INT32),
+                    out_rope_cos_il,
+                    out_rope_sin_signed,
+                    out_rope_swap_idx,
+                )
+                group_done[local_group] = group_tid
+            merge_tid = pl.system.task_dummy(deps=[group_done])
     return merge_tid
 
 
@@ -613,21 +683,22 @@ def attention_csa(
         out_rope_swap_idx,
         idx_rope_swap_idx,
     )
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    o_proj_tp_core(
+    o_proj_hc_core(
         o_packed,
         merge_tid,
         wo_a_shard,
         wo_b_shard,
         wo_b_scale,
-        attn_out,
+        x_hc,
+        post_t,
+        comb_t,
+        x_out,
         reduce_window,
         reduce_signal,
         sync_signal,
         my_rank,
         oproj_epoch,
     )
-    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
@@ -912,9 +983,9 @@ def golden_attention_csa(tensors):
     import torch
 
     if __package__:
-        from .decode_compressor_ratio4 import golden_compressor
+        from .decode_compressors import golden_compressor_ratio4 as golden_compressor
     else:
-        from decode_compressor_ratio4 import golden_compressor
+        from decode_compressors import golden_compressor_ratio4 as golden_compressor
     if __package__:
         from .hc_pre import golden_hc_pre
     else:
@@ -932,13 +1003,13 @@ def golden_attention_csa(tensors):
     else:
         from rmsnorm import golden_rms_norm
     if __package__:
-        from .decode_sparse_attn_csa import golden_sparse_attn
+        from .decode_sparse_attn import golden_sparse_attn_csa as golden_sparse_attn
     else:
-        from decode_sparse_attn_csa import golden_sparse_attn
+        from decode_sparse_attn import golden_sparse_attn_csa as golden_sparse_attn
     if __package__:
-        from .hc_post import golden_hc_post
+        from .hc_post_common import golden_hc_post
     else:
-        from hc_post import golden_hc_post
+        from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post
 
     x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
     post_t = torch.zeros(T, HC_MULT, dtype=torch.float32)
@@ -1701,9 +1772,9 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=0, help="Seed for the generated correctness fixture.")
     if __package__:
-        from .config import CONTEXT_CAPACITY
+        from .decode_shapes import CONTEXT_CAPACITY
     else:
-        from config import CONTEXT_CAPACITY
+        from decode_shapes import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     parser.add_argument("--tp", type=int, default=OPROJ_N_RANKS, choices=[1, 2, 4, 8])

@@ -6,8 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+"""Drafter request metadata and context KV preparation."""
 
 import pypto.language as pl
+from .config import BLOCK_SIZE, FLASH as M
+from ..kv_proj_rope import kv_proj_rope
+from .qkv_proj_rope import rope_prepare
+
 
 BANK_COUNT = pl.dynamic("D_METADATA_BANK_COUNT")
 
@@ -149,3 +154,84 @@ def select_drafter_metadata(
         ]
         qg_sin_selected_rows = pl.reshape(qg_sin_selected, [4, 64])
         query_group_freqs_sin[qg_sin_row : qg_sin_row + 4, :] = qg_sin_selected_rows
+
+
+ROWS = pl.dynamic("NATIVE_D_HISTORY_INPUT_ROWS")
+
+MAIN_IN = 12288
+
+RING_ROWS = 128
+
+
+@pl.jit.inline(auto_scope=False)
+def history_ring_to_window(
+    ring: pl.Tensor[[ROWS, MAIN_IN], pl.BF16],
+    anchors: pl.Tensor,
+    ordered: pl.Out[pl.Tensor[[ROWS, MAIN_IN], pl.BF16]],
+    prior_cycle_gate: pl.Scalar[pl.TASK_ID],
+):
+    ring.bind_dynamic(0, ROWS)
+    ordered.bind_dynamic(0, ROWS)
+    rows = pl.tensor.dim(ring, 0)
+    with pl.spmd(
+        rows, name_hint="history_ring_unpack", allow_early_resolve=True, deps=[prior_cycle_gate]
+    ) as ready_tid:
+        row = pl.tile.get_block_idx()
+        position = pl.cast(pl.read(anchors, [0]), pl.INDEX)
+        count = pl.min(position + 1, RING_ROWS)
+        first = position + 1 - count
+        if row < count:
+            source_row = (first + row) % RING_ROWS
+            ordered[row : row + 1, 0:MAIN_IN] = ring[source_row : source_row + 1, 0:MAIN_IN]
+        else:
+            ordered[row : row + 1, 0:MAIN_IN] = pl.full([1, MAIN_IN], dtype=pl.BF16, value=0.0)
+    return (ordered, ready_tid)
+
+
+T_DYN = pl.dynamic("NATIVE_D_DSPARK_CONTEXT_KV_T_DYN")
+
+ORI_BLOCK_NUM_DYN = pl.dynamic("NATIVE_D_DSPARK_CONTEXT_KV_ORI_BLOCK_NUM_DYN")
+
+DSPARK_CONTEXT_LAYERS = 3
+
+D = M.hidden_size
+
+HEAD_DIM = M.head_dim
+
+ROPE_DIM = M.qk_rope_head_dim
+
+
+@pl.jit.inline
+def dspark_context_kv(
+    main_x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[DSPARK_CONTEXT_LAYERS, T_DYN], pl.INT64],
+    layer_index: pl.Scalar[pl.INT32],
+    kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+):
+    t_dim = pl.tensor.dim(position_ids, 0)
+
+    rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
+    rope_prepare(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
+
+    # This no-work source task seeds the explicit kv_proj dependency chain.
+    late_dep = pl.system.task_dummy(deps=[])
+    kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
+    kv_proj_rope(main_x, wkv, gamma_ckv, rope_cos_il, rope_sin_signed, rope_swap_idx, kv, late_dep)
+
+    ori_block_num = pl.tensor.dim(kv_cache, 0)
+    kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_context_kv_scatter"):
+        for write_t in pl.range(t_dim):
+            write_row_i64 = pl.read(slot_mapping, [layer_index, write_t])
+            if write_row_i64 >= 0:
+                write_row = pl.cast(write_row_i64, pl.INDEX)
+                kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
+
+    return kv_cache

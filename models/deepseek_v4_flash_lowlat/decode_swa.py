@@ -21,9 +21,9 @@ if __package__:
 else:
     from qkv_proj_rope import prepare_qkv_rope_metadata
 if __package__:
-    from .decode_sparse_attn_swa import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
+    from .decode_sparse_attn import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
 else:
-    from decode_sparse_attn_swa import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
+    from decode_sparse_attn import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -32,14 +32,16 @@ if __package__:
 else:
     import o_proj_tp as OTP
 if __package__:
-    from .o_proj_tp import o_proj_tp_core
+    from .o_proj_tp import o_proj_hc_core
 else:
-    from o_proj_tp import o_proj_tp_core
+    from o_proj_tp import o_proj_hc_core
 
 if __package__:
-    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
 else:
-    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from decode_shapes import DECODE_CONFIG as M
+    from config import INT8_SCALE_MAX, INT8_AMAX_EPS
 if __package__:
     from .decode_shapes import (
         DECODE_BATCH,
@@ -53,13 +55,9 @@ if __package__:
 else:
     from decode_shapes import DECODE_BATCH, DECODE_ORI_BLOCK_NUM, DECODE_SEQ, BLOCK_SIZE, KV_CMP_MAX_BLOCKS, KV_ORI_MAX_BLOCKS, KV_ORI_TABLE_MAX_BLOCKS
 if __package__:
-    from .hc_pre import hc_pre
+    from .hc_pre import hc_pre, hc_pre_norm
 else:
-    from hc_pre import hc_pre
-if __package__:
-    from .hc_post import hc_post
-else:
-    from hc_post import hc_post
+    from hc_pre import hc_pre, hc_pre_norm
 if __package__:
     from .qkv_proj_rope import qkv_proj_rope
 else:
@@ -69,9 +67,9 @@ if __package__:
 else:
     from rmsnorm import rms_norm
 if __package__:
-    from .decode_sparse_attn_swa import sparse_attn_swa_packed
+    from .decode_sparse_attn import sparse_attn_swa_packed
 else:
-    from decode_sparse_attn_swa import sparse_attn_swa_packed
+    from decode_sparse_attn import sparse_attn_swa_packed
 
 
 # model config
@@ -202,13 +200,15 @@ def attention_swa(
     out_rope_sin_signed: pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32],
     out_rope_swap_idx: pl.Tensor[[SWA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32],
 ):
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
-
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    if T == 6:
+        rms_tid = hc_pre_norm(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, x_normed_t, post_t, comb_t)
+    else:
+        x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+        hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+        rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
     # SDMA CMO L2 warm of this layer's attention weights, in deadline order.
     wq_a_flat = pl.reshape(wq_a, [D * Q_LORA])
     wkv_flat = pl.reshape(wkv, [D * HEAD_DIM])
@@ -271,7 +271,6 @@ def attention_swa(
             v_mapped = pl.minimum(pl.maximum(pl.add(v_indices, 1.0), 0.0), 1.0)
             v_valid = pl.mul(v_valid, v_mapped)
             sparse_bias[0:T, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     group_merge = pl.array.create(GROUPS_PER_RANK, pl.TASK_ID)
     for local_group in pl.range(GROUPS_PER_RANK):
@@ -282,13 +281,16 @@ def attention_swa(
         )
         group_merge[local_group] = group_merge_tid
     merge_tid = pl.system.task_dummy(deps=[group_merge])
-    o_proj_tp_core(
+    o_proj_hc_core(
         o_packed,
         merge_tid,
         wo_a_shard,
         wo_b_shard,
         wo_b_scale,
-        attn_out,
+        x_hc,
+        post_t,
+        comb_t,
+        x_out,
         reduce_window,
         reduce_signal,
         sync_signal,
@@ -296,7 +298,6 @@ def attention_swa(
         oproj_epoch,
     )
 
-    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
@@ -472,13 +473,13 @@ def golden_attention_swa(tensors):
     else:
         from rmsnorm import golden_rms_norm
     if __package__:
-        from .decode_sparse_attn_swa import golden_sparse_attn
+        from .decode_sparse_attn import golden_sparse_attn_swa as golden_sparse_attn
     else:
-        from decode_sparse_attn_swa import golden_sparse_attn
+        from decode_sparse_attn import golden_sparse_attn_swa as golden_sparse_attn
     if __package__:
-        from .hc_post import golden_hc_post
+        from .hc_post_common import golden_hc_post
     else:
-        from hc_post import golden_hc_post
+        from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
     x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)

@@ -13,15 +13,17 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from .drafter.device_metadata import BANK_COUNT
 from .native_cycle_common import (
-    full_cycle_reuse_gate, markov_cycle_banks, prepare_draft_markov, target_cycle_banks,
+    full_cycle_reuse_gate, markov_cycle_banks, populate_local_draft_history, prepare_draft_markov8, target_cycle_banks,
 )
 from .native_decode import (
     CSA_CMP_MAX_BLOCKS, CSA_IDX_CACHE_MAX_BLOCKS, CSA_INNER_STATE_MAX_BLOCKS,
     CSA_MAIN_STATE_MAX_BLOCKS, HCA_CMP_MAX_BLOCKS, HCA_COMPRESS_STATE_MAX_BLOCKS,
     MAX_SEQ_LEN, ORI_TABLE_MAX_BLOCKS, s6_prepared,
 )
-from .device_control import prepare_device_inputs_after
-from .phase_reuse import eight_rank_reuse_gate
+from .target_state import prepare_device_inputs_after
+from .drafter.kv_tp8 import draft_kv_projection_tp8, draft_kv_norm_tp8
+from .markov.head8 import run_head8_steps
+from .target_state import eight_rank_reuse_gate
 
 NATIVE_S_FWD_ORI_BLOCK_NUM_DYN = pl.dynamic("NATIVE_S_FWD_ORI_BLOCK_NUM_DYN")
 NATIVE_S_FWD_HCA_STATE_BLOCK_NUM_DYN = pl.dynamic("NATIVE_S_FWD_HCA_STATE_BLOCK_NUM_DYN")
@@ -54,15 +56,15 @@ def l2_full_cycles(
     d_hc_attn_base: pl.Tensor[[72], pl.FP32],
     d_attn_norm_w: pl.Tensor[[12288], pl.BF16],
     d_wq_a: pl.Tensor[[3, 4096, 1024], pl.BF16, pl.NZ],
-    d_wq_b: pl.Tensor[[3, 1024, 32768], pl.INT8, pl.NZ],
-    d_wq_b_scale: pl.Tensor[[98304], pl.FP32],
+    d_wq_b: pl.Tensor[[3, 1024, 4096], pl.INT8, pl.NZ],
+    d_wq_b_scale: pl.Tensor[[3, 4096], pl.FP32],
     d_wkv: pl.Tensor[[12288, 512], pl.BF16],
     d_gamma_cq: pl.Tensor[[3072], pl.BF16],
     d_gamma_ckv: pl.Tensor[[1536], pl.BF16],
     d_kv_caches: pl.InOut[pl.Tensor[[3, 512, 32, 1, 512], pl.BF16]],
-    d_attn_sink: pl.Tensor[[192], pl.FP32],
-    d_wo_a: pl.Tensor[[6, 1024, 4096], pl.BF16, pl.NZ],
-    d_wo_b: pl.Tensor[[6, 4096, 1024], pl.INT8, pl.NZ],
+    d_attn_sink: pl.Tensor[[3, 8], pl.FP32],
+    d_wo_a: pl.Tensor[[3, 1024, 4096], pl.BF16, pl.NZ],
+    d_wo_b: pl.Tensor[[3, 4096, 1024], pl.INT8, pl.NZ],
     d_wo_b_scale: pl.Tensor[[12288], pl.FP32],
     d_hc_ffn_fn: pl.Tensor[[72, 16384], pl.FP32],
     d_hc_ffn_scale: pl.Tensor[[9], pl.FP32],
@@ -71,52 +73,47 @@ def l2_full_cycles(
     d_gate_w: pl.Tensor[[768, 4096], pl.FP32],
     d_gate_bias: pl.Tensor[[768], pl.FP32],
     d_tid2eid: pl.Tensor[[387840, 6], pl.INT32],
-    d_routed_w1: pl.Tensor[[192, 2048, 4096], pl.INT8, pl.NZ],
-    d_routed_w1_scale: pl.Tensor[[192, 2048], pl.FP32],
-    d_routed_w3: pl.Tensor[[192, 2048, 4096], pl.INT8, pl.NZ],
-    d_routed_w3_scale: pl.Tensor[[192, 2048], pl.FP32],
-    d_routed_w2: pl.Tensor[[192, 4096, 2048], pl.INT8, pl.NZ],
-    d_routed_w2_scale: pl.Tensor[[192, 4096], pl.FP32],
-    d_shared_w1: pl.Tensor[[3, 2048, 4096], pl.INT8, pl.NZ],
-    d_shared_w1_scale: pl.Tensor[[6144], pl.FP32],
-    d_shared_w3: pl.Tensor[[3, 2048, 4096], pl.INT8, pl.NZ],
-    d_shared_w3_scale: pl.Tensor[[6144], pl.FP32],
-    d_shared_w2: pl.Tensor[[3, 4096, 2048], pl.INT8, pl.NZ],
-    d_shared_w2_scale: pl.Tensor[[12288], pl.FP32],
+    d_routed_w1: pl.Tensor[[3, 257, 256, 4096], pl.INT8, pl.NZ],
+    d_routed_w1_scale: pl.Tensor[[3, 257, 256], pl.FP32],
+    d_routed_w3: pl.Tensor[[3, 257, 256, 4096], pl.INT8, pl.NZ],
+    d_routed_w3_scale: pl.Tensor[[3, 257, 256], pl.FP32],
+    d_routed_w2: pl.Tensor[[3, 257, 512, 2048], pl.INT8, pl.NZ],
+    d_routed_w2_scale: pl.Tensor[[3, 257, 512], pl.FP32],
+    d_shared_w1: pl.Tensor[[3, 256, 4096], pl.INT8, pl.NZ],
+    d_shared_w1_scale: pl.Tensor[[3, 256], pl.FP32],
+    d_shared_w3: pl.Tensor[[3, 256, 4096], pl.INT8, pl.NZ],
+    d_shared_w3_scale: pl.Tensor[[3, 256], pl.FP32],
+    d_shared_w2: pl.Tensor[[3, 512, 2048], pl.INT8, pl.NZ],
+    d_shared_w2_scale: pl.Tensor[[3, 512], pl.FP32],
     d_hc_head_fn: pl.Tensor[[4, 16384], pl.FP32],
     d_hc_head_scale: pl.Tensor[[1], pl.FP32],
     d_hc_head_base: pl.Tensor[[4], pl.FP32],
     d_initial_hidden: pl.Out[pl.Tensor[[32, 4, 4096], pl.FP32]],
     d_intermediate_hidden: pl.Out[pl.Tensor[[3, 32, 4, 4096], pl.FP32]],
     d_head_hidden: pl.Out[pl.Tensor[[1, 5, 4096], pl.BF16]],
-    d_hidden_gather_window: pld.DistributedTensor[[8192, 4096], pl.BF16],
-    d_hidden_gather_signal: pld.DistributedTensor[[4, 1], pl.INT32],
-    d_attention_window: pld.DistributedTensor[[256, 4096], pl.BF16],
-    d_attention_signal: pld.DistributedTensor[[4, 1], pl.INT32],
-    d_o_window: pld.DistributedTensor[[128, 4096], pl.BF16],
-    d_o_signal: pld.DistributedTensor[[4, 1], pl.INT32],
-    d_recv_meta: pld.DistributedTensor[[4, 64], pl.INT32],
-    d_recv_x: pld.DistributedTensor[[8192, 4096], pl.INT8],
-    d_recv_aux: pld.DistributedTensor[[8192, 8], pl.FP32],
-    d_recv_route: pld.DistributedTensor[[8192, 8], pl.INT32],
-    d_arrived: pld.DistributedTensor[[4, 1], pl.INT32],
-    d_data_arrived: pld.DistributedTensor[[4, 1], pl.INT32],
-    d_routed_y_buf: pld.DistributedTensor[[192, 4096], pl.BF16],
-    d_combine_arrived: pld.DistributedTensor[[4, 1], pl.INT32],
+    d_tp8_o_window: pld.DistributedTensor[[80, 4096], pl.FP32],
+    d_tp8_o_flags: pld.DistributedTensor[[8, 32], pl.INT32],
+    d_tp8_max_window: pld.DistributedTensor[[640, 8], pl.FP32],
+    d_tp8_max_flags: pld.DistributedTensor[[8, 32], pl.INT32],
+    d_tp8_int8_window: pld.DistributedTensor[[640, 256], pl.INT8],
+    d_tp8_int8_flags: pld.DistributedTensor[[8, 32], pl.INT32],
+    d_tp8_output_window: pld.DistributedTensor[[80, 512], pl.BF16],
+    d_tp8_output_flags: pld.DistributedTensor[[8, 32], pl.INT32],
     m_final_norm_weight: pl.Tensor[[4096], pl.BF16],
-    m_lm_head_weight: pl.Tensor[[32320, 4096], pl.BF16, pl.NZ],
+    m_lm_head_weight: pl.Tensor[[16384, 4096], pl.BF16, pl.NZ],
     m_logit_row_indices: pl.Tensor[[32], pl.INT32],
     m_num_sampled: pl.Tensor[[1], pl.INT32],
     m_next_prefill_tokens: pl.Tensor[[1], pl.INT64],
     m_markov_w1: pl.Tensor[[129280, 256], pl.BF16],
-    m_markov_w2: pl.Tensor[[129280, 256], pl.BF16],
+    m_markov_w2: pl.Tensor[[16384, 256], pl.BF16],
     m_confidence_head_weight: pl.Tensor[[1, 4352], pl.FP32],
     m_draft_token_ids: pl.Out[pl.Tensor[[2, 1, 5], pl.INT32]],
     m_confidence_probs: pl.Out[pl.Tensor[[2, 1, 5], pl.FP32]],
-    m_hidden_window: pld.DistributedTensor[[128, 4096], pl.BF16],
-    m_hidden_done: pld.DistributedTensor[[4, 1], pl.INT32],
-    m_logits_window: pld.DistributedTensor[[32, 129280], pl.FP32],
-    m_logits_done: pld.DistributedTensor[[4, 1], pl.INT32],
+    m_hidden_window: pld.DistributedTensor[[32, 4096], pl.BF16],
+    m8_seed: pld.DistributedTensor[[2, 8], pl.INT64],
+    m8_ready: pld.DistributedTensor[[2, 32], pl.INT32],
+    m8_pairs: pld.DistributedTensor[[80, 16], pl.FP32],
+    m8_arrivals: pld.DistributedTensor[[80, 32], pl.INT32],
     s_embed_weight: pl.Tensor[[16160, 4096], pl.BF16],
     s_hc_attn_fn: pl.Tensor[[1032, 16384], pl.FP32],
     s_hc_attn_scale: pl.Tensor[[129], pl.FP32],
@@ -201,6 +198,7 @@ def l2_full_cycles(
     s_sampled_ids: pl.Out[pl.Tensor[[2, 6, 8], pl.INT32]],
     s_reduce_window: pld.DistributedTensor[[256, 4096], pl.FP32],
     s_reduce_signal: pld.DistributedTensor[[8, 1], pl.INT32],
+    local_moe_ready: pld.DistributedTensor[[2, 32], pl.INT32],
     s_oproj_reduce_window: pld.DistributedTensor[[256, 4096], pl.FP32],
     s_oproj_reduce_signal: pld.DistributedTensor[[8, 1], pl.INT32],
     s_oproj_sync_signal: pld.DistributedTensor[[8, 1], pl.INT32],
@@ -208,6 +206,8 @@ def l2_full_cycles(
     s_tok_q_signal: pld.DistributedTensor[[8, 1], pl.INT32],
     s_tok_o_window: pld.DistributedTensor[[6, 4096], pl.BF16],
     s_tok_o_signal: pld.DistributedTensor[[8, 1], pl.INT32],
+    idx_owned_window: pld.DistributedTensor[[12, 512], pl.INT32],
+    idx_owned_ready: pld.DistributedTensor[[12, 32], pl.INT32],
     s_embed_window: pld.DistributedTensor[[6, 4096], pl.BF16],
     s_embed_signal: pld.DistributedTensor[[8, 1], pl.INT32],
     s_lm_head_hidden_window: pld.DistributedTensor[[48, 4096], pl.BF16],
@@ -229,6 +229,24 @@ def l2_full_cycles(
     s_cycle_arrival_signal: pld.DistributedTensor[[8, 32], pl.INT32],
     native_cycles: pl.Scalar[pl.INT32],
 ):
+    if False:
+        # Supply the chip entry's real typed scratch geometry to the specializer.
+        # The branch cannot add any submitted task or runtime storage.
+        ctx_kv_input = pl.create_tensor([128,4096],dtype=pl.BF16)
+        ctx_kv_weight = pl.create_tensor([4096,512],dtype=pl.BF16)
+        ctx_kv_raw = pl.create_tensor([128,512],dtype=pl.FP32)
+        ctx_gamma = pl.create_tensor([512],dtype=pl.BF16)
+        ctx_cos = pl.create_tensor([128,64],dtype=pl.FP32)
+        ctx_sin = pl.create_tensor([128,64],dtype=pl.FP32)
+        ctx_swap = pl.create_tensor([128,64],dtype=pl.INT32)
+        ctx_kv = pl.create_tensor([128,512],dtype=pl.BF16)
+        ctx_rows = pl.const(128,pl.INDEX)
+        ctx_start = pl.const(0,pl.INDEX)
+        ctx_before = pl.system.task_invalid()
+        ctx_projected = draft_kv_projection_tp8(ctx_kv_input,ctx_kv_weight,ctx_kv_raw,
+                                                ctx_rows,ctx_start,ctx_rows,ctx_before)
+        draft_kv_norm_tp8(ctx_kv_raw,ctx_gamma,ctx_cos,ctx_sin,ctx_swap,ctx_kv,
+                          ctx_rows,ctx_start,ctx_rows,ctx_projected)
     prior_cycle_gate = pl.system.task_invalid()
     for native_cycle in pl.range(native_cycles):
         (m_draft_token_ids_bank, m_confidence_probs_bank) = markov_cycle_banks(
@@ -257,7 +275,7 @@ def l2_full_cycles(
             request_snapshot,
             prior_cycle_gate,
         )
-        (bridge_ids_view, m_ready_confidence, d_local_cleanup, m_token_output_ready) = prepare_draft_markov(
+        (bridge_ids_view, m_ready_confidence, d_local_cleanup, m_token_output_ready) = prepare_draft_markov8(
             d_main_proj_weight,
             d_main_norm_weight,
             d_last_sampled,
@@ -313,20 +331,14 @@ def l2_full_cycles(
             d_initial_hidden,
             d_intermediate_hidden,
             d_head_hidden,
-            d_hidden_gather_window,
-            d_hidden_gather_signal,
-            d_attention_window,
-            d_attention_signal,
-            d_o_window,
-            d_o_signal,
-            d_recv_meta,
-            d_recv_x,
-            d_recv_aux,
-            d_recv_route,
-            d_arrived,
-            d_data_arrived,
-            d_routed_y_buf,
-            d_combine_arrived,
+            d_tp8_o_window,
+            d_tp8_o_flags,
+            d_tp8_max_window,
+            d_tp8_max_flags,
+            d_tp8_int8_window,
+            d_tp8_int8_flags,
+            d_tp8_output_window,
+            d_tp8_output_flags,
             m_final_norm_weight,
             m_lm_head_weight,
             m_logit_row_indices,
@@ -336,9 +348,13 @@ def l2_full_cycles(
             m_markov_w2,
             m_confidence_head_weight,
             m_hidden_window,
-            m_hidden_done,
-            m_logits_window,
-            m_logits_done,
+            m8_seed,
+            m8_ready,
+            m8_pairs,
+            m8_arrivals,
+            s_bridge_epoch,
+            pl.cast(native_cycle, pl.INDEX),
+            metadata_ready,
             s_history_ring,
             s_request_state,
             m_draft_token_ids_bank,
@@ -429,13 +445,14 @@ def l2_full_cycles(
             s_sampled_ids_bank,
             s_reduce_window,
             s_reduce_signal,
+            local_moe_ready,
             s_oproj_reduce_window,
             s_oproj_reduce_signal,
             s_oproj_sync_signal,
             s_tok_q_window,
             s_tok_q_signal,
             s_tok_o_window,
-            s_tok_o_signal,
+            s_tok_o_signal, idx_owned_window, idx_owned_ready,
             s_embed_window,
             s_embed_signal,
             s_lm_head_hidden_window,
@@ -457,16 +474,27 @@ def l2_full_cycles(
             s_emitted_bank,
             request_snapshot,
         )
+        tp8_history_retired=populate_local_draft_history(
+            s_dspark_target_hidden_out_bank,request_snapshot,s_request_state,s_history_ring,s_my_rank,s6_local_reuse_ready,
+        )
         if native_cycle + 1 < native_cycles:
             prior_cycle_gate = full_cycle_reuse_gate(
                 s_bridge_epoch, s_cycle_arrival_signal, s_my_rank,
-                d_local_cleanup, m_token_output_ready, s6_local_reuse_ready,
+                d_local_cleanup, m_token_output_ready, tp8_history_retired,
             )
     return (s_control, s_emitted)
 
 
 @pl.jit(auto_scope=False)
 def l2_s6_cycles_only(
+    m_markov_w1: pl.Tensor[[129280, 256], pl.BF16],
+    m_markov_w2: pl.Tensor[[16384, 256], pl.BF16],
+    m_lm_head_weight: pl.Tensor[[16384, 4096], pl.BF16, pl.NZ],
+    m_hidden_window: pld.DistributedTensor[[32, 4096], pl.BF16],
+    m8_seed: pld.DistributedTensor[[2, 8], pl.INT64],
+    m8_ready: pld.DistributedTensor[[2, 32], pl.INT32],
+    m8_pairs: pld.DistributedTensor[[80, 16], pl.FP32],
+    m8_arrivals: pld.DistributedTensor[[80, 32], pl.INT32],
     s_embed_weight: pl.Tensor[[16160, 4096], pl.BF16],
     s_hc_attn_fn: pl.Tensor[[1032, 16384], pl.FP32],
     s_hc_attn_scale: pl.Tensor[[129], pl.FP32],
@@ -551,6 +579,7 @@ def l2_s6_cycles_only(
     s_sampled_ids: pl.Out[pl.Tensor[[2, 6, 8], pl.INT32]],
     s_reduce_window: pld.DistributedTensor[[256, 4096], pl.FP32],
     s_reduce_signal: pld.DistributedTensor[[8, 1], pl.INT32],
+    local_moe_ready: pld.DistributedTensor[[2, 32], pl.INT32],
     s_oproj_reduce_window: pld.DistributedTensor[[256, 4096], pl.FP32],
     s_oproj_reduce_signal: pld.DistributedTensor[[8, 1], pl.INT32],
     s_oproj_sync_signal: pld.DistributedTensor[[8, 1], pl.INT32],
@@ -558,6 +587,8 @@ def l2_s6_cycles_only(
     s_tok_q_signal: pld.DistributedTensor[[8, 1], pl.INT32],
     s_tok_o_window: pld.DistributedTensor[[6, 4096], pl.BF16],
     s_tok_o_signal: pld.DistributedTensor[[8, 1], pl.INT32],
+    idx_owned_window: pld.DistributedTensor[[12, 512], pl.INT32],
+    idx_owned_ready: pld.DistributedTensor[[12, 32], pl.INT32],
     s_embed_window: pld.DistributedTensor[[6, 4096], pl.BF16],
     s_embed_signal: pld.DistributedTensor[[8, 1], pl.INT32],
     s_lm_head_hidden_window: pld.DistributedTensor[[48, 4096], pl.BF16],
@@ -605,6 +636,11 @@ def l2_s6_cycles_only(
             request_snapshot,
             prior_cycle_gate,
         )
+        local_ids = pl.create_tensor([1, 5], dtype=pl.INT32)
+        m8_completion = run_head8_steps(m_lm_head_weight, m_hidden_window,
+                                       m_markov_w1, m_markov_w2, local_ids, s_bridge_epoch,
+                                       m8_seed, m8_ready, m8_pairs, m8_arrivals, s_my_rank,
+                                       pl.cast(native_cycle, pl.INDEX), metadata_ready)
         (s_result, commit_ack, next_state_ready, s6_local_reuse_ready) = s6_prepared(
             s_embed_weight,
             s_hc_attn_fn,
@@ -688,13 +724,14 @@ def l2_s6_cycles_only(
             s_sampled_ids_bank,
             s_reduce_window,
             s_reduce_signal,
+            local_moe_ready,
             s_oproj_reduce_window,
             s_oproj_reduce_signal,
             s_oproj_sync_signal,
             s_tok_q_window,
             s_tok_q_signal,
             s_tok_o_window,
-            s_tok_o_signal,
+            s_tok_o_signal, idx_owned_window, idx_owned_ready,
             s_embed_window,
             s_embed_signal,
             s_lm_head_hidden_window,
@@ -717,69 +754,70 @@ def l2_s6_cycles_only(
             request_snapshot,
         )
         if native_cycle + 1 < native_cycles:
+            m8_local_exit = pl.system.task_dummy(deps=[m8_completion, s6_local_reuse_ready])
             prior_cycle_gate = eight_rank_reuse_gate(
-                s_bridge_epoch, s_cycle_arrival_signal, s_my_rank, s6_local_reuse_ready
+                s_bridge_epoch, s_cycle_arrival_signal, s_my_rank, m8_local_exit
             )
     return (s_control, s_emitted)
 
 
 @pl.jit.host
 def native_cycles(
-    d_initial_hidden: pl.Out[pl.Tensor[[4, 32, 4, 4096], pl.FP32]],
-    d_intermediate_hidden: pl.Out[pl.Tensor[[4, 3, 32, 4, 4096], pl.FP32]],
-    d_main_proj_weight: pl.Tensor[[4, 4096, 12288], pl.BF16],
-    d_main_norm_weight: pl.Tensor[[4, 4096], pl.BF16],
-    d_last_sampled: pl.Out[pl.Tensor[[4, 1], pl.INT64]],
-    d_embedding_weight: pl.Tensor[[4, 129280, 4096], pl.BF16],
-    d_context_group_position_ids_bank: pl.Tensor[[4, BANK_COUNT, 512], pl.INT32],
-    d_context_group_slot_mapping_bank: pl.Tensor[[4, BANK_COUNT, 3, 512], pl.INT64],
-    d_block_tables: pl.Tensor[[4, 3, 1, 32768], pl.INT32],
-    d_query_group_position_ids_bank: pl.Tensor[[4, BANK_COUNT, 80], pl.INT32],
-    d_query_group_slot_mapping_bank: pl.Tensor[[4, BANK_COUNT, 3, 80], pl.INT64],
-    d_context_group_freqs_cos_bank: pl.Tensor[[4, BANK_COUNT, 512, 64], pl.BF16],
-    d_context_group_freqs_sin_bank: pl.Tensor[[4, BANK_COUNT, 512, 64], pl.BF16],
-    d_query_freqs_cos_bank: pl.Tensor[[4, BANK_COUNT, 20, 64], pl.BF16],
-    d_query_freqs_sin_bank: pl.Tensor[[4, BANK_COUNT, 20, 64], pl.BF16],
-    d_query_group_freqs_cos_bank: pl.Tensor[[4, BANK_COUNT, 80, 64], pl.BF16],
-    d_query_group_freqs_sin_bank: pl.Tensor[[4, BANK_COUNT, 80, 64], pl.BF16],
-    d_hc_attn_fn: pl.Tensor[[4, 72, 16384], pl.FP32],
-    d_hc_attn_scale: pl.Tensor[[4, 9], pl.FP32],
-    d_hc_attn_base: pl.Tensor[[4, 72], pl.FP32],
-    d_attn_norm_w: pl.Tensor[[4, 12288], pl.BF16],
-    d_wq_a: pl.Tensor[[4, 3, 4096, 1024], pl.BF16],
-    d_wq_b: pl.Tensor[[4, 3, 1024, 32768], pl.INT8],
-    d_wq_b_scale: pl.Tensor[[4, 98304], pl.FP32],
-    d_wkv: pl.Tensor[[4, 12288, 512], pl.BF16],
-    d_gamma_cq: pl.Tensor[[4, 3072], pl.BF16],
-    d_gamma_ckv: pl.Tensor[[4, 1536], pl.BF16],
-    d_kv_caches: pl.InOut[pl.Tensor[[4, 3, 512, 32, 1, 512], pl.BF16]],
-    d_attn_sink: pl.Tensor[[4, 192], pl.FP32],
-    d_wo_a: pl.Tensor[[4, 6, 1024, 4096], pl.BF16],
-    d_wo_b: pl.Tensor[[4, 6, 4096, 1024], pl.INT8],
-    d_wo_b_scale: pl.Tensor[[4, 12288], pl.FP32],
-    d_hc_ffn_fn: pl.Tensor[[4, 72, 16384], pl.FP32],
-    d_hc_ffn_scale: pl.Tensor[[4, 9], pl.FP32],
-    d_hc_ffn_base: pl.Tensor[[4, 72], pl.FP32],
-    d_ffn_norm_w: pl.Tensor[[4, 12288], pl.BF16],
-    d_gate_w: pl.Tensor[[4, 768, 4096], pl.FP32],
-    d_gate_bias: pl.Tensor[[4, 768], pl.FP32],
-    d_tid2eid: pl.Tensor[[4, 387840, 6], pl.INT32],
-    d_routed_w1: pl.Tensor[[4, 192, 2048, 4096], pl.INT8],
-    d_routed_w1_scale: pl.Tensor[[4, 192, 2048], pl.FP32],
-    d_routed_w3: pl.Tensor[[4, 192, 2048, 4096], pl.INT8],
-    d_routed_w3_scale: pl.Tensor[[4, 192, 2048], pl.FP32],
-    d_routed_w2: pl.Tensor[[4, 192, 4096, 2048], pl.INT8],
-    d_routed_w2_scale: pl.Tensor[[4, 192, 4096], pl.FP32],
-    d_shared_w1: pl.Tensor[[4, 3, 2048, 4096], pl.INT8],
-    d_shared_w1_scale: pl.Tensor[[4, 6144], pl.FP32],
-    d_shared_w3: pl.Tensor[[4, 3, 2048, 4096], pl.INT8],
-    d_shared_w3_scale: pl.Tensor[[4, 6144], pl.FP32],
-    d_shared_w2: pl.Tensor[[4, 3, 4096, 2048], pl.INT8],
-    d_shared_w2_scale: pl.Tensor[[4, 12288], pl.FP32],
-    d_hc_head_fn: pl.Tensor[[4, 4, 16384], pl.FP32],
-    d_hc_head_scale: pl.Tensor[[4, 1], pl.FP32],
-    d_hc_head_base: pl.Tensor[[4, 4], pl.FP32],
-    d_head_hidden: pl.Out[pl.Tensor[[4, 1, 5, 4096], pl.BF16]],
+    d_initial_hidden: pl.Out[pl.Tensor[[8, 32, 4, 4096], pl.FP32]],
+    d_intermediate_hidden: pl.Out[pl.Tensor[[8, 3, 32, 4, 4096], pl.FP32]],
+    d_main_proj_weight: pl.Tensor[[8, 4096, 12288], pl.BF16],
+    d_main_norm_weight: pl.Tensor[[8, 4096], pl.BF16],
+    d_last_sampled: pl.Out[pl.Tensor[[8, 1], pl.INT64]],
+    d_embedding_weight: pl.Tensor[[8, 129280, 4096], pl.BF16],
+    d_context_group_position_ids_bank: pl.Tensor[[8, BANK_COUNT, 512], pl.INT32],
+    d_context_group_slot_mapping_bank: pl.Tensor[[8, BANK_COUNT, 3, 512], pl.INT64],
+    d_block_tables: pl.Tensor[[8, 3, 1, 32768], pl.INT32],
+    d_query_group_position_ids_bank: pl.Tensor[[8, BANK_COUNT, 80], pl.INT32],
+    d_query_group_slot_mapping_bank: pl.Tensor[[8, BANK_COUNT, 3, 80], pl.INT64],
+    d_context_group_freqs_cos_bank: pl.Tensor[[8, BANK_COUNT, 512, 64], pl.BF16],
+    d_context_group_freqs_sin_bank: pl.Tensor[[8, BANK_COUNT, 512, 64], pl.BF16],
+    d_query_freqs_cos_bank: pl.Tensor[[8, BANK_COUNT, 20, 64], pl.BF16],
+    d_query_freqs_sin_bank: pl.Tensor[[8, BANK_COUNT, 20, 64], pl.BF16],
+    d_query_group_freqs_cos_bank: pl.Tensor[[8, BANK_COUNT, 80, 64], pl.BF16],
+    d_query_group_freqs_sin_bank: pl.Tensor[[8, BANK_COUNT, 80, 64], pl.BF16],
+    d_hc_attn_fn: pl.Tensor[[8, 72, 16384], pl.FP32],
+    d_hc_attn_scale: pl.Tensor[[8, 9], pl.FP32],
+    d_hc_attn_base: pl.Tensor[[8, 72], pl.FP32],
+    d_attn_norm_w: pl.Tensor[[8, 12288], pl.BF16],
+    d_wq_a: pl.Tensor[[8, 3, 4096, 1024], pl.BF16],
+    d_wq_b: pl.Tensor[[8, 3, 1024, 4096], pl.INT8],
+    d_wq_b_scale: pl.Tensor[[8, 3, 4096], pl.FP32],
+    d_wkv: pl.Tensor[[8, 12288, 512], pl.BF16],
+    d_gamma_cq: pl.Tensor[[8, 3072], pl.BF16],
+    d_gamma_ckv: pl.Tensor[[8, 1536], pl.BF16],
+    d_kv_caches: pl.InOut[pl.Tensor[[8, 3, 512, 32, 1, 512], pl.BF16]],
+    d_attn_sink: pl.Tensor[[8, 3, 8], pl.FP32],
+    d_wo_a: pl.Tensor[[8, 3, 1024, 4096], pl.BF16],
+    d_wo_b: pl.Tensor[[8, 3, 4096, 1024], pl.INT8],
+    d_wo_b_scale: pl.Tensor[[8, 12288], pl.FP32],
+    d_hc_ffn_fn: pl.Tensor[[8, 72, 16384], pl.FP32],
+    d_hc_ffn_scale: pl.Tensor[[8, 9], pl.FP32],
+    d_hc_ffn_base: pl.Tensor[[8, 72], pl.FP32],
+    d_ffn_norm_w: pl.Tensor[[8, 12288], pl.BF16],
+    d_gate_w: pl.Tensor[[8, 768, 4096], pl.FP32],
+    d_gate_bias: pl.Tensor[[8, 768], pl.FP32],
+    d_tid2eid: pl.Tensor[[8, 387840, 6], pl.INT32],
+    d_routed_w1: pl.Tensor[[8, 3, 257, 256, 4096], pl.INT8],
+    d_routed_w1_scale: pl.Tensor[[8, 3, 257, 256], pl.FP32],
+    d_routed_w3: pl.Tensor[[8, 3, 257, 256, 4096], pl.INT8],
+    d_routed_w3_scale: pl.Tensor[[8, 3, 257, 256], pl.FP32],
+    d_routed_w2: pl.Tensor[[8, 3, 257, 512, 2048], pl.INT8],
+    d_routed_w2_scale: pl.Tensor[[8, 3, 257, 512], pl.FP32],
+    d_shared_w1: pl.Tensor[[8, 3, 256, 4096], pl.INT8],
+    d_shared_w1_scale: pl.Tensor[[8, 3, 256], pl.FP32],
+    d_shared_w3: pl.Tensor[[8, 3, 256, 4096], pl.INT8],
+    d_shared_w3_scale: pl.Tensor[[8, 3, 256], pl.FP32],
+    d_shared_w2: pl.Tensor[[8, 3, 512, 2048], pl.INT8],
+    d_shared_w2_scale: pl.Tensor[[8, 3, 512], pl.FP32],
+    d_hc_head_fn: pl.Tensor[[8, 4, 16384], pl.FP32],
+    d_hc_head_scale: pl.Tensor[[8, 1], pl.FP32],
+    d_hc_head_base: pl.Tensor[[8, 4], pl.FP32],
+    d_head_hidden: pl.Out[pl.Tensor[[8, 1, 5, 4096], pl.BF16]],
     s_embed_weight: pl.Tensor[[8, 16160, 4096], pl.BF16],
     s_hc_attn_fn: pl.Tensor[[8, 1032, 16384], pl.FP32],
     s_hc_attn_scale: pl.Tensor[[8, 129], pl.FP32],
@@ -870,39 +908,35 @@ def native_cycles(
     s_request_state: pl.InOut[pl.Tensor[[8, 4], pl.INT64]],
     s_control: pl.Out[pl.Tensor[[8, 2, 16], pl.INT64]],
     s_emitted: pl.Out[pl.Tensor[[8, 2, 6], pl.INT64]],
-    m_final_norm_weight: pl.Tensor[[4, 4096], pl.BF16],
-    m_lm_head_weight: pl.Tensor[[4, 32320, 4096], pl.BF16],
-    m_logit_row_indices: pl.Tensor[[4, 32], pl.INT32],
-    m_num_sampled: pl.Tensor[[4, 1], pl.INT32],
-    m_next_prefill_tokens: pl.Tensor[[4, 1], pl.INT64],
-    m_markov_w1: pl.Tensor[[4, 129280, 256], pl.BF16],
-    m_markov_w2: pl.Tensor[[4, 129280, 256], pl.BF16],
-    m_confidence_head_weight: pl.Tensor[[4, 1, 4352], pl.FP32],
-    m_draft_token_ids: pl.Out[pl.Tensor[[4, 2, 1, 5], pl.INT32]],
-    m_confidence_probs: pl.Out[pl.Tensor[[4, 2, 1, 5], pl.FP32]],
+    m_final_norm_weight: pl.Tensor[[8, 4096], pl.BF16],
+    m_lm_head_weight: pl.Tensor[[8, 16384, 4096], pl.BF16],
+    m_logit_row_indices: pl.Tensor[[8, 32], pl.INT32],
+    m_num_sampled: pl.Tensor[[8, 1], pl.INT32],
+    m_next_prefill_tokens: pl.Tensor[[8, 1], pl.INT64],
+    m_markov_w1: pl.Tensor[[8, 129280, 256], pl.BF16],
+    m_markov_w2: pl.Tensor[[8, 16384, 256], pl.BF16],
+    m_confidence_head_weight: pl.Tensor[[8, 1, 4352], pl.FP32],
+    m_draft_token_ids: pl.Out[pl.Tensor[[8, 2, 1, 5], pl.INT32]],
+    m_confidence_probs: pl.Out[pl.Tensor[[8, 2, 1, 5], pl.FP32]],
     cycle_count: pl.constexpr = 2,
     native_w2_fingerprint: pl.constexpr = "generated",
 ):
-    d_hidden_gather_window_buffer = pld.alloc_window_buffer([8192, 4096], dtype=pl.BF16)
-    d_hidden_gather_signal_buffer = pld.alloc_window_buffer([4, 1], dtype=pl.INT32)
-    d_attention_window_buffer = pld.alloc_window_buffer([256, 4096], dtype=pl.BF16)
-    d_attention_signal_buffer = pld.alloc_window_buffer([4, 1], dtype=pl.INT32)
-    d_o_window_buffer = pld.alloc_window_buffer([128, 4096], dtype=pl.BF16)
-    d_o_signal_buffer = pld.alloc_window_buffer([4, 1], dtype=pl.INT32)
-    d_recv_meta_buffer = pld.alloc_window_buffer([4, 64], dtype=pl.INT32)
-    d_recv_x_buffer = pld.alloc_window_buffer([8192, 4096], dtype=pl.INT8)
-    d_recv_aux_buffer = pld.alloc_window_buffer([8192, 8], dtype=pl.FP32)
-    d_recv_route_buffer = pld.alloc_window_buffer([8192, 8], dtype=pl.INT32)
-    d_arrived_buffer = pld.alloc_window_buffer([4, 1], dtype=pl.INT32)
-    d_data_arrived_buffer = pld.alloc_window_buffer([4, 1], dtype=pl.INT32)
-    d_routed_y_buf_buffer = pld.alloc_window_buffer([192, 4096], dtype=pl.BF16)
-    d_combine_arrived_buffer = pld.alloc_window_buffer([4, 1], dtype=pl.INT32)
-    m_hidden_window_buffer = pld.alloc_window_buffer([128, 4096], dtype=pl.BF16)
-    m_hidden_done_buffer = pld.alloc_window_buffer([4, 1], dtype=pl.INT32)
-    m_logits_window_buffer = pld.alloc_window_buffer([32, 129280], dtype=pl.FP32)
-    m_logits_done_buffer = pld.alloc_window_buffer([4, 1], dtype=pl.INT32)
+    m8_seed_buffer = pld.alloc_window_buffer([2, 8], dtype=pl.INT64)
+    m8_ready_buffer = pld.alloc_window_buffer([2, 32], dtype=pl.INT32)
+    m8_pairs_buffer = pld.alloc_window_buffer([80, 16], dtype=pl.FP32)
+    m8_arrivals_buffer = pld.alloc_window_buffer([80, 32], dtype=pl.INT32)
+    d_tp8_o_window_buffer = pld.alloc_window_buffer([80, 4096], dtype=pl.FP32)
+    d_tp8_o_flags_buffer = pld.alloc_window_buffer([8, 32], dtype=pl.INT32)
+    d_tp8_max_window_buffer = pld.alloc_window_buffer([640, 8], dtype=pl.FP32)
+    d_tp8_max_flags_buffer = pld.alloc_window_buffer([8, 32], dtype=pl.INT32)
+    d_tp8_int8_window_buffer = pld.alloc_window_buffer([640, 256], dtype=pl.INT8)
+    d_tp8_int8_flags_buffer = pld.alloc_window_buffer([8, 32], dtype=pl.INT32)
+    d_tp8_output_window_buffer = pld.alloc_window_buffer([80, 512], dtype=pl.BF16)
+    d_tp8_output_flags_buffer = pld.alloc_window_buffer([8, 32], dtype=pl.INT32)
+    m_hidden_window_buffer = pld.alloc_window_buffer([32, 4096], dtype=pl.BF16)
     s_reduce_window_buffer = pld.alloc_window_buffer([256, 4096], dtype=pl.FP32)
     s_reduce_signal_buffer = pld.alloc_window_buffer([8, 1], dtype=pl.INT32)
+    local_moe_ready_buf = pld.alloc_window_buffer([2, 32], dtype=pl.INT32)
     s_oproj_reduce_window_buffer = pld.alloc_window_buffer([256, 4096], dtype=pl.FP32)
     s_oproj_reduce_signal_buffer = pld.alloc_window_buffer([8, 1], dtype=pl.INT32)
     s_oproj_sync_signal_buffer = pld.alloc_window_buffer([8, 1], dtype=pl.INT32)
@@ -910,6 +944,8 @@ def native_cycles(
     s_tok_q_signal_buffer = pld.alloc_window_buffer([8, 1], dtype=pl.INT32)
     s_tok_o_window_buffer = pld.alloc_window_buffer([6, 4096], dtype=pl.BF16)
     s_tok_o_signal_buffer = pld.alloc_window_buffer([8, 1], dtype=pl.INT32)
+    idx_owned_window_buffer = pld.alloc_window_buffer([12, 512], dtype=pl.INT32)
+    idx_owned_ready_buffer = pld.alloc_window_buffer([12, 32], dtype=pl.INT32)
     s_embed_window_buffer = pld.alloc_window_buffer([6, 4096], dtype=pl.BF16)
     # Isolate scalar cache-line writes from the following LM hidden window.
     s_embed_signal_buffer = pld.alloc_window_buffer(64)
@@ -923,27 +959,18 @@ def native_cycles(
     s_state_window_buffer = pld.alloc_window_buffer([4], dtype=pl.INT64)
     s_state_signal_buffer = pld.alloc_window_buffer([1], dtype=pl.INT32)
     s_cycle_arrival_signal_buffer = pld.alloc_window_buffer([8, 32], dtype=pl.INT32)
-    for rank in pl.range(0, 4):
-        d_hidden_gather_window = pld.window(d_hidden_gather_window_buffer, [8192, 4096], dtype=pl.BF16)
-        d_hidden_gather_signal = pld.window(d_hidden_gather_signal_buffer, [4, 1], dtype=pl.INT32)
-        d_attention_window = pld.window(d_attention_window_buffer, [256, 4096], dtype=pl.BF16)
-        d_attention_signal = pld.window(d_attention_signal_buffer, [4, 1], dtype=pl.INT32)
-        d_o_window = pld.window(d_o_window_buffer, [128, 4096], dtype=pl.BF16)
-        d_o_signal = pld.window(d_o_signal_buffer, [4, 1], dtype=pl.INT32)
-        d_recv_meta = pld.window(d_recv_meta_buffer, [4, 64], dtype=pl.INT32)
-        d_recv_x = pld.window(d_recv_x_buffer, [8192, 4096], dtype=pl.INT8)
-        d_recv_aux = pld.window(d_recv_aux_buffer, [8192, 8], dtype=pl.FP32)
-        d_recv_route = pld.window(d_recv_route_buffer, [8192, 8], dtype=pl.INT32)
-        d_arrived = pld.window(d_arrived_buffer, [4, 1], dtype=pl.INT32)
-        d_data_arrived = pld.window(d_data_arrived_buffer, [4, 1], dtype=pl.INT32)
-        d_routed_y_buf = pld.window(d_routed_y_buf_buffer, [192, 4096], dtype=pl.BF16)
-        d_combine_arrived = pld.window(d_combine_arrived_buffer, [4, 1], dtype=pl.INT32)
-        m_hidden_window = pld.window(m_hidden_window_buffer, [128, 4096], dtype=pl.BF16)
-        m_hidden_done = pld.window(m_hidden_done_buffer, [4, 1], dtype=pl.INT32)
-        m_logits_window = pld.window(m_logits_window_buffer, [32, 129280], dtype=pl.FP32)
-        m_logits_done = pld.window(m_logits_done_buffer, [4, 1], dtype=pl.INT32)
+    for rank in pl.range(0, 8):
+        d_tp8_o_window = pld.window(d_tp8_o_window_buffer, [80, 4096], dtype=pl.FP32)
+        d_tp8_o_flags = pld.window(d_tp8_o_flags_buffer, [8, 32], dtype=pl.INT32)
+        d_tp8_max_window = pld.window(d_tp8_max_window_buffer, [640, 8], dtype=pl.FP32)
+        d_tp8_max_flags = pld.window(d_tp8_max_flags_buffer, [8, 32], dtype=pl.INT32)
+        d_tp8_int8_window = pld.window(d_tp8_int8_window_buffer, [640, 256], dtype=pl.INT8)
+        d_tp8_int8_flags = pld.window(d_tp8_int8_flags_buffer, [8, 32], dtype=pl.INT32)
+        d_tp8_output_window = pld.window(d_tp8_output_window_buffer, [80, 512], dtype=pl.BF16)
+        d_tp8_output_flags = pld.window(d_tp8_output_flags_buffer, [8, 32], dtype=pl.INT32)
         s_reduce_window = pld.window(s_reduce_window_buffer, [256, 4096], dtype=pl.FP32)
         s_reduce_signal = pld.window(s_reduce_signal_buffer, [8, 1], dtype=pl.INT32)
+        local_moe_ready = pld.window(local_moe_ready_buf, [2, 32], dtype=pl.INT32)
         s_oproj_reduce_window = pld.window(s_oproj_reduce_window_buffer, [256, 4096], dtype=pl.FP32)
         s_oproj_reduce_signal = pld.window(s_oproj_reduce_signal_buffer, [8, 1], dtype=pl.INT32)
         s_oproj_sync_signal = pld.window(s_oproj_sync_signal_buffer, [8, 1], dtype=pl.INT32)
@@ -951,6 +978,8 @@ def native_cycles(
         s_tok_q_signal = pld.window(s_tok_q_signal_buffer, [8, 1], dtype=pl.INT32)
         s_tok_o_window = pld.window(s_tok_o_window_buffer, [6, 4096], dtype=pl.BF16)
         s_tok_o_signal = pld.window(s_tok_o_signal_buffer, [8, 1], dtype=pl.INT32)
+        idx_owned_window = pld.window(idx_owned_window_buffer, [12, 512], dtype=pl.INT32)
+        idx_owned_ready = pld.window(idx_owned_ready_buffer, [12, 32], dtype=pl.INT32)
         s_embed_window = pld.window(s_embed_window_buffer, [6, 4096], dtype=pl.BF16)
         s_embed_signal = pld.window(s_embed_signal_buffer, [8, 1], dtype=pl.INT32)
         s_lm_head_hidden_window = pld.window(s_lm_head_hidden_window_buffer, [48, 4096], dtype=pl.BF16)
@@ -962,6 +991,11 @@ def native_cycles(
         s_state_window = pld.window(s_state_window_buffer, [4], dtype=pl.INT64)
         s_state_signal = pld.window(s_state_signal_buffer, [1], dtype=pl.INT32)
         s_cycle_arrival_signal = pld.window(s_cycle_arrival_signal_buffer, [8, 32], dtype=pl.INT32)
+        m_hidden_window = pld.window(m_hidden_window_buffer, [32,4096], dtype=pl.BF16)
+        m8_seed = pld.window(m8_seed_buffer, [2, 8], dtype=pl.INT64)
+        m8_ready = pld.window(m8_ready_buffer, [2, 32], dtype=pl.INT32)
+        m8_pairs = pld.window(m8_pairs_buffer, [80, 16], dtype=pl.FP32)
+        m8_arrivals = pld.window(m8_arrivals_buffer, [80, 32], dtype=pl.INT32)
         l2_full_cycles(
             d_main_proj_weight[rank],
             d_main_norm_weight[rank],
@@ -1018,20 +1052,14 @@ def native_cycles(
             d_initial_hidden[rank],
             d_intermediate_hidden[rank],
             d_head_hidden[rank],
-            d_hidden_gather_window,
-            d_hidden_gather_signal,
-            d_attention_window,
-            d_attention_signal,
-            d_o_window,
-            d_o_signal,
-            d_recv_meta,
-            d_recv_x,
-            d_recv_aux,
-            d_recv_route,
-            d_arrived,
-            d_data_arrived,
-            d_routed_y_buf,
-            d_combine_arrived,
+            d_tp8_o_window,
+            d_tp8_o_flags,
+            d_tp8_max_window,
+            d_tp8_max_flags,
+            d_tp8_int8_window,
+            d_tp8_int8_flags,
+            d_tp8_output_window,
+            d_tp8_output_flags,
             m_final_norm_weight[rank],
             m_lm_head_weight[rank],
             m_logit_row_indices[rank],
@@ -1043,9 +1071,10 @@ def native_cycles(
             m_draft_token_ids[rank],
             m_confidence_probs[rank],
             m_hidden_window,
-            m_hidden_done,
-            m_logits_window,
-            m_logits_done,
+            m8_seed,
+            m8_ready,
+            m8_pairs,
+            m8_arrivals,
             s_embed_weight[rank],
             s_hc_attn_fn[rank],
             s_hc_attn_scale[rank],
@@ -1128,13 +1157,14 @@ def native_cycles(
             s_sampled_ids[rank],
             s_reduce_window,
             s_reduce_signal,
+            local_moe_ready,
             s_oproj_reduce_window,
             s_oproj_reduce_signal,
             s_oproj_sync_signal,
             s_tok_q_window,
             s_tok_q_signal,
             s_tok_o_window,
-            s_tok_o_signal,
+            s_tok_o_signal, idx_owned_window, idx_owned_ready,
             s_embed_window,
             s_embed_signal,
             s_lm_head_hidden_window,
@@ -1142,140 +1172,6 @@ def native_cycles(
             s_lm_head_logits_window,
             s_lm_head_logits_done,
             s_num_tokens_per_owner[rank],
-            s_bridge_epoch[rank],
-            s_bridge_seen_epoch[rank],
-            s_bridge_ids_window,
-            s_bridge_ready_signal,
-            s_state_window,
-            s_state_signal,
-            rank,
-            s_history_ring[rank],
-            s_request_state[rank],
-            s_control[rank],
-            s_emitted[rank],
-            s_cycle_arrival_signal,
-            cycle_count,
-            device=rank,
-        )
-    for rank in pl.range(4, 8):
-        s_reduce_window = pld.window(s_reduce_window_buffer, [256, 4096], dtype=pl.FP32)
-        s_reduce_signal = pld.window(s_reduce_signal_buffer, [8, 1], dtype=pl.INT32)
-        s_oproj_reduce_window = pld.window(s_oproj_reduce_window_buffer, [256, 4096], dtype=pl.FP32)
-        s_oproj_reduce_signal = pld.window(s_oproj_reduce_signal_buffer, [8, 1], dtype=pl.INT32)
-        s_oproj_sync_signal = pld.window(s_oproj_sync_signal_buffer, [8, 1], dtype=pl.INT32)
-        s_tok_q_window = pld.window(s_tok_q_window_buffer, [64, 512], dtype=pl.BF16)
-        s_tok_q_signal = pld.window(s_tok_q_signal_buffer, [8, 1], dtype=pl.INT32)
-        s_tok_o_window = pld.window(s_tok_o_window_buffer, [6, 4096], dtype=pl.BF16)
-        s_tok_o_signal = pld.window(s_tok_o_signal_buffer, [8, 1], dtype=pl.INT32)
-        s_embed_window = pld.window(s_embed_window_buffer, [6, 4096], dtype=pl.BF16)
-        s_embed_signal = pld.window(s_embed_signal_buffer, [8, 1], dtype=pl.INT32)
-        s_lm_head_hidden_window = pld.window(s_lm_head_hidden_window_buffer, [48, 4096], dtype=pl.BF16)
-        s_lm_head_hidden_done = pld.window(s_lm_head_hidden_done_buffer, [8, 1], dtype=pl.INT32)
-        s_lm_head_logits_window = pld.window(s_lm_head_logits_window_buffer, [6, 129280], dtype=pl.FP32)
-        s_lm_head_logits_done = pld.window(s_lm_head_logits_done_buffer, [8, 1], dtype=pl.INT32)
-        s_bridge_ids_window = pld.window(s_bridge_ids_window_buffer, [8], dtype=pl.INT64)
-        s_bridge_ready_signal = pld.window(s_bridge_ready_signal_buffer, [1], dtype=pl.INT32)
-        s_state_window = pld.window(s_state_window_buffer, [4], dtype=pl.INT64)
-        s_state_signal = pld.window(s_state_signal_buffer, [1], dtype=pl.INT32)
-        s_cycle_arrival_signal = pld.window(s_cycle_arrival_signal_buffer, [8, 32], dtype=pl.INT32)
-        l2_s6_cycles_only(
-            s_embed_weight[rank],
-            s_hc_attn_fn[rank],
-            s_hc_attn_scale[rank],
-            s_hc_attn_base[rank],
-            s_attn_norm_w[rank],
-            s_wq_a[rank],
-            s_wq_b[rank],
-            s_wq_b_scale[rank],
-            s_wkv[rank],
-            s_gamma_cq[rank],
-            s_gamma_ckv[rank],
-            s_kv_cache[rank],
-            s_attn_sink[rank],
-            s_wo_b_scale[rank],
-            s_wo_a_shard[rank],
-            s_wo_b_shard[rank],
-            s_hca_cmp_wkv[rank],
-            s_hca_cmp_wgate[rank],
-            s_hca_cmp_ape[rank],
-            s_hca_cmp_norm_w[rank],
-            s_hca_compress_state[rank],
-            s_csa_cmp_wkv[rank],
-            s_csa_cmp_wgate[rank],
-            s_csa_cmp_ape[rank],
-            s_csa_cmp_norm_w[rank],
-            s_csa_compress_state[rank],
-            s_csa_idx_wq_b[rank],
-            s_csa_idx_wq_b_scale[rank],
-            s_csa_weights_proj[rank],
-            s_csa_hadamard_idx[rank],
-            s_csa_inner_wkv[rank],
-            s_csa_inner_wgate[rank],
-            s_csa_inner_ape[rank],
-            s_csa_inner_norm_w[rank],
-            s_csa_inner_compress_state[rank],
-            s_hca_cmp_kv[rank],
-            s_csa_cmp_kv[rank],
-            s_idx_kv_cache[rank],
-            s_idx_kv_scale[rank],
-            s_hc_ffn_fn[rank],
-            s_hc_ffn_scale[rank],
-            s_hc_ffn_base[rank],
-            s_norm_w[rank],
-            s_gate_w[rank],
-            s_gate_bias[rank],
-            s_tid2eid[rank],
-            s_routed_w1[rank],
-            s_routed_w1_scale[rank],
-            s_routed_w3[rank],
-            s_routed_w3_scale[rank],
-            s_routed_w2[rank],
-            s_routed_w2_scale[rank],
-            s_freqs_cos[rank],
-            s_freqs_sin[rank],
-            s_block_table[rank],
-            s_position_ids[rank],
-            s_kv_seq_lens[rank],
-            s_hca_compress_state_block_table[rank],
-            s_csa_compress_state_block_table[rank],
-            s_csa_inner_compress_state_block_table[rank],
-            s_hca_cmp_block_table[rank],
-            s_csa_cmp_block_table[rank],
-            s_idx_block_table[rank],
-            s_block_counts[rank],
-            s_input_ids[rank],
-            s_hc_head_fn[rank],
-            s_hc_head_scale[rank],
-            s_hc_head_base[rank],
-            s_final_norm_w[rank],
-            s_lm_head_weight[rank],
-            s_logit_row_indices[rank],
-            s_sampling_temperatures[rank],
-            s_sampling_top_ks[rank],
-            s_sampling_seeds[rank],
-            s_sampling_positions[rank],
-            s_pre_hc_hidden_out[rank],
-            s_dspark_target_hidden_out[rank],
-            s_hidden_out[rank],
-            s_logits[rank],
-            s_sampled_ids[rank],
-            s_reduce_window,
-            s_reduce_signal,
-            s_oproj_reduce_window,
-            s_oproj_reduce_signal,
-            s_oproj_sync_signal,
-            s_tok_q_window,
-            s_tok_q_signal,
-            s_tok_o_window,
-            s_tok_o_signal,
-            s_embed_window,
-            s_embed_signal,
-            s_lm_head_hidden_window,
-            s_lm_head_hidden_done,
-            s_lm_head_logits_window,
-            s_lm_head_logits_done,
-            s_num_tokens_per_owner[rank],
-            s_bridge_markov_ids[rank],
             s_bridge_epoch[rank],
             s_bridge_seen_epoch[rank],
             s_bridge_ids_window,

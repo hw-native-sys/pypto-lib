@@ -18,9 +18,11 @@ else:
     from fp32_numerics import newton_sqrt_seed, midpoint_sqrt_seed
 
 if __package__:
-    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
 else:
-    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from decode_shapes import DECODE_CONFIG as M
+    from config import INT8_SCALE_MAX, INT8_AMAX_EPS
 if __package__:
     from .decode_shapes import DECODE_BATCH, DECODE_SEQ
 else:

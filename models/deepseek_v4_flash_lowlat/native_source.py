@@ -100,8 +100,18 @@ def select_sources(files, expected_fingerprint):
         )
     sites = {role: sum(role in Path(item["source"]).parts for item in selected)
              for role in ("l2_full_cycles", "l2_s6_cycles_only")}
-    if tuple(sites.values()) not in ((5, 5), (1, 1)) or sum(sites.values()) != len(selected):
-        raise ValueError(f"Expected five W2 sites or one shared site in each of two roles: {sites}")
+    names = tuple(Path(name) for name in files)
+    full_tp8_drafter = (
+        sites == {"l2_full_cycles": 1, "l2_s6_cycles_only": 0}
+        and not any("l2_s6_cycles_only" in n.parts for n in names)
+        and all(any("l2_full_cycles" in n.parts and n.suffix == ".cpp" and label in n.stem
+                    for n in names)
+                for label in ("draft_tp8_commit_peer_history", "d_tp8_clear_signals",
+                              "draft_tp8_w2_owned_columns"))
+    )
+    if (tuple(sites.values()) not in ((5, 5), (1, 1)) and not full_tp8_drafter
+            or sum(sites.values()) != len(selected)):
+        raise ValueError(f"Unexpected W2 sites for the generated rank roles: {sites}")
     result["report/native-w2-source-selection.json"] = (
         json.dumps(
             dict(
@@ -110,6 +120,7 @@ def select_sources(files, expected_fingerprint):
                 fragment_sha256=hashlib.sha256(NATIVE_SOURCE.read_bytes()).hexdigest(),
                 selected=selected,
                 sites_by_role=sites,
+                full_tp8_drafter=full_tp8_drafter,
                 old_binaries_loaded=False,
                 native_build="REQUIRED",
             ),
