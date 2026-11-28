@@ -1944,6 +1944,72 @@ def deepseek_select_pool(
 
 
 @pl.jit.inline(auto_scope=False)
+def _publish_complete_pool(
+    lengths: pl.Tensor,
+    ids: pl.Tensor,
+    counts: pl.Tensor,
+    active: pl.Scalar[pl.INT32],
+):
+    """Publish every visible block in chronological order when all can be retained."""
+    rows = pl.tensor.dim(ids, 0)
+    capacity = pl.tensor.dim(ids, 1)
+    limit = pl.cast(pl.min(capacity, CANDIDATE_TOPK_BLOCKS) * CANDIDATE_BLOCK_SIZE, pl.INT32)
+    row_lengths = pl.reshape(lengths, [1, rows])
+    row_counts = pl.reshape(counts, [1, rows])
+    workers = pl.max(1, pl.min(rows, pl.system.available_aiv_count()))
+    with pl.spmd(workers, name_hint="idx_complete_pool"):
+        worker = pl.tile.get_block_idx()
+        lanes = pl.tile.arange(0, [1, 256], dtype=pl.INT32)
+        pl.system.cacheinvalid()
+        for row in pl.range(worker, rows, workers):
+            count = pl.cast(0, pl.INT32)
+            if row < active:
+                length = pl.min(limit, pl.max(0, pl.read(lengths, [row])))
+                count = pl.cast((length + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE, pl.INT32)
+            for begin in pl.range(0, capacity, 256):
+                blocks = pl.add(lanes, pl.cast(begin, pl.INT32))
+                present = pl.tile.cmps(blocks, count, cmp_type=2)
+                selected = pl.tile.select(present, blocks, -1)
+                pl.store(pl.set_validshape(selected, 1, pl.min(256, capacity - begin)), [row, begin], ids)
+        for begin in pl.range(worker * 16, rows, workers * 16):
+            width = pl.min(16, rows - begin)
+            visible = pl.load(row_lengths, [0, begin], [1, 16], valid_shape=[1, width])
+            bounded = pl.minimum(pl.maximum(pl.tile.fillpad(visible), 0), limit)
+            count_tile = pl.shrs(pl.add(bounded, CANDIDATE_BLOCK_SIZE - 1), 3)
+            row_ids = pl.add(pl.tile.arange(0, [1, 16], dtype=pl.INT32), pl.cast(begin, pl.INT32))
+            active_counts = pl.tile.select(pl.tile.cmps(row_ids, active, cmp_type=2), count_tile, 0)
+            pl.store(pl.set_validshape(active_counts, 1, width), [0, begin], row_counts)
+
+
+@pl.jit.inline(auto_scope=False)
+def _select_qli_attention(
+    query: pl.Tensor,
+    query_scale: pl.Tensor,
+    raw_weights: pl.Tensor,
+    key: pl.Tensor,
+    key_scale: pl.Tensor,
+    table: pl.Tensor,
+    request_ids: pl.Tensor,
+    lengths: pl.Tensor,
+    metadata: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    sorted_index: pl.constexpr,
+):
+    tokens = pl.tensor.dim(query, 0)
+    active = pl.cast(num_tokens, pl.INT32)
+    page_rows = pl.tensor.dim(key, 1)
+    capacity = pl.tensor.dim(table, 1) * page_rows
+    width = (capacity + 255) // 256 * 256
+    scores = pl.create_tensor([tokens, width], dtype=pl.BF16)
+    score_paged(
+        query, query_scale, raw_weights, key, key_scale, table,
+        request_ids, lengths, metadata, scores, active, scores, False,
+    )
+    deepseek_select_attention(scores, lengths, table, request_ids, output, active, page_rows, sorted_index)
+
+
+@pl.jit.inline(auto_scope=False)
 def select_qli(
     query: pl.Tensor,
     query_scale: pl.Tensor,
@@ -1961,32 +2027,40 @@ def select_qli(
     candidates: pl.constexpr = False,
     sorted_index: pl.constexpr = False,
 ):
-    tokens = pl.tensor.dim(query, 0)
-    active = pl.cast(num_tokens, pl.INT32)
-    page_rows = pl.tensor.dim(key, 1)
-    capacity = pl.tensor.dim(table, 1) * page_rows
-    width = (capacity + 255) // 256 * 256
-    scores = pl.create_tensor([tokens, width], dtype=pl.BF16)
     if candidates:
-        block_width = pl.max(2048, ((capacity + 7) // 8 + 511) // 512 * 512)
-        block_scores = pl.create_tensor([tokens, block_width], dtype=pl.BF16)
-        score_paged(
-            query, query_scale, raw_weights, key, key_scale, table,
-            request_ids, lengths, metadata, scores, active, block_scores, True,
-        )
-        deepseek_select_attention(
-            scores, lengths, table, request_ids, output, active, page_rows, sorted_index,
-        )
-        deepseek_select_pool(
-            block_scores, lengths, pool_ids, pool_counts, active,
-        )
+        tokens = pl.tensor.dim(query, 0)
+        active = pl.cast(num_tokens, pl.INT32)
+        page_rows = pl.tensor.dim(key, 1)
+        capacity = pl.tensor.dim(table, 1) * page_rows
+        width = (capacity + 255) // 256 * 256
+        scores = pl.create_tensor([tokens, width], dtype=pl.BF16)
+        keep = pl.min(pl.tensor.dim(pool_ids, 1), CANDIDATE_TOPK_BLOCKS)
+        if capacity <= keep * CANDIDATE_BLOCK_SIZE:
+            _publish_complete_pool(lengths, pool_ids, pool_counts, active)
+            score_paged(
+                query, query_scale, raw_weights, key, key_scale, table,
+                request_ids, lengths, metadata, scores, active, scores, False,
+            )
+            deepseek_select_attention(
+                scores, lengths, table, request_ids, output, active, page_rows, sorted_index,
+            )
+        else:
+            block_width = pl.max(2048, ((capacity + 7) // 8 + 511) // 512 * 512)
+            block_scores = pl.create_tensor([tokens, block_width], dtype=pl.BF16)
+            score_paged(
+                query, query_scale, raw_weights, key, key_scale, table,
+                request_ids, lengths, metadata, scores, active, block_scores, True,
+            )
+            deepseek_select_attention(
+                scores, lengths, table, request_ids, output, active, page_rows, sorted_index,
+            )
+            deepseek_select_pool(
+                block_scores, lengths, pool_ids, pool_counts, active,
+            )
     else:
-        score_paged(
+        _select_qli_attention(
             query, query_scale, raw_weights, key, key_scale, table,
-            request_ids, lengths, metadata, scores, active, scores, False,
-        )
-        deepseek_select_attention(
-            scores, lengths, table, request_ids, output, active, page_rows, sorted_index,
+            request_ids, lengths, metadata, output, num_tokens, sorted_index,
         )
 
 
@@ -2030,11 +2104,10 @@ def decode_c2a_indexer(
         num_tokens,
         projection_payload, projection_scales,
     )
-    select_qli(
+    _select_qli_attention(
         query, query_scale, raw_weights, index_cache, index_cache_scale,
         index_block_table, token_to_req_indices, compressed_lens, metadata,
-        topk_indices, compressed_lens, compressed_lens,
-        num_tokens, False, False,
+        topk_indices, num_tokens, False,
     )
     return topk_indices
 
@@ -2509,7 +2582,7 @@ if __name__ == "__main__":
     from functools import partial
     from golden import run
 
-    parser = argparse.ArgumentParser(description="Paged C++ LI precision validation")
+    parser = argparse.ArgumentParser(description="Paged Lightning Indexer precision validation")
     parser.add_argument("--device", "-d", type=int, default=0)
     parser.add_argument("--batch", type=int, help="Default: 2")
     parser.add_argument("--sequence", type=int, help="Default: 2")
@@ -2544,10 +2617,15 @@ if __name__ == "__main__":
     batch = 2 if args.batch is None else args.batch
     sequence = 2 if args.sequence is None else args.sequence
     cases = [(page, batch, sequence, args.kv_length, candidate_modes, sort_modes) for page in page_modes]
-    if (not replay and not args.compile_only and args.batch is None and args.sequence is None
-            and args.kv_length is None and False in candidate_modes and False in sort_modes):
-        # First active-row count above the small metadata scan's shared-memory budget.
-        cases.append((page_modes[0], 3, 329, 513, [False], [False]))
+    if not replay and not args.compile_only and args.batch is None and args.sequence is None and args.kv_length is None:
+        if True in candidate_modes:
+            # One active row and one inactive row at each pool-selection boundary.
+            retention = CANDIDATE_TOPK_BLOCKS * CANDIDATE_BLOCK_SIZE
+            for history in (513, retention, retention + 1):
+                cases.append((page_modes[0], 1, 1, history, [True], [sort_modes[0]]))
+        if False in candidate_modes and False in sort_modes:
+            # First active-row count above the small metadata scan's shared-memory budget.
+            cases.append((page_modes[0], 3, 329, 513, [False], [False]))
     for page_rows, batch, sequence, history, pools, sorts in cases:
         for candidates in pools:
             for sorted_index in sorts:
