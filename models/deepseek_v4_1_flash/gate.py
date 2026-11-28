@@ -445,7 +445,7 @@ def _gate_project_tile(
     acc = pl.create_tile([GATE_M_TILE, columns], dtype=pl.FP32, target_memory=pl.Mem.Acc)
     for k0 in pl.pipeline(0, width, k_tile, stage=2):
         left = pl.load(x, [row, k0], [GATE_M_TILE, k_tile], target_memory=pl.Mem.Mat)
-        right = pl.load(gate_w, [column, k0], [columns, k_tile], valid_shape=[valid, k_tile], target_memory=pl.Mem.Mat)
+        right = pl.load(gate_w, [column, k0], [columns, k_tile], valid_shape=[valid, k_tile], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
         right = pl.tile.transpose_view(right)
         acc = pl.tile.matmul_acc(acc, left, right, init_cond=k0 == 0)
     return acc

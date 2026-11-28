@@ -1802,14 +1802,14 @@ def project_index_weights(
             row = block * 80
             rows = pl.min(80, num_tokens - row)
             a = pl.load(source, [row, begin], [80, INDEX_WEIGHT_K_TILE], valid_shape=[rows, INDEX_WEIGHT_K_TILE], target_memory=pl.MemorySpace.Mat)
-            w = pl.load(weight, [begin, 0], [INDEX_WEIGHT_K_TILE, INDEX_H], target_memory=pl.MemorySpace.Mat)
+            w = pl.load(weight, [begin, 0], [INDEX_WEIGHT_K_TILE, INDEX_H], target_memory=pl.MemorySpace.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
             full_a = pl.set_validshape(a, 80, INDEX_WEIGHT_K_TILE)
             acc = pl.matmul(full_a, w)
             k_begin = begin + INDEX_WEIGHT_K_TILE
             k_end = begin + D // INDEX_WEIGHT_K_SPLIT_TILE
             for k in pl.pipeline(k_begin, k_end, INDEX_WEIGHT_K_TILE, stage=2):
                 a = pl.load(source, [row, k], [80, INDEX_WEIGHT_K_TILE], valid_shape=[rows, INDEX_WEIGHT_K_TILE], target_memory=pl.MemorySpace.Mat)
-                w = pl.load(weight, [k, 0], [INDEX_WEIGHT_K_TILE, INDEX_H], target_memory=pl.MemorySpace.Mat)
+                w = pl.load(weight, [k, 0], [INDEX_WEIGHT_K_TILE, INDEX_H], target_memory=pl.MemorySpace.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 full_a = pl.set_validshape(a, 80, INDEX_WEIGHT_K_TILE)
                 acc = pl.matmul_acc(acc, full_a, w)
             value = pl.set_validshape(acc, rows, INDEX_H)

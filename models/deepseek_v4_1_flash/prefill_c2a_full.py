@@ -161,7 +161,7 @@ def prefill_c2a_full(
         compressor_score = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.FP32)
         c2a_compressor_project(
             kv_hidden, w_compressor_kv, w_compressor_gate, compressor_kv, compressor_score,
-            kv_token_count, n_tile=128,
+            kv_token_count, n_tile=128, weight_cache=pl.CachePolicy.DEFAULT,
         )
         no_dependency = pl.system.task_invalid()
         compressed_latent = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
@@ -564,7 +564,7 @@ def prefill_c2a_full_cp(
         compressor_score = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.FP32)
         c2a_compressor_project(
             kv_hidden, w_compressor_kv, w_compressor_gate, compressor_kv, compressor_score,
-            kv_token_count, n_tile=128,
+            kv_token_count, n_tile=128, weight_cache=pl.CachePolicy.DEFAULT,
         )
         compressed_latent = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
         compressed_published = c2a_compressor_publish(

@@ -141,7 +141,10 @@ def decode_c2a_full(
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
-    c2a_compressor_project(x_norm, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens, n_tile=64)
+    c2a_compressor_project(
+        x_norm, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens,
+        n_tile=64, weight_cache=pl.CachePolicy.NOT_ALLOC_KEEP,
+    )
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,

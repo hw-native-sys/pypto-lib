@@ -159,47 +159,35 @@ def engram_proj(
                     sa_l1 = pl.load(activation_scale, [m0, 0], [row_tile, scale_groups], target_memory=pl.Mem.Mat)
                     sb_l1 = pl.load(packed_weight_scale, [0, n0], [scale_groups, n_tile], target_memory=pl.Mem.Mat)
                     acc = pl.create_tile([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.Mem.Acc)
-                    # Load the initial K256 panels into L1.
+                    # Load the initial activation panels into L1.
                     a_even = pl.load(payload, [m0, 0], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
-                    b_even = pl.load(weight, [0, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
                     a_odd = pl.load(
                         payload, [m0, PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat,
-                    )
-                    b_odd = pl.load(
-                        weight, [PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat,
                     )
                     if four_l1_slots:
                         a_third = pl.load(
                             payload, [m0, 2 * PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat,
                         )
-                        b_third = pl.load(
-                            weight, [2 * PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat,
-                        )
                         a_fourth = pl.load(
                             payload, [m0, 3 * PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat,
-                        )
-                        b_fourth = pl.load(
-                            weight, [3 * PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat,
                         )
                     for k_base in pl.range(0, ENGRAM_K, l1_slots * PROJECTION_K_TILE):
                         for panel in pl.unroll(l1_slots):
                             if panel == 0:
                                 a_l1 = a_even
-                                b_l1 = b_even
                             elif panel == 1:
                                 a_l1 = a_odd
-                                b_l1 = b_odd
                             else:
                                 if four_l1_slots:
                                     if panel == 2:
                                         a_l1 = a_third
-                                        b_l1 = b_third
                                     else:
                                         a_l1 = a_fourth
-                                        b_l1 = b_fourth
                                 else:
                                     a_l1 = a_odd
-                                    b_l1 = b_odd
+                            panel_k = k_base + panel * PROJECTION_K_TILE
+                            b_l1 = pl.load(weight, [panel_k, n0], [PROJECTION_K_TILE, n_tile],
+                                           target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                             # The A5 scale address is the payload byte address shifted right by four.
                             # Scale slots 0 and 2 match the two payload slots because each scale
                             # tile uses one thirty-second of the corresponding FP8 payload bytes.
@@ -252,30 +240,18 @@ def engram_proj(
                                     a_even = pl.tile.gather_row(
                                         a_even, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE],
                                     )
-                                    b_even = pl.tile.gather_row(
-                                        b_even, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile],
-                                    )
                                 elif panel == 1:
                                     a_odd = pl.tile.gather_row(
                                         a_odd, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE],
-                                    )
-                                    b_odd = pl.tile.gather_row(
-                                        b_odd, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile],
                                     )
                                 elif four_l1_slots:
                                     if panel == 2:
                                         a_third = pl.tile.gather_row(
                                             a_third, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE],
                                         )
-                                        b_third = pl.tile.gather_row(
-                                            b_third, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile],
-                                        )
                                     else:
                                         a_fourth = pl.tile.gather_row(
                                             a_fourth, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE],
-                                        )
-                                        b_fourth = pl.tile.gather_row(
-                                            b_fourth, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile],
                                         )
                     valid_acc = pl.set_validshape(acc, pl.min(row_tile, tokens - m0), n_tile)
                     kv = pl.store(valid_acc, [m0, n0], kv)

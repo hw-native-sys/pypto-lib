@@ -196,13 +196,13 @@ def dspark_proj_pypto(
             col = pl.tile.get_block_idx() * PROJ_N_TILE
             a = pl.load(payload, [row, 0], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
             sa = pl.load(activation_scale, [0, 0], [PROJ_M_TILE, PROJ_K_TILE // MX_GROUP])
-            b = pl.load(main_proj_weight, [0, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+            b = pl.load(main_proj_weight, [0, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
             sb = pl.load(weight_scale, [0, col], [PROJ_K_TILE // MX_GROUP, PROJ_N_TILE])
             acc = pl.matmul_mx(a, sa, b, sb)
             for k in pl.pipeline(PROJ_K_TILE, MAIN_IN, PROJ_K_TILE, stage=2):
                 a_next = pl.load(payload, [row, k], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
                 sa_next = pl.load(activation_scale, [0, k // MX_GROUP], [PROJ_M_TILE, PROJ_K_TILE // MX_GROUP])
-                b_next = pl.load(main_proj_weight, [k, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                b_next = pl.load(main_proj_weight, [k, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 sb_next = pl.load(weight_scale, [k // MX_GROUP, col], [PROJ_K_TILE // MX_GROUP, PROJ_N_TILE])
                 acc = pl.matmul_mx_acc(acc, a_next, sa_next, b_next, sb_next)
             valid = pl.set_validshape(acc, pl.min(PROJ_M_TILE, num_tokens - row), PROJ_N_TILE)

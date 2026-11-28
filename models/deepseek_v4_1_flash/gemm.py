@@ -72,7 +72,7 @@ def gemm_mxfp8_to_bf16(
                 else:
                     a0 = pl.load(payload, [payload_row, 0], [m_tile, k_tile])
                 sa0 = pl.load(activation_scale, [0, 0], [m_tile, k_tile // 32])
-                b0 = pl.load(weight, [weight_row, n0], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                b0 = pl.load(weight, [weight_row, n0], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 sb0 = pl.load(scale_group, [0, n0], [k_tile // 32, n_tile])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
                 for k0 in pl.pipeline(k_tile, width, k_tile, stage=k_stages):
@@ -81,7 +81,7 @@ def gemm_mxfp8_to_bf16(
                     else:
                         a = pl.load(payload, [payload_row, k0], [m_tile, k_tile])
                     sa = pl.load(activation_scale, [0, k0 // 32], [m_tile, k_tile // 32])
-                    b = pl.load(weight, [weight_row + k0, n0], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                    b = pl.load(weight, [weight_row + k0, n0], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                     sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                 output_n = output_col + n0
@@ -176,7 +176,7 @@ def _gemm_bf16_to_bf16(
             acc = pl.tile.create([16, n_tile], dtype=pl.FP32)
             for k in pl.range(0, width, k_tile):
                 a = pl.load(source, [row, k], [16, k_tile], valid_shape=[rows, k_tile])
-                w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
             value = pl.set_validshape(acc, rows, n_tile)
             output = pl.store(value, [row, col], output)

@@ -58,11 +58,11 @@ __aicore__ inline void load_payload(__gm__ F* a, __gm__ F* b, int k, int n, int 
     if constexpr (WeightNZ) {
         GM<F, 256, NT, K, N, Layout::NZ> bg(b + n * K + k * 32);
         TLOAD(am, ag);
-        TLOAD(bm, bg);
+        TLOAD<TLoadL2Hint::NotAllocKeep>(bm, bg);
     } else {
         GM<F, 256, NT, K, N, Layout::ND> bg(b + k * N + n);
         TLOAD(am, ag);
-        TLOAD(bm, bg);
+        TLOAD<TLoadL2Hint::NotAllocKeep>(bm, bg);
     }
     set_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(slot));
 }
