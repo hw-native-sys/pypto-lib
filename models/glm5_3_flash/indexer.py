@@ -448,9 +448,11 @@ def indexer_select(
     if maximum > KPOOL_SELECT_K:
         leaf_scores = pl.create_tensor([tokens, SORT_TILE], dtype=pl.FP32)
         roots = pl.create_tensor([tokens, PAIR_WIDTH], dtype=pl.FP32)
+        prev_merge_tid = None
         for leaf in pl.range((maximum + SORT_TILE - 1) // SORT_TILE):
             leaf_start = leaf * SORT_TILE
-            with pl.spmd(tokens, name_hint="indexer_select_scores") as score_tid:
+            # The previous merge reads the shared score buffer.
+            with pl.spmd(tokens, name_hint="indexer_select_scores", deps=[prev_merge_tid]) as score_tid:
                 token = pl.tile.get_block_idx()
                 visible = pl.cast(pl.max(pl.read(pool_count, [token]), 0), pl.INDEX)
                 segment = pl.cast(pl.read(seg_start, [token]), pl.INDEX)
@@ -461,7 +463,7 @@ def indexer_select(
                             index_q, pool_cache, pool_blocks, head_weights, token, segment, column, visible,
                         )
                         leaf_scores[token:token + 1, offset:offset + SCORE_C_TILE] = scores
-            with pl.spmd(tokens, name_hint="indexer_select_merge", deps=[score_tid]):
+            with pl.spmd(tokens, name_hint="indexer_select_merge", deps=[score_tid]) as merge_tid:
                 token = pl.tile.get_block_idx()
                 visible = pl.cast(pl.max(pl.read(pool_count, [token]), 0), pl.INDEX)
                 if visible > KPOOL_SELECT_K and leaf_start < visible:
@@ -488,6 +490,7 @@ def indexer_select(
                     picked = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                     pl.store(picked, [token, 0], selected_pools)
                     pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=1), [token, 0], selected_valid)
+            prev_merge_tid = merge_tid
 
     return selected_pools, selected_valid
 
