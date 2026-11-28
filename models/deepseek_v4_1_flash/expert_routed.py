@@ -97,7 +97,6 @@ SWIGLU_GROUP_ROWS = SWIGLU_ROW_TILE * SWIGLU_SCALE_COLS
 SWIGLU_LANES = 64
 SWIGLU_GROUPS_PER_CHUNK = SWIGLU_LANES // MX_GROUP
 SWIGLU_COUNT_LANES = SWIGLU_LANES
-SWIGLU_SCALE_SCRATCH_TILE = SWIGLU_ROW_TILE * (MOE_INTER // SWIGLU_LANES) * 8
 
 # Full physical activation-scale row tiles with a clamped capacity tail.
 W13_M_TILE = min(64, gcd(RECV_MAX, 160))
@@ -746,121 +745,6 @@ def _routed_swiglu_quant(
     return payload, scales
 
 
-@pl.jit.inline(auto_scope=False)
-def routed_swiglu_quant_pypto(
-    pair: pl.Tensor,
-    weights: pl.Tensor,
-    counts: pl.Tensor,
-    payload: pl.Tensor,
-    scales: pl.Tensor,
-    w13_ready: pl.Scalar[pl.TASK_ID],
-    experts: pl.constexpr,
-):
-    """Apply weighted SwiGLU and group-32 MXFP8 quantization in vector registers."""
-    counts_row = pl.reshape(counts, [1, experts])
-    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant_pypto", deps=[w13_ready]) as ready:
-        core = pl.tile.get_block_idx()
-        rows = pl.cast(0, pl.INDEX)
-        for first in pl.range(0, experts, SWIGLU_COUNT_LANES):
-            remaining = pl.min(SWIGLU_COUNT_LANES, experts - first)
-            counts_tile = pl.load(counts_row, [0, first], [1, SWIGLU_COUNT_LANES],
-                                  valid_shape=[1, remaining], target_memory=pl.MemorySpace.Vec)
-            counts_flat = pl.reshape(counts_tile, [SWIGLU_COUNT_LANES])
-            total_tile = pl.tile.create([SWIGLU_COUNT_LANES], dtype=pl.INT32,
-                                        target_memory=pl.MemorySpace.Vec)
-            with pl.reg_scope():
-                count_mask = pl.reg.create_group_mask(remaining, num_groups=1,
-                                                      group_size=SWIGLU_COUNT_LANES)
-                count_lane = pl.reg.index_gen(0, lanes=SWIGLU_COUNT_LANES, dtype=pl.UINT32)
-                count_values = pl.reg.gather(counts_flat, count_lane, count_mask)
-                count_total = pl.reg.reduce_sum(count_values, count_mask)
-                total_written = pl.reg.store(total_tile, 0, value=count_total)
-            rows = rows + pl.cast(pl.tile.read(total_written, [0]), pl.INDEX)
-        work_count = (rows + SWIGLU_ROW_TILE - 1) // SWIGLU_ROW_TILE
-        for work in pl.range(core, work_count, ROUTED_VECTOR_WORKER_TILE):
-            row = work * SWIGLU_ROW_TILE
-            gate_tile = pl.load(pair, [row, 0], [SWIGLU_ROW_TILE, MOE_INTER],
-                                target_memory=pl.MemorySpace.Vec)
-            up_tile = pl.load(pair, [row, MOE_INTER], [SWIGLU_ROW_TILE, MOE_INTER],
-                              target_memory=pl.MemorySpace.Vec)
-            weight_tile = pl.load(weights, [row, 0], [SWIGLU_ROW_TILE, 1],
-                                  target_memory=pl.MemorySpace.Vec)
-            gate_flat = pl.reshape(gate_tile, [SWIGLU_ROW_TILE * MOE_INTER])
-            up_flat = pl.reshape(up_tile, [SWIGLU_ROW_TILE * MOE_INTER])
-            weight_flat = pl.reshape(weight_tile, [SWIGLU_ROW_TILE])
-            payload_flat = pl.tile.create([SWIGLU_ROW_TILE * MOE_INTER], dtype=pl.INT8,
-                                          target_memory=pl.MemorySpace.Vec)
-            # Each pair of exponents occupies one 32-byte aligned scratch slot.
-            scale_scratch = pl.tile.create([SWIGLU_SCALE_SCRATCH_TILE], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
-            code_flat = pl.tile.create([SWIGLU_GROUP_ROWS], dtype=pl.INT8, target_memory=pl.MemorySpace.Vec)
-            with pl.reg_scope():
-                active = pl.reg.full_mask(lanes=SWIGLU_LANES)
-                bias = pl.reg.broadcast(254, lanes=SWIGLU_LANES, dtype=pl.INT32)
-                lane_id = pl.reg.index_gen(0, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                lane_span = pl.reg.broadcast(SWIGLU_LANES - 1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                group_lane = pl.reg.muls(lane_id, MX_GROUP, active)
-                code_pick = pl.reg.bitwise_and(group_lane, lane_span, active)
-                code_store = pl.reg.active_mask(SWIGLU_GROUPS_PER_CHUNK, lanes=SWIGLU_LANES)
-                for lane_row in pl.hardware_loop(SWIGLU_ROW_TILE):
-                    route_row = pl.cast(lane_row, pl.UINT32)
-                    route_index = pl.reg.broadcast(route_row, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                    route_v = pl.reg.gather(weight_flat, route_index, active)
-                    for chunk in pl.hardware_loop(MOE_INTER // SWIGLU_LANES):
-                        offset = lane_row * MOE_INTER + chunk * SWIGLU_LANES
-                        gate_bf = pl.reg.load(gate_flat, offset, lanes=SWIGLU_LANES)
-                        gate = pl.reg.convert(gate_bf, dtype=pl.FP32)
-                        up_bf = pl.reg.load(up_flat, offset, lanes=SWIGLU_LANES)
-                        up = pl.reg.convert(up_bf, dtype=pl.FP32)
-                        gate_c = pl.reg.minimums(gate, SWIGLU_LIMIT, active)
-                        up_low = pl.reg.minimums(up, SWIGLU_LIMIT, active)
-                        up_c = pl.reg.maximums(up_low, -SWIGLU_LIMIT, active)
-                        neg_gate = pl.reg.neg(gate_c, active)
-                        gate_exp = pl.reg.exp(neg_gate, active)
-                        denom = pl.reg.adds(gate_exp, 1.0, active)
-                        silu = pl.reg.div(gate_c, denom, active)
-                        gated = pl.reg.mul(silu, up_c, active)
-                        values = pl.reg.mul(gated, route_v, active)
-                        magnitude = pl.reg.abs(values, active)
-                        group_peak = pl.reg.reduce_max(magnitude, active, group_size=MX_GROUP)
-                        group_max = pl.reg.group_broadcast(group_peak, lanes=SWIGLU_LANES)
-                        floored = pl.reg.maximums(group_max, SWIGLU_SCALE_FLOOR, active)
-                        amax = pl.reg.muls(floored, SWIGLU_MAX_INV, active)
-                        amax_bits = pl.reg.interpret_cast(amax, dtype=pl.INT32)
-                        carried = pl.reg.adds(amax_bits, 8388607, active)
-                        exponent = pl.reg.shift_rights(carried, 23, active)
-                        recip_exp = pl.reg.sub(bias, exponent, active)
-                        recip_bits = pl.reg.shift_lefts(recip_exp, 23, active)
-                        recip = pl.reg.interpret_cast(recip_bits, dtype=pl.FP32)
-                        normalized = pl.reg.mul(values, recip, active)
-                        encoded = pl.reg.convert(normalized, dtype=pl.FP8E4M3FN, rounding="R", saturate=True)
-                        payload_code = pl.reg.interpret_cast(encoded, dtype=pl.INT8)
-                        payload_alias = pl.reg.store(payload_flat, offset, value=payload_code)
-                        picked = pl.reg.gather_lanes(exponent, code_pick)
-                        code_offset = (lane_row * (MOE_INTER // SWIGLU_LANES) + chunk) * 8
-                        code_alias = pl.reg.store(scale_scratch, code_offset, value=picked, mask=code_store)
-                # Compact the two populated words from each scratch slot.
-                compact_lane = pl.reg.index_gen(0, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                for compact_chunk in pl.hardware_loop(SWIGLU_GROUP_ROWS // SWIGLU_LANES):
-                    group_offset = pl.cast(compact_chunk * SWIGLU_LANES, pl.UINT32)
-                    compact_group = pl.reg.adds(compact_lane, group_offset, active)
-                    scratch_group = pl.reg.shift_rights(compact_group, 1, active)
-                    scratch_base = pl.reg.shift_lefts(scratch_group, 3, active)
-                    parity_one = pl.reg.broadcast(1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                    scratch_parity = pl.reg.bitwise_and(compact_group, parity_one, active)
-                    scratch_index = pl.reg.add(scratch_base, scratch_parity, active)
-                    compact_codes_wide = pl.reg.gather(scale_scratch, scratch_index, active)
-                    compact_codes = pl.reg.convert(compact_codes_wide, dtype=pl.INT8, saturate=False)
-                    compact_written = pl.reg.store(code_flat, compact_chunk * SWIGLU_LANES, value=compact_codes)
-            payload_row = pl.reshape(payload_flat, [SWIGLU_ROW_TILE, MOE_INTER])
-            quantized = pl.reinterpret_view(payload_row, pl.FP8E4M3FN)
-            payload = pl.store(quantized, [row, 0], payload)
-            code_row = pl.reshape(code_flat, [1, SWIGLU_GROUP_ROWS])
-            code_bytes = pl.reinterpret_view(code_row, pl.UINT8)
-            codes = pl.reinterpret_view(code_bytes, pl.FP8E8M0)
-            scales = pl.store(codes, [0, row * SWIGLU_SCALE_COLS], scales)
-    return payload, scales, ready
-
-
 @pl.jit.extern(
     core_type="mixed",
     aic_source=Path(__file__).parent / "kernels" / "expert_routed_w2.cpp",
@@ -1145,10 +1029,108 @@ def _expert_routed_output(
 
     payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(swiglu_workers, name_hint="routed_swiglu_quant"):
-        payload, scales = _routed_swiglu_quant(
-            pair, compact_weights, counts, payload, scales, experts, stride, hidden, row_capacity,
-        )
+    if MOE_TOKENS >= 1024:
+        counts_row = pl.reshape(counts, [1, experts])
+        with pl.spmd(swiglu_workers, name_hint="routed_swiglu_quant"):
+            core = pl.tile.get_block_idx()
+            workers = pl.tile.get_block_num()
+            rows = pl.cast(0, pl.INDEX)
+            for first in pl.range(0, experts, SWIGLU_COUNT_LANES):
+                remaining = pl.min(SWIGLU_COUNT_LANES, experts - first)
+                counts_tile = pl.load(counts_row, [0, first], [1, SWIGLU_COUNT_LANES],
+                                      valid_shape=[1, remaining], target_memory=pl.MemorySpace.Vec)
+                counts_flat = pl.reshape(counts_tile, [SWIGLU_COUNT_LANES])
+                total_tile = pl.tile.create([SWIGLU_COUNT_LANES], dtype=pl.INT32,
+                                            target_memory=pl.MemorySpace.Vec)
+                with pl.reg_scope():
+                    count_mask = pl.reg.create_group_mask(remaining, num_groups=1,
+                                                          group_size=SWIGLU_COUNT_LANES)
+                    count_lane = pl.reg.index_gen(0, lanes=SWIGLU_COUNT_LANES, dtype=pl.UINT32)
+                    count_values = pl.reg.gather(counts_flat, count_lane, count_mask)
+                    count_total = pl.reg.reduce_sum(count_values, count_mask)
+                    total_written = pl.reg.store(total_tile, 0, value=count_total)
+                rows = rows + pl.cast(pl.tile.read(total_written, [0]), pl.INDEX)
+            compact_route = pl.tensor.view(compact_weights, [1, compact_weights.shape[0]])
+            work_count = (rows + SWIGLU_ROW_TILE - 1) // SWIGLU_ROW_TILE
+            for i in pl.pipeline((work_count + workers - 1 - core) // workers, stage=2):
+                row = (core + i * workers) * SWIGLU_ROW_TILE
+                gate_tile = pl.load(pair, [row, 0], [SWIGLU_ROW_TILE, MOE_INTER],
+                                    target_memory=pl.MemorySpace.Vec)
+                up_tile = pl.load(pair, [row, MOE_INTER], [SWIGLU_ROW_TILE, MOE_INTER],
+                                  target_memory=pl.MemorySpace.Vec)
+                weight_tile = pl.load(compact_route, [0, row], [1, 8], valid_shape=[1, SWIGLU_ROW_TILE],
+                                      target_memory=pl.MemorySpace.Vec)
+                gate_flat = pl.reshape(gate_tile, [SWIGLU_ROW_TILE * MOE_INTER])
+                up_flat = pl.reshape(up_tile, [SWIGLU_ROW_TILE * MOE_INTER])
+                weight_row = pl.set_validshape(weight_tile, 1, 8)
+                weight_flat = pl.reshape(weight_row, [8])
+                payload_flat = pl.tile.create([SWIGLU_ROW_TILE * MOE_INTER], dtype=pl.INT8,
+                                              target_memory=pl.MemorySpace.Vec)
+                # Store two exponents per chunk, then pack the dense words into E8M0 bytes.
+                scale_scratch = pl.tile.create([SWIGLU_GROUP_ROWS], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
+                code_flat = pl.tile.create([SWIGLU_GROUP_ROWS], dtype=pl.INT8, target_memory=pl.MemorySpace.Vec)
+                with pl.reg_scope(auto_sync=False):
+                    active = pl.reg.full_mask(lanes=SWIGLU_LANES)
+                    bias = pl.reg.broadcast(254, lanes=SWIGLU_LANES, dtype=pl.INT32)
+                    lane_id = pl.reg.index_gen(0, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                    lane_span = pl.reg.broadcast(SWIGLU_LANES - 1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                    group_lane = pl.reg.muls(lane_id, MX_GROUP, active)
+                    code_pick = pl.reg.bitwise_and(group_lane, lane_span, active)
+                    code_store = pl.reg.active_mask(SWIGLU_GROUPS_PER_CHUNK, lanes=SWIGLU_LANES)
+                    for lane_row in pl.hardware_loop(SWIGLU_ROW_TILE):
+                        route_row = pl.cast(lane_row, pl.UINT32)
+                        route_index = pl.reg.broadcast(route_row, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                        route_v = pl.reg.gather(weight_flat, route_index, active)
+                        for chunk in pl.hardware_loop(MOE_INTER // SWIGLU_LANES):
+                            offset = lane_row * MOE_INTER + chunk * SWIGLU_LANES
+                            gate_bf = pl.reg.load(gate_flat, offset, lanes=SWIGLU_LANES)
+                            gate = pl.reg.convert(gate_bf, dtype=pl.FP32)
+                            up_bf = pl.reg.load(up_flat, offset, lanes=SWIGLU_LANES)
+                            up = pl.reg.convert(up_bf, dtype=pl.FP32)
+                            gate_c = pl.reg.minimums(gate, SWIGLU_LIMIT, active)
+                            up_low = pl.reg.minimums(up, SWIGLU_LIMIT, active)
+                            up_c = pl.reg.maximums(up_low, -SWIGLU_LIMIT, active)
+                            neg_gate = pl.reg.neg(gate_c, active)
+                            gate_exp = pl.reg.exp(neg_gate, active)
+                            denom = pl.reg.adds(gate_exp, 1.0, active)
+                            silu = pl.reg.div(gate_c, denom, active)
+                            gated = pl.reg.mul(silu, up_c, active)
+                            values = pl.reg.mul(gated, route_v, active)
+                            magnitude = pl.reg.abs(values, active)
+                            group_peak = pl.reg.reduce_max(magnitude, active, group_size=MX_GROUP)
+                            group_max = pl.reg.group_broadcast(group_peak, lanes=SWIGLU_LANES)
+                            floored = pl.reg.maximums(group_max, SWIGLU_SCALE_FLOOR, active)
+                            amax = pl.reg.muls(floored, SWIGLU_MAX_INV, active)
+                            amax_bits = pl.reg.interpret_cast(amax, dtype=pl.INT32)
+                            carried = pl.reg.adds(amax_bits, 8388607, active)
+                            exponent = pl.reg.shift_rights(carried, 23, active)
+                            recip_exp = pl.reg.sub(bias, exponent, active)
+                            recip_bits = pl.reg.shift_lefts(recip_exp, 23, active)
+                            recip = pl.reg.interpret_cast(recip_bits, dtype=pl.FP32)
+                            normalized = pl.reg.mul(values, recip, active)
+                            encoded = pl.reg.convert(normalized, dtype=pl.FP8E4M3FN, rounding="R", saturate=True)
+                            payload_code = pl.reg.interpret_cast(encoded, dtype=pl.INT8)
+                            payload_alias = pl.reg.store(payload_flat, offset, value=payload_code)
+                            picked = pl.reg.gather_lanes(exponent, code_pick)
+                            code_offset = lane_row * SWIGLU_SCALE_COLS + chunk * SWIGLU_GROUPS_PER_CHUNK
+                            code_alias = pl.reg.scatter(scale_scratch, lane_id, picked, code_store, base_offset=code_offset)
+                    pl.reg.mem_bar("VST_VLD")
+                    for compact in pl.hardware_loop(SWIGLU_GROUP_ROWS // SWIGLU_LANES):
+                        words = pl.reg.load(scale_scratch, compact * SWIGLU_LANES, lanes=SWIGLU_LANES)
+                        code = pl.reg.convert(words, dtype=pl.INT8, saturate=False)
+                        code_write = pl.reg.store(code_flat, compact * SWIGLU_LANES, value=code)
+                payload_row = pl.reshape(payload_flat, [SWIGLU_ROW_TILE, MOE_INTER])
+                quantized = pl.reinterpret_view(payload_row, pl.FP8E4M3FN)
+                payload = pl.store(quantized, [row, 0], payload)
+                code_row = pl.reshape(code_flat, [1, SWIGLU_GROUP_ROWS])
+                code_bytes = pl.reinterpret_view(code_row, pl.UINT8)
+                codes = pl.reinterpret_view(code_bytes, pl.FP8E8M0)
+                scales = pl.store(codes, [0, row * SWIGLU_SCALE_COLS], scales)
+    else:
+        with pl.spmd(swiglu_workers, name_hint="routed_swiglu_quant"):
+            payload, scales = _routed_swiglu_quant(
+                pair, compact_weights, counts, payload, scales, experts, stride, hidden, row_capacity,
+            )
 
     output_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     output = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, width], dtype=pl.BF16)
