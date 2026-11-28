@@ -17,8 +17,7 @@ import pypto.language as pl
 from quant import pack_quantized_cache, unpack_quantized_cache
 
 from config import FLASH as M, T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES, DECODE_BATCH
-from sparse_attention import gather_sparse_attention
-from o_proj import o_proj_hc_post
+from o_proj import gather_project_hc_post
 from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
 from hc import hc_head_norm, hc_project, hc_sinkhorn
 
@@ -104,15 +103,10 @@ def decode_swa(
         window_slots, window_cache,
         num_tokens,
     )
-    attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    gather_sparse_attention(
+    gather_project_hc_post(
         q, window_indices, window_cache, window_indices, window_cache,
-        attn_sink, attn_out, num_tokens, compressed_keys=0,
-    )
-    o_proj_hc_post(
-        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
-        oa_row_tile=80, ob_row_tile=128,
+        attn_sink, rope_cos, rope_sin, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        x_hc, post_mix, residual_mix, attention_hidden, num_tokens, compressed_keys=0,
     )
     return attention_hidden, attention_pre_mix
 

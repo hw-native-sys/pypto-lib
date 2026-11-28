@@ -171,13 +171,17 @@ template <bool First, typename Result, typename Values, typename State>
 __tf__ __aicore__ inline void finish(
     typename Result::TileDType __out__ result, typename Values::TileDType __in__ previous,
     typename Values::TileDType __in__ weighted, typename State::TileDType __in__ correction,
-    typename State::TileDType __in__ multiplier) {
+    typename State::TileDType __in__ multiplier, int channel) {
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(result);
     auto old = (__ubuf__ float*)__cce_get_tile_ptr(previous);
     auto pv = (__ubuf__ float*)__cce_get_tile_ptr(weighted);
     auto corr = (__ubuf__ float*)__cce_get_tile_ptr(correction);
     auto scale = (__ubuf__ float*)__cce_get_tile_ptr(multiplier);
     __VEC_SCOPE__ {
+#if defined(SPARSE_GATHER_MXFP8)
+        sparse_quant::Angles angles;
+        if (channel == 1) sparse_quant::load_angles(angles);
+#endif
         MaskReg all = pset_b32(PAT_ALL);
         for (uint16_t row = 0; row < Values::Rows; ++row) {
             RegTensor<float> c, norm;
@@ -195,6 +199,9 @@ __tf__ __aicore__ inline void finish(
                 }
                 vmul(value, value, norm, all, MODE_ZEROING);
                 vcvt(converted, value, all, ROUND_R, RS_DISABLE, PART_EVEN);
+#if defined(SPARSE_GATHER_MXFP8)
+                sparse_quant::finish_fragment(converted, angles, row, col, channel);
+#endif
                 // Packed BF16 writes stay behind unread FP32 values when result aliases weighted.
                 vsts(converted, dst, row * Values::Cols + col, PK_B32, all);
             }

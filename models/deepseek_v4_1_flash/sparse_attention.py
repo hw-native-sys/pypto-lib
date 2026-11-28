@@ -23,6 +23,7 @@ from quant import (
     pack_quantized_cache, unpack_quantized_cache,
 )
 
+
 # model config
 HEAD_DIM = M.head_dim
 LOCAL_H = M.num_attention_heads
@@ -119,8 +120,43 @@ def _gather_compact_sparse_vf_rows(
     ...
 
 
+_KERNEL_DIR = Path(__file__).parent / "kernels"
+_MXFP8_GATHER_SOURCE = _KERNEL_DIR / "sparse_gather_mxfp8.cpp"
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_MXFP8_GATHER_SOURCE,
+    aiv_source=_MXFP8_GATHER_SOURCE,
+    include_dirs=(pto_isa_include_dir(), _KERNEL_DIR),
+    dual_aiv_dispatch=True,
+)
+def _gather_sparse_mxfp8(
+    output: pl.Out[pl.Tensor],
+    query: pl.Tensor,
+    sink: pl.Tensor,
+    window: pl.Tensor,
+    compressed: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    partials: pl.InOut[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    heads: pl.Scalar[pl.INT32],
+    window_keys: pl.Scalar[pl.INT32],
+    compressed_keys: pl.Scalar[pl.INT32],
+    balanced: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+    cache_mode: pl.constexpr,
+):
+    """Finish sparse attention in row-major MXFP8 for the output projection."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
-def gather_sparse_attention(
+def _submit_sparse_attention(
     query: pl.Tensor,
     window_indices: pl.Tensor,
     window: pl.Tensor,
@@ -130,10 +166,18 @@ def gather_sparse_attention(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     compressed_keys: pl.constexpr,
+    quantized: pl.constexpr,
+    scales: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    padded_rows: pl.Scalar[pl.INDEX],
 ):
-    """Attend H=32/64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
+    """Partition attention work and submit the appropriate final-output kernel."""
     query = query[:num_tokens, :]
-    active_output = output[:num_tokens, :]
+    if quantized:
+        active_output = output
+    else:
+        active_output = output[:num_tokens, :]
     window_indices = window_indices[:num_tokens, :]
     compressed_indices = compressed_indices[:num_tokens, :]
     if compressed_keys == 0:
@@ -165,12 +209,20 @@ def gather_sparse_attention(
             flags = pl.tile.set_validshape(flags, 1, 2 * workers)
             pl.store(flags, [0, ready_offset], flat_partials)
         with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[reset]) as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
-    elif compressed_keys == INDEX_TOPK and num_tokens >= SPARSE_VF_WORKER_TILE and plan_pool:
+            if quantized:
+                _gather_sparse_mxfp8(
+                    active_output, query, sink, window, compressed,
+                    window_indices, compressed_indices, partials, scales, rope_cos, rope_sin,
+                    num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys, balanced, padded_rows,
+                    cache_mode=compressed_keys,
+                )
+            else:
+                _gather_sparse_vf_rows(
+                    active_output, query, sink, window, compressed,
+                    window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                    balanced, cache_mode=compressed_keys,
+                )
+    elif not quantized and compressed_keys == INDEX_TOPK and num_tokens >= SPARSE_VF_WORKER_TILE and plan_pool:
         tiles_per_worker = ((num_tokens + workers - 1) // workers) * parts
         plan_cols = 128 + ((tiles_per_worker + 127) // 128) * 128
         compact_plan = pl.create_tensor([workers * plan_cols], dtype=pl.INT32)
@@ -182,12 +234,62 @@ def gather_sparse_attention(
             )
     else:
         with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
+            if quantized:
+                _gather_sparse_mxfp8(
+                    active_output, query, sink, window, compressed,
+                    window_indices, compressed_indices, partials, scales, rope_cos, rope_sin,
+                    num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys, balanced, padded_rows,
+                    cache_mode=compressed_keys,
+                )
+            else:
+                _gather_sparse_vf_rows(
+                    active_output, query, sink, window, compressed,
+                    window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                    balanced, cache_mode=compressed_keys,
+                )
     return attended
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_sparse_attention(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    """Attend H=32/64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
+    return _submit_sparse_attention(
+        query, window_indices, window, compressed_indices, compressed, sink,
+        output, num_tokens, compressed_keys, False, output, output, output, 0,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_sparse_attention_mxfp8(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Tensor,
+    scales: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    padded_rows: pl.Scalar[pl.INDEX],
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    """Write the inverse-rotated quantized output and the row-major scales."""
+    return _submit_sparse_attention(
+        query, window_indices, window, compressed_indices, compressed, sink,
+        output, num_tokens, compressed_keys, True, scales, rope_cos, rope_sin, padded_rows,
+    )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -4342,6 +4444,74 @@ def build_sparse_attention_specs(rows, active, *, compressed_keys, start=0, case
     return specs
 
 
+@pl.jit(auto_scope=False)
+def l2_check_sparse_output_quant(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    window_indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
+    cosine: pl.Tensor[[T_DYN, 32], pl.FP32],
+    sine: pl.Tensor[[T_DYN, 32], pl.FP32],
+    payload: pl.Out[pl.Tensor[[80, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN]],
+    scales: pl.Out[pl.Tensor[[80, LOCAL_H * HEAD_DIM // 32], pl.FP8E8M0]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Retain the BF16 gather as an independent input to the output-quant reference."""
+    compressed.bind_dynamic(1, CACHE_ROWS_DYN)
+    gather_sparse_attention(
+        query, window_indices, window, compressed_indices, compressed, sink, output, num_tokens, INDEX_TOPK,
+    )
+    gather_sparse_attention_mxfp8(
+        query, window_indices, window, compressed_indices, compressed, sink, payload, scales,
+        cosine, sine, 80, num_tokens, INDEX_TOPK,
+    )
+    return output, payload, scales
+
+
+def check_sparse_output_quant(args):
+    """Compare raw row-major payload and channel-major scale bytes, including padding."""
+    from golden import TensorSpec, run
+
+    from quant import _ocp_e8m0_codes_from_amax, _quantize_mxfp8_activation
+
+    for rows in (64, 72):  # whole-token and split-token/merge schedules
+        specs = build_sparse_attention_specs(rows, rows, compressed_keys=INDEX_TOPK)
+        angle = torch.linspace(-3, 3, rows * 32).reshape(rows, 32)
+        result = run(
+            fn=l2_check_sparse_output_quant,
+            specs=specs[:7] + [
+                TensorSpec("cosine", [rows, 32], torch.float32, init_value=angle.cos()),
+                TensorSpec("sine", [rows, 32], torch.float32, init_value=angle.sin()),
+                TensorSpec("payload", [80, LOCAL_H * HEAD_DIM], torch.float8_e4m3fn),
+                TensorSpec("scales", [80, LOCAL_H * HEAD_DIM // 32], torch.float8_e8m0fnu),
+                specs[7],
+            ],
+            return_tensors=True, compile_only=args.compile_only, runtime_dir=args.runtime_dir,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+        )
+        if not result.passed:
+            raise RuntimeError(result.error)
+        if args.compile_only:
+            continue
+        ref = result.tensors["output"].reshape(rows, LOCAL_H, HEAD_DIM).clone()
+        even = ref[..., -64::2].float()
+        odd = ref[..., -63::2].float()
+        cos, sin = angle.cos()[:, None, :], angle.sin()[:, None, :]
+        ref[..., -64::2] = even * cos + odd * sin
+        ref[..., -63::2] = odd * cos - even * sin
+        fp8, _ = _quantize_mxfp8_activation(ref, scale_alg=0)
+        groups = ref.float().reshape(rows, LOCAL_H, 2, 8, 32)
+        codes = _ocp_e8m0_codes_from_amax(groups.abs().amax(dim=-1)).transpose(1, 2)
+        for name, expected in (("payload", fp8.view(torch.uint8)), ("scales", codes)):
+            actual = result.tensors[name].view(torch.uint8)
+            if not torch.equal(actual[:rows], expected.reshape(rows, -1)) or actual[rows:].any():
+                raise AssertionError(f"{rows} active rows: {name} differs at the byte level")
+        print(f"Verified {rows} active rows: payload, scales and padding match byte for byte.")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -4357,7 +4527,11 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--runtime-dir", type=str)
+    parser.add_argument("--check-output-quant", action="store_true", help="verify fused MXFP8 payload and scale bytes")
     args = parser.parse_args()
+    if args.check_output_quant:
+        check_sparse_output_quant(args)
+        raise SystemExit(0)
     if args.rows is not None and args.rows < 0:
         parser.error("--rows must be nonnegative")
     if args.case == "tile-transitions" and args.compressed_keys == 0:
