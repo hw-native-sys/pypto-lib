@@ -60,13 +60,20 @@ POST_WORKER_TILE = 64
 
 
 @pl.jit.inline
-def hc_sinkhorn(
+def _hc_sinkhorn_with_rows(
     inv_rms: pl.Tensor, partials: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
     pre_mix: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
+    graph_rows: pl.constexpr = 0,
 ):
     """Normalize six HC matrices per worker, keeping all four rows in registers."""
-    tokens = pl.tensor.dim(pre_mix, 0)
-    padded_rows = pl.tensor.dim(inv_rms, 0)
+    if graph_rows:
+        tokens = graph_rows
+    else:
+        tokens = pl.tensor.dim(pre_mix, 0)
+    if graph_rows:
+        padded_rows = (graph_rows + LINEAR_T_TILE - 1) // LINEAR_T_TILE * LINEAR_T_TILE
+    else:
+        padded_rows = pl.tensor.dim(inv_rms, 0)
     inverse_flat = pl.reshape(inv_rms, [1, padded_rows])
     scale_flat = pl.reshape(scale, [1, 3])
     bias_flat = pl.reshape(base, [1, MIX_HC])
@@ -314,11 +321,24 @@ def hc_sinkhorn(
     return ready
 
 
+@pl.jit.inline
+def hc_sinkhorn(
+    inv_rms: pl.Tensor, partials: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
+    pre_mix: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
+):
+    return _hc_sinkhorn_with_rows(inv_rms, partials, scale, base, pre_mix, post_mix, residual_mix, 0)
+
+
 
 @pl.jit.inline
-def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.constexpr):
+def _hc_project_with_rows(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.constexpr,
+    graph_rows: pl.constexpr = 0,
+):
     """Compute FP32 inverse RMS and split-K HC projection coefficients."""
-    t_dim = pl.tensor.dim(x_hc, 0)
+    if graph_rows:
+        t_dim = graph_rows
+    else:
+        t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
 
@@ -344,22 +364,34 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
                 pl.rsqrt(rms_arg, high_precision=True), [T_TILE, 1]
             )
 
-    partials = hc_linear(x_hc, function, HF32_LINEAR_T_TILE, HF32_LINEAR_K_L0_TILE)
+    partials = _hc_linear_rows(x_hc, function, HF32_LINEAR_T_TILE, HF32_LINEAR_K_L0_TILE, graph_rows)
     return inv_rms, partials
 
 
 @pl.jit.inline
-def hc_linear(
+def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.constexpr):
+    return _hc_project_with_rows(x_hc, function, rms_worker_limit, 0)
+
+
+@pl.jit.inline
+def _hc_linear_rows(
     x_hc: pl.Tensor, function: pl.Tensor, row_tile: pl.constexpr,
     k_tile: pl.constexpr,
+    graph_rows: pl.constexpr = 0,
 ):
     """Project HC coefficients in FP32 split-K tiles."""
-    t_dim = pl.tensor.dim(x_hc, 0)
+    if graph_rows:
+        t_dim = graph_rows
+    else:
+        t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
     tasks = ((t_dim + row_tile - 1) // row_tile) * LINEAR_OK
-    workers = pl.min(tasks, pl.system.available_cluster_count())
+    if graph_rows:
+        workers = pl.min(tasks, 32)
+    else:
+        workers = pl.min(tasks, pl.system.available_cluster_count())
     for worker in pl.spmd(workers, name_hint="hc_linear"):
         for task in pl.range(worker, tasks, pl.tile.get_block_num()):
             t0 = (task // LINEAR_OK) * row_tile
@@ -395,13 +427,21 @@ def hc_linear(
     return mixes_partials
 
 
+@pl.jit.inline
+def hc_linear(
+    x_hc: pl.Tensor, function: pl.Tensor, row_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+):
+    return _hc_linear_rows(x_hc, function, row_tile, k_tile, 0)
+
+
 _NORM_ONLY = 1
 _NORM_AND_COLLAPSED = 2
 _NORM_COLLAPSED_AND_INV_RMS = 3
 
 
 @pl.jit.inline
-def _hc_collapse_rows(
+def _hc_collapse_outputs(
     x_hc: pl.Tensor,
     pre_mix: pl.Tensor,
     output: pl.Tensor,
@@ -411,9 +451,13 @@ def _hc_collapse_rows(
     worker_limit: pl.constexpr,
     row_tile: pl.constexpr,
     outputs: pl.constexpr,
+    graph_rows: pl.constexpr = 0,
 ):
     """Normalize the BF16 collapse and optionally emit the raw collapse and the FP32 input inverse RMS."""
-    tokens = pl.tensor.dim(x_hc, 0)
+    if graph_rows:
+        tokens = graph_rows
+    else:
+        tokens = pl.tensor.dim(x_hc, 0)
     if outputs == _NORM_COLLAPSED_AND_INV_RMS:
         padded = (tokens + LINEAR_T_TILE - 1) // LINEAR_T_TILE * LINEAR_T_TILE
         inv_rms = pl.create_tensor([padded, 1], dtype=pl.FP32)
@@ -495,6 +539,21 @@ def _hc_collapse_rows(
         return inv_rms
     else:
         return output
+
+
+@pl.jit.inline
+def _hc_collapse_rows(
+    x_hc: pl.Tensor,
+    pre_mix: pl.Tensor,
+    output: pl.Tensor,
+    norm_weight: pl.Tensor,
+    raw_output: pl.Tensor,
+    active_rows: pl.Scalar[pl.INDEX],
+    worker_limit: pl.constexpr,
+    row_tile: pl.constexpr,
+    outputs: pl.constexpr,
+):
+    return _hc_collapse_outputs(x_hc, pre_mix, output, norm_weight, raw_output, active_rows, worker_limit, row_tile, outputs, 0)
 
 
 @pl.jit.inline
@@ -585,20 +644,36 @@ def hc_head_norm_store(
 
 
 @pl.jit.inline(auto_scope=False)
+def hc_pre_moe_rows(
+    x_hc: pl.Tensor, pre_mix: pl.Tensor, norm_weight: pl.Tensor, output: pl.Tensor,
+    collapsed: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], function: pl.Tensor,
+    collapse_row_tile: pl.constexpr, graph_rows: pl.constexpr,
+):
+    """Collapse HC streams for routing and project their normalized coefficients."""
+    if graph_rows:
+        tokens = graph_rows
+    else:
+        tokens = pl.tensor.dim(x_hc, 0)
+    active = pl.max(pl.min(pl.cast(num_tokens, pl.INDEX), tokens), 0)
+    inv_rms = _hc_collapse_outputs(
+        x_hc, pre_mix, output, norm_weight, collapsed, active, 64, collapse_row_tile,
+        outputs=_NORM_COLLAPSED_AND_INV_RMS, graph_rows=graph_rows,
+    )
+    partials = _hc_linear_rows(
+        x_hc, function, MOE_LINEAR_T_TILE, MOE_LINEAR_K_TILE, graph_rows,
+    )
+    return inv_rms, partials
+
+
+@pl.jit.inline(auto_scope=False)
 def hc_pre_moe(
     x_hc: pl.Tensor, pre_mix: pl.Tensor, norm_weight: pl.Tensor, output: pl.Tensor,
     collapsed: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], function: pl.Tensor,
     collapse_row_tile: pl.constexpr = PRE_NORM_STORE_T_TILE,
 ):
-    """Collapse HC streams for routing and project their normalized coefficients."""
-    tokens = pl.tensor.dim(x_hc, 0)
-    active = pl.max(pl.min(pl.cast(num_tokens, pl.INDEX), tokens), 0)
-    inv_rms = _hc_collapse_rows(
-        x_hc, pre_mix, output, norm_weight, collapsed, active, 64, collapse_row_tile,
-        outputs=_NORM_COLLAPSED_AND_INV_RMS,
+    return hc_pre_moe_rows(
+        x_hc, pre_mix, norm_weight, output, collapsed, num_tokens, function, collapse_row_tile, 0,
     )
-    partials = hc_linear(x_hc, function, MOE_LINEAR_T_TILE, MOE_LINEAR_K_TILE)
-    return inv_rms, partials
 
 
 @pl.jit.inline

@@ -453,13 +453,19 @@ def _gate_project_tile(
 
 @pl.jit.inline(auto_scope=False)
 def _gate_project(xg_buf: pl.Tensor, gate_w: pl.Tensor, active_tokens: pl.Scalar[pl.INDEX],
-                  n_experts: pl.constexpr, n_tile: pl.constexpr):
+                  n_experts: pl.constexpr, n_tile: pl.constexpr,
+    graph_clusters: pl.constexpr = 0,
+):
     """Project the active token rows onto the router experts."""
     row_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
     column_tiles = (n_experts + n_tile - 1) // n_tile
     logits = pl.create_tensor([T_PAD, column_tiles * n_tile], dtype=pl.FP32)
     tasks = row_tiles * column_tiles
-    workers = pl.max(1, pl.min(tasks, pl.system.available_cluster_count()))
+    if graph_clusters:
+        launch_workers = graph_clusters
+    else:
+        launch_workers = pl.system.available_cluster_count()
+    workers = pl.max(1, pl.min(tasks, launch_workers))
     with pl.spmd(workers, name_hint="gate_project"):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, tasks, pl.tile.get_block_num()):
@@ -480,10 +486,14 @@ def _gate_project_and_select_routes(
     active_tokens: pl.Scalar[pl.INDEX],
     topk: pl.constexpr,
     n_experts: pl.constexpr,
+    graph_clusters: pl.constexpr = 0,
 ):
     """Project 128 experts per panel and merge three panel prefixes inside each row worker."""
     row_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
-    clusters = pl.system.available_cluster_count()
+    if graph_clusters:
+        clusters = graph_clusters
+    else:
+        clusters = pl.system.available_cluster_count()
     workers = pl.max(1, pl.min(row_tiles, clusters))
     with pl.spmd(workers, name_hint="gate_project_select"):
         worker = pl.tile.get_block_idx()
@@ -517,6 +527,36 @@ def _gate_project_and_select_routes(
 
 
 @pl.jit.inline
+def route_tokens_with_clusters(
+    xg_buf: pl.Tensor[[T_PAD, D], pl.BF16],
+    gate_w: pl.Tensor,
+    gate_bias: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    n_experts: pl.constexpr = N_EXPERTS,
+    topk: pl.constexpr = TOPK,
+    graph_clusters: pl.constexpr = 0,
+):
+    """Project BF16 rows and select routes from biased scores."""
+    active_tokens = pl.max(0, pl.min(pl.cast(num_tokens, pl.INDEX), T))
+    bias = pl.reshape(gate_bias, [pl.tensor.dim(gate_bias, 0) // n_experts, n_experts])
+    if n_experts > 256 and T_PAD >= 256:
+        _gate_project_and_select_routes(xg_buf, gate_w, bias, indices, weights, active_tokens, topk, n_experts, graph_clusters)
+    else:
+        # Use 16 expert columns when all projection tiles fit in one A5 wave.
+        logits = _gate_project(
+            xg_buf, gate_w, active_tokens, n_experts,
+            16 if (T_PAD // GATE_M_TILE) * ((n_experts + 15) // 16) <= 32 else GATE_N_TILE, graph_clusters,
+        )
+        indices, weights = _gate_select_routes(
+            logits, bias, indices, weights, active_tokens, topk,
+            32 if n_experts <= 32 else ((n_experts + 127) // 128) * 128, n_experts,
+        )
+    return weights
+
+
+@pl.jit.inline
 def route_tokens(
     xg_buf: pl.Tensor[[T_PAD, D], pl.BF16],
     gate_w: pl.Tensor,
@@ -528,21 +568,7 @@ def route_tokens(
     topk: pl.constexpr = TOPK,
 ):
     """Project BF16 rows and select routes from biased scores."""
-    active_tokens = pl.max(0, pl.min(pl.cast(num_tokens, pl.INDEX), T))
-    bias = pl.reshape(gate_bias, [pl.tensor.dim(gate_bias, 0) // n_experts, n_experts])
-    if n_experts > 256 and T_PAD >= 256:
-        _gate_project_and_select_routes(xg_buf, gate_w, bias, indices, weights, active_tokens, topk, n_experts)
-    else:
-        # Use 16 expert columns when all projection tiles fit in one A5 wave.
-        logits = _gate_project(
-            xg_buf, gate_w, active_tokens, n_experts,
-            16 if (T_PAD // GATE_M_TILE) * ((n_experts + 15) // 16) <= 32 else GATE_N_TILE,
-        )
-        indices, weights = _gate_select_routes(
-            logits, bias, indices, weights, active_tokens, topk,
-            32 if n_experts <= 32 else ((n_experts + 127) // 128) * 128, n_experts,
-        )
-    return weights
+    return route_tokens_with_clusters(xg_buf, gate_w, gate_bias, num_tokens, indices, weights, n_experts, topk, 0)
 
 
 @pl.jit.inline

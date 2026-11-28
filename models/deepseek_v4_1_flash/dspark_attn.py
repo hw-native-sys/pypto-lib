@@ -16,14 +16,16 @@ import torch
 
 from quant import packed_cache_compare, pack_quantized_cache, unpack_quantized_cache
 
+from decode_c1a_reuse import DECODE_LAYER_GRAPH, _decode_attention_prefix, _decode_output_projection
 from config import (
     DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN,
-    WINDOW_CACHE_BYTES,
+    BLOCK_SIZE, DECODE_MAX_TOKENS, WINDOW_CACHE_BYTES,
 )
-from hc import hc_head_norm, hc_project, hc_sinkhorn
 from o_proj import o_proj_hc_post
-from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
-from qkv_proj_rope import golden_rope_interleave
+from qkv_proj_rope import kv_proj, window_publish
+from qkv_proj_rope import (
+    KV_N_TILE, PROJ_M_TILE, WINDOW_PUBLISH_WORKER_TILE, _proj_kv_tile_pypto, golden_rope_interleave, norm_rope_publish,
+)
 from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm
 
@@ -47,6 +49,9 @@ O_LORA = FLASH.o_lora_rank
 Q_LORA = FLASH.q_lora_rank
 ROPE_DIM = FLASH.qk_rope_head_dim
 
+CONTEXT_KV_WORKER_LIMIT = 32
+CONTEXT_KV_WORKERS = min(CONTEXT_KV_WORKER_LIMIT, ((DECODE_MAX_TOKENS + PROJ_M_TILE - 1) // PROJ_M_TILE) * (HEAD_DIM // KV_N_TILE))
+CONTEXT_PUBLISH_WORKERS = min(DECODE_MAX_TOKENS, WINDOW_PUBLISH_WORKER_TILE)
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 
 # tiling
@@ -434,16 +439,34 @@ def dspark_context_kv(
     """Project shared quantized context inputs through one layer's own weights."""
     tokens = pl.tensor.dim(context_slots, 0)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj(
-        kv_input_payload, kv_input_scales,
-        wkv, wkv_scale,
-        projected, num_tokens, worker_limit=32, row_tile=80,
-    )
-    window_publish(
-        projected, kv_norm_weight, rope_cos, rope_sin,
-        context_slots, window_cache,
-        num_tokens,
-    )
+    tiles = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * (HEAD_DIM // KV_N_TILE)
+    kv_workers = pl.max(1, pl.min(tiles, pl.min(CONTEXT_KV_WORKER_LIMIT, pl.system.available_cluster_count())))
+    publish_workers = pl.max(1, pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE))
+    replay_rows = ((DECODE_MAX_TOKENS + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+    if (DECODE_LAYER_GRAPH and kv_workers == CONTEXT_KV_WORKERS and publish_workers == CONTEXT_PUBLISH_WORKERS
+            and pl.tensor.dim(kv_input_scales, 1) == replay_rows * (D // 32)):
+        cache_rows = pl.tensor.dim(window_cache, 0) * BLOCK_SIZE
+        flat_cache = pl.reshape(window_cache, [cache_rows, WINDOW_CACHE_BYTES])
+        with pl.graph("dspark_draft_context_kv"):
+            _proj_kv_tile_pypto(
+                kv_input_payload, wkv, kv_input_scales, wkv_scale, projected, num_tokens,
+                CONTEXT_KV_WORKER_LIMIT, PROJ_M_TILE, KV_N_TILE, 256, prefetch_four_panels=False, graph_rows=DECODE_MAX_TOKENS,
+            )
+            with pl.spmd(CONTEXT_PUBLISH_WORKERS, name_hint="norm_rope_pub_win"):
+                _published = norm_rope_publish(
+                    projected, kv_norm_weight, rope_cos, rope_sin, context_slots, flat_cache, num_tokens,
+                )
+    else:
+        kv_proj(
+            kv_input_payload, kv_input_scales,
+            wkv, wkv_scale,
+            projected, num_tokens, worker_limit=32, row_tile=80,
+        )
+        window_publish(
+            projected, kv_norm_weight, rope_cos, rope_sin,
+            context_slots, window_cache,
+            num_tokens,
+        )
     return window_cache
 
 
@@ -503,49 +526,34 @@ def dspark_attn(
     attention_pre_mix: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT], pl.FP32]],
     attention_hidden: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
+    static_launch: pl.constexpr,
 ):
     """Run HC pre-mix, query attention, output projection, and HC post."""
-    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
-    normalized_attention = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, normalized_attention, worker_limit=64)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
-
     post_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([MOE_TOKENS, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
-    proj_payload, proj_scales, proj_rows = qkv_quant(normalized_attention, num_tokens, row_tile=80)
-    qr = pl.create_tensor([MOE_TOKENS, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    q_proj_rope(
-        proj_payload, proj_scales,
-        wq_a, wq_a_scale, q_norm_weight,
-        wq_b, wq_b_scale,
-        rope_cos, rope_sin,
-        qr, q,
-        num_tokens, qa_worker_limit=32, qb_worker_limit=32,
-        padded_rows=proj_rows,
-        qa_row_tile=80, qb_row_tile=80,
-    )
-    kv_projection = pl.create_tensor([MOE_TOKENS, HEAD_DIM], dtype=pl.BF16)
-    kv_proj(
-        proj_payload, proj_scales,
-        wkv, wkv_scale,
-        kv_projection, num_tokens, worker_limit=32, row_tile=80,
-    )
-    window_publish(
-        kv_projection, kv_norm_weight, rope_cos, rope_sin,
-        window_slots, window_cache,
-        num_tokens,
+    if not static_launch:
+        window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
+    _decode_attention_prefix(
+        x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a,
+        wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+        window_slots, window_cache, attention_pre_mix, num_tokens, q, post_mix, residual_mix,
+        MOE_TOKENS if static_launch else 0,
     )
     attention_output = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     dspark_attention(q, window_cache, window_indices, attn_sink, attention_output, num_tokens)
 
-    o_proj_hc_post(
-        attention_output, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
-        oa_row_tile=80, ob_row_tile=128,
-    )
-
+    if static_launch:
+        _decode_output_projection(
+            attention_output, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, x_hc, post_mix,
+            residual_mix, attention_hidden, num_tokens,
+        )
+    else:
+        o_proj_hc_post(
+            attention_output, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
+            oa_row_tile=80, ob_row_tile=128,
+        )
     return attention_hidden, attention_pre_mix, window_cache
 
 
@@ -588,7 +596,7 @@ def l2_dspark_attn(
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin, window_slots, window_indices, window_cache,
         attention_pre_mix, attention_hidden,
-        num_tokens,
+        num_tokens, static_launch=False,
     )
 
 

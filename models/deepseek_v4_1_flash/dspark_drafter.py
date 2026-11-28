@@ -31,6 +31,7 @@ from expert_routed import (
 from input_pack import pack_x_hc
 from decode_moe import BALANCED_ROUTING, initialize_balanced_routes, make_decode_moe
 
+from decode_c1a_reuse import ROW_TILE, DECODE_GRAPH_CLUSTERS, DECODE_LAYER_GRAPH
 from dspark_attn import dspark_attn, dspark_context_kv
 from qkv_proj_rope import qkv_quant
 from utils import forward_replay_weight_shapes
@@ -114,6 +115,8 @@ W1_DEVICE_ROWS = MX_W1_PACKED_ROWS // PANEL_ROWS
 W2_DEVICE_ROWS = MX_W2_PACKED_ROWS // PANEL_ROWS
 W3_DEVICE_ROWS = MX_W3_PACKED_ROWS // PANEL_ROWS
 draft_moe = make_decode_moe(N_LOCAL_EXPERTS, TOPK, packed_routed_weights=PACK_ROUTED_WEIGHTS)
+DRAFT_QUERY_ROWS = C.DECODE_BATCH * DSPARK_QUERY_WIDTH
+graph_draft_moe = make_decode_moe(N_LOCAL_EXPERTS, TOPK, packed_routed_weights=PACK_ROUTED_WEIGHTS, graph_clusters=DECODE_GRAPH_CLUSTERS)
 
 
 @pl.jit.inline
@@ -609,6 +612,12 @@ def dspark_drafter(
 
     batch = pl.tensor.dim(num_sampled, 0)
     query_tokens = batch * DSPARK_QUERY_WIDTH
+    use_layer_graph = False
+    if DECODE_LAYER_GRAPH:
+        use_layer_graph = (
+            MOE_TOKENS <= ROW_TILE and query_tokens == DRAFT_QUERY_ROWS
+            and pl.system.available_cluster_count() == DECODE_GRAPH_CLUSTERS
+        )
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     if BALANCED_ROUTING:
         initialize_balanced_routes(force_topk, query_tokens, rank, N_LOCAL_EXPERTS, TOPK)
@@ -627,31 +636,58 @@ def dspark_drafter(
         x_mixed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
         attention_pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
         attention_hidden = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-        dspark_attn(
-            x_hc, pre_mix,
-            hc_attn_fn[weight_layer], hc_attn_scale[weight_layer], hc_attn_base[weight_layer], attn_norm_weight[weight_layer],
-            wq_a[weight_layer], layer_wq_a_scale, q_norm_weight[weight_layer], wq_b[weight_layer], layer_wq_b_scale,
-            wkv[weight_layer], layer_wkv_scale, kv_norm_weight[weight_layer], attn_sink[weight_layer],
-            wo_a[weight_layer], wo_a_scale[weight_layer], wo_b[weight_layer], layer_wo_b_scale,
-            rope_cos, rope_sin, padded_slots[layer], padded_indices[layer], window_cache[layer],
-            attention_pre_mix, attention_hidden,
-            query_tokens,
-        )
-
-        draft_moe(
-            attention_hidden, attention_pre_mix,
-            hc_ffn_fn[weight_layer], hc_ffn_scale[weight_layer], hc_ffn_base[weight_layer],
-            ffn_norm_weight[weight_layer],
-            gate_weight[weight_layer], correction_bias[weight_layer],
-            routed_w1[weight_layer], layer_routed_w1_scale,
-            routed_w2[weight_layer], layer_routed_w2_scale,
-            routed_w3[weight_layer], layer_routed_w3_scale,
-            shared_w1[weight_layer], layer_shared_w1_scale,
-            shared_w2[weight_layer], layer_shared_w2_scale,
-            shared_w3[weight_layer], layer_shared_w3_scale,
-            pre_mix, x_mixed, x_hc,
-            moe_workspace, query_tokens, force_topk,
-        )
+        if use_layer_graph:
+            draft_layer_window = window_cache[layer]
+            with pl.graph("dspark_draft_layer"):
+                dspark_attn(
+                    x_hc, pre_mix,
+                    hc_attn_fn[weight_layer], hc_attn_scale[weight_layer], hc_attn_base[weight_layer], attn_norm_weight[weight_layer],
+                    wq_a[weight_layer], layer_wq_a_scale, q_norm_weight[weight_layer], wq_b[weight_layer], layer_wq_b_scale,
+                    wkv[weight_layer], layer_wkv_scale, kv_norm_weight[weight_layer], attn_sink[weight_layer],
+                    wo_a[weight_layer], wo_a_scale[weight_layer], wo_b[weight_layer], layer_wo_b_scale,
+                    rope_cos, rope_sin, padded_slots[layer], padded_indices[layer], draft_layer_window,
+                    attention_pre_mix, attention_hidden,
+                    pl.cast(DRAFT_QUERY_ROWS, pl.INT32), static_launch=True,
+                )
+                graph_draft_moe(
+                    attention_hidden, attention_pre_mix,
+                    hc_ffn_fn[weight_layer], hc_ffn_scale[weight_layer], hc_ffn_base[weight_layer],
+                    ffn_norm_weight[weight_layer],
+                    gate_weight[weight_layer], correction_bias[weight_layer],
+                    routed_w1[weight_layer], layer_routed_w1_scale,
+                    routed_w2[weight_layer], layer_routed_w2_scale,
+                    routed_w3[weight_layer], layer_routed_w3_scale,
+                    shared_w1[weight_layer], layer_shared_w1_scale,
+                    shared_w2[weight_layer], layer_shared_w2_scale,
+                    shared_w3[weight_layer], layer_shared_w3_scale,
+                    pre_mix, x_mixed, x_hc,
+                    moe_workspace, pl.cast(DRAFT_QUERY_ROWS, pl.INT32), force_topk,
+                )
+        else:
+            dspark_attn(
+                x_hc, pre_mix,
+                hc_attn_fn[weight_layer], hc_attn_scale[weight_layer], hc_attn_base[weight_layer], attn_norm_weight[weight_layer],
+                wq_a[weight_layer], layer_wq_a_scale, q_norm_weight[weight_layer], wq_b[weight_layer], layer_wq_b_scale,
+                wkv[weight_layer], layer_wkv_scale, kv_norm_weight[weight_layer], attn_sink[weight_layer],
+                wo_a[weight_layer], wo_a_scale[weight_layer], wo_b[weight_layer], layer_wo_b_scale,
+                rope_cos, rope_sin, padded_slots[layer], padded_indices[layer], window_cache[layer],
+                attention_pre_mix, attention_hidden,
+                query_tokens, static_launch=False,
+            )
+            draft_moe(
+                attention_hidden, attention_pre_mix,
+                hc_ffn_fn[weight_layer], hc_ffn_scale[weight_layer], hc_ffn_base[weight_layer],
+                ffn_norm_weight[weight_layer],
+                gate_weight[weight_layer], correction_bias[weight_layer],
+                routed_w1[weight_layer], layer_routed_w1_scale,
+                routed_w2[weight_layer], layer_routed_w2_scale,
+                routed_w3[weight_layer], layer_routed_w3_scale,
+                shared_w1[weight_layer], layer_shared_w1_scale,
+                shared_w2[weight_layer], layer_shared_w2_scale,
+                shared_w3[weight_layer], layer_shared_w3_scale,
+                pre_mix, x_mixed, x_hc,
+                moe_workspace, query_tokens, force_topk,
+            )
 
 
 @pl.jit(auto_scope=False)

@@ -9,6 +9,8 @@
 # ci: no-sim
 """C1A reuse decode attention with HC."""
 
+import os
+
 from quant import packed_cache_compare
 
 import pypto.language as pl
@@ -16,14 +18,22 @@ import pypto.language as pl
 
 from config import CACHE_ROWS_DYN
 from config import (
-    FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, WINDOW_CACHE_BYTES,
+    FLASH as M, CMP_BLOCKS_DYN, MOE_TOKENS, ORI_BLOCKS_DYN, T_DYN, WINDOW_CACHE_BYTES,
     COMPRESSED_CACHE_BYTES,
 )
-from hc import hc_head_norm, hc_project, hc_sinkhorn
-from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
-from o_proj import o_proj_hc_post
-from sparse_attention import gather_sparse_attention
-
+from hc import (
+    PRE_NORM_T_TILE, _NORM_ONLY, _hc_collapse_outputs, _hc_project_with_rows,
+    _hc_sinkhorn_with_rows,
+)
+from o_proj import (
+    O_B_N_TILE, O_QUANT_HEADS, O_QUANT_ROW_TILE,
+    _quant_o_vf_schedule, o_proj_a_pypto, o_proj_b_hc_post, o_proj_hc_post,
+)
+from qkv_proj_rope import (
+    _kv_proj_with_rows, _q_proj_rope_with_rows, _qkv_quant_with_rows,
+    window_publish,
+)
+from sparse_attention import _submit_sparse_attention, gather_sparse_attention
 
 
 # model config
@@ -40,6 +50,11 @@ HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
 MIX_HC = M.mix_hc
 INDEX_TOPK = M.index_topk
+ROW_TILE = 80
+DECODE_GRAPH_CLUSTERS = 32
+DECODE_LAYER_GRAPH = os.environ.get("PYPTO_LIB_A5_RUNTIME", "host_build_graph") == "host_build_graph"
+OB_ROW_TILE = 128
+OB_WORKERS = (D + O_B_N_TILE - 1) // O_B_N_TILE
 
 
 @pl.jit.inline(auto_scope=False)
@@ -74,19 +89,61 @@ def decode_c1a_reuse(
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    tokens = pl.tensor.dim(x_hc, 0)
+    """Run C1A reuse with shape-dependent scheduling."""
+    return _decode_c1a_reuse(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
+        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+        kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin, window_slots, window_indices, window_cache,
+        compressed_cache, compressed_indices, output, next_pre_mix, num_tokens,
+        graph_rows=0, compressed_keys=INDEX_TOPK, attention_workers=0, attention_balanced=0,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def _decode_attention_prefix(
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    query: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    graph_rows: pl.constexpr,
+):
+    """Run HC and QKV/window publication; return normalized input and QB activations."""
+    if graph_rows:
+        tokens = graph_rows
+    else:
+        tokens = pl.tensor.dim(x_hc, 0)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm, worker_limit=64)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
-    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    x_norm = _hc_collapse_outputs(
+        x_hc, pre_mix, x_norm, attn_norm_weight, x_norm, tokens, 64, PRE_NORM_T_TILE,
+        outputs=_NORM_ONLY, graph_rows=graph_rows,
+    )
+    inv_rms, partials = _hc_project_with_rows(x_hc, hc_attn_fn, rms_worker_limit=64, graph_rows=graph_rows)
+    _hc_sinkhorn_with_rows(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, graph_rows)
 
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = qkv_quant(x_norm, num_tokens, row_tile=80)
-    q_proj_rope(
+    proj_payload, proj_scales, proj_payload_padded_rows = _qkv_quant_with_rows(x_norm, num_tokens, row_tile=80, graph_rows=graph_rows)
+    qb_payload, qb_scales = _q_proj_rope_with_rows(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -94,28 +151,167 @@ def decode_c1a_reuse(
         qr, query,
         num_tokens, qa_worker_limit=32, qb_worker_limit=32,
         padded_rows=proj_payload_padded_rows,
-        qa_row_tile=80, qb_row_tile=80,
+        qa_row_tile=80, qb_row_tile=80, graph_rows=graph_rows,
     )
-    kv_proj(
+    kv_projection = _kv_proj_with_rows(
         proj_payload, proj_scales,
         wkv, wkv_scale,
-        kv_projection, num_tokens, worker_limit=32, row_tile=80,
+        kv_projection, num_tokens, worker_limit=32, row_tile=80, graph_rows=graph_rows,
     )
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache,
         num_tokens,
     )
+    return x_norm, qb_payload, qb_scales
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _decode_output_projection(
+    attn_out: pl.Tensor,
+    wo_a: pl.Tensor,
+    wo_a_scale: pl.Tensor,
+    wo_b: pl.Tensor,
+    wo_b_scale: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    payload_all = pl.create_tensor([LOCAL_O_GROUPS * ROW_TILE, O_GROUP_IN], dtype=pl.FP8E4M3FN)
+    scales_all = pl.create_tensor([LOCAL_O_GROUPS, ROW_TILE * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
+    payload = pl.create_tensor([ROW_TILE, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
+    activation_scale = pl.create_tensor([1, ROW_TILE * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
+    _quant_o_vf_schedule(
+        O_QUANT_ROW_TILE, 0, attn_out, rope_cos, rope_sin, payload_all, scales_all,
+        num_tokens, ROW_TILE, fixed_workers=O_QUANT_HEADS,
+    )
+    o_proj_a_pypto(
+        payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
+        LOCAL_O_WIDTH, num_tokens, ROW_TILE, ROW_TILE,
+    )
+    o_proj_b_hc_post(
+        payload, wo_b, activation_scale, wo_b_scale, residual, post_mix, residual_mix,
+        output, MOE_TOKENS, OB_ROW_TILE, OB_WORKERS,
+    )
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _attention_output_graph(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    sink: pl.Tensor,
+    active_output: pl.Tensor,
+    attn_out: pl.Tensor,
+    wo_a: pl.Tensor,
+    wo_a_scale: pl.Tensor,
+    wo_b: pl.Tensor,
+    wo_b_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    workers: pl.constexpr,
+    balanced: pl.constexpr,
+    compressed_keys: pl.constexpr,
+):
+    # Own the buffers in the enclosing HBG scope. The graph can then bind
+    # their original, packed tensor descriptors on each invocation.
+    slots = 1
+    if balanced:
+        slots = 2 * workers
+    scratch_size = slots * 64 * (HEAD_DIM + 2) + 2 * workers
+    scratch = pl.create_tensor([scratch_size], dtype=pl.FP32)
+    _submit_sparse_attention(
+        query, window_indices, window, compressed_indices, compressed, sink, active_output,
+        scratch, scratch_size, num_tokens, workers, balanced, compressed_keys=compressed_keys, plan_pool=0,
+    )
+    _decode_output_projection(
+        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, residual, post_mix,
+        residual_mix, output, num_tokens,
+    )
+
+@pl.jit.inline(auto_scope=False)
+def _decode_c1a_reuse(
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    graph_rows: pl.constexpr,
+    compressed_keys: pl.constexpr,
+    attention_workers: pl.constexpr,
+    attention_balanced: pl.constexpr,
+):
+    if graph_rows:
+        tokens = graph_rows
+    else:
+        tokens = pl.tensor.dim(x_hc, 0)
+    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
+    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
+    query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    _decode_attention_prefix(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale,
+        q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+        window_slots, window_cache, next_pre_mix, num_tokens, query, post_mix, residual_mix, graph_rows,
+    )
     attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    gather_sparse_attention(
-        query, window_indices, window_cache, compressed_indices, compressed_cache,
-        attn_sink, attn_out, num_tokens, compressed_keys=INDEX_TOPK,
-    )
-    o_proj_hc_post(
-        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        x_hc, post_mix, residual_mix, output, num_tokens,
-        oa_row_tile=80, ob_row_tile=128,
-    )
+    if graph_rows:
+        query_rows = query[:num_tokens, :]
+        output_rows = attn_out[:num_tokens, :]
+        window_rows = window_indices[:num_tokens, :]
+        compressed_rows = compressed_indices[:num_tokens, :]
+        _attention_output_graph(
+            query_rows, window_rows, window_cache, compressed_rows, compressed_cache,
+            attn_sink, output_rows, attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            x_hc, post_mix, residual_mix, output, num_tokens,
+            workers=attention_workers, balanced=attention_balanced, compressed_keys=compressed_keys,
+        )
+    else:
+        gather_sparse_attention(
+            query, window_indices, window_cache, compressed_indices, compressed_cache,
+            attn_sink, attn_out, num_tokens, compressed_keys=compressed_keys,
+        )
+        o_proj_hc_post(
+            attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            x_hc, post_mix, residual_mix, output, num_tokens,
+            oa_row_tile=80, ob_row_tile=128,
+        )
     return output
 
 

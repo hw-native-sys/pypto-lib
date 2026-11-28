@@ -46,7 +46,7 @@ if N_LOCAL_EXPERTS <= 0 or not config.FLASH.num_experts_per_tok <= _test_experts
 
 
 from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, T_DYN
-from gate import gate, route_tokens
+from gate import gate, route_tokens_with_clusters
 from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
 from mega_moe import (
     FP4_PANEL_ROWS, forward_routed_weight_spec,
@@ -56,7 +56,10 @@ from expert_routed import (
     ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
 )
-from hc import PRE_NORM_STORE_T_TILE, hc_pre_moe, hc_sinkhorn, hc_post
+from hc import (
+    PRE_NORM_STORE_T_TILE, _hc_sinkhorn_with_rows, hc_post,
+    hc_pre_moe, hc_pre_moe_rows, hc_sinkhorn,
+)
 
 
 # model config
@@ -335,8 +338,9 @@ def split_moe(
     return x_next
 
 
-def make_decode_moe(local_experts, topk, packed_routed_weights=False):
+def make_decode_moe(local_experts, topk, packed_routed_weights=False, *, graph_clusters=0):
     """Wire HC and routing to the fused experts specialized for this entry."""
+    graph_rows = MOE_TOKENS if graph_clusters else 0
     # On the four-local-expert EP8 drafter, six rows of HC collapse share each AIV tile.
     collapse_row_tile = 6 if (EP_SIZE, MOE_TOKENS, topk, local_experts) == (8, 384, 3, 4) else PRE_NORM_STORE_T_TILE
     # Larger decode capacities use the independently scheduled HC post.
@@ -347,7 +351,9 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
     else:
         publish_input = None
         fused_hc = None
-        fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights, separate_input=True)
+        fused_experts = specialize_mega_moe(
+            local_experts, topk, packed_routed_weights, separate_input=True,
+        )
 
     @pl.jit.inline(auto_scope=False)
     def moe(
@@ -383,18 +389,20 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
         post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
         residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
         x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
-        inv_rms, partials = hc_pre_moe(
-            x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn, collapse_row_tile,
+        inv_rms, partials = hc_pre_moe_rows(
+            x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn, collapse_row_tile, graph_rows,
         )
-        hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+        _hc_sinkhorn_with_rows(
+            inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix, graph_rows,
+        )
 
         # MoE transport and routed-result scope.
         with pl.scope():
             indices = pl.create_tensor([MOE_TOKENS, topk], dtype=pl.INT32)
             weights = pl.create_tensor([t, topk], dtype=pl.FP32)
-            route_tokens(
+            route_tokens_with_clusters(
                 x_norm, gate_weight, correction_bias, num_tokens,
-                indices, weights, n_experts=EP_SIZE * local_experts, topk=topk,
+                indices, weights, n_experts=EP_SIZE * local_experts, topk=topk, graph_clusters=graph_clusters,
             )
             if BALANCED_ROUTING:
                 dispatch_indices = force_topk
@@ -403,9 +411,15 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
 
             sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
             if fuse_hc_post:
-                with pl.spmd(pl.system.available_aiv_count(), name_hint="moe_publish_input"):
+                if graph_clusters:
+                    publish_workers = 2 * graph_clusters
+                    moe_workers = graph_clusters
+                else:
+                    publish_workers = pl.system.available_aiv_count()
+                    moe_workers = pl.system.available_cluster_count()
+                with pl.spmd(publish_workers, name_hint="moe_publish_input"):
                     publish_input(x_norm, sublayer, moe_workspace, num_tokens)
-                with pl.spmd(pl.system.available_cluster_count(), sync_start=True, name_hint="moe_fused"):
+                with pl.spmd(moe_workers, sync_start=True, name_hint="moe_fused"):
                     sublayer, moe_workspace, x_next = fused_hc(
                         dispatch_indices, x_norm, weights,
                         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
