@@ -51,34 +51,42 @@ PTO_INTERNAL void load_angles(Angles& a) {
 
 // A producer emits 64 BF16 values (two MX groups). Use the rounded values
 // for both the data and the maxima; rotating the FP32 accumulator changes ties.
-PTO_INTERNAL void finish_fragment(RegTensor<bfloat16_t>& rounded, Angles& a,
-                                   uint32_t row, uint32_t col, uint32_t channel) {
+PTO_INTERNAL void rotate_tail(RegTensor<bfloat16_t>& rounded, Angles& a) {
     MaskReg full = pset_b32(PAT_ALL);
     uint32_t count = 32;
-    MaskReg lower = plt_b32(count, POST_UPDATE), upper;
-    pnot(upper, lower, full);
-    if (channel == 1 && col == ChannelWidth - 64) {
-        RegTensor<float> value, even, odd, real, imag, cross, unused;
-        vcvt(value, rounded, full, PART_EVEN);
-        vdintlv(even, odd, value, value);
-        vmul(real, even, a.cosine, lower, MODE_ZEROING);
-        vmul(cross, odd, a.sine, lower, MODE_ZEROING);
-        vadd(real, real, cross, lower, MODE_ZEROING);
-        vmul(imag, odd, a.cosine, lower, MODE_ZEROING);
-        vmul(cross, even, a.sine, lower, MODE_ZEROING);
-        vsub(imag, imag, cross, lower);
-        vintlv(value, unused, real, imag);
-        vcvt(rounded, value, full, ROUND_R, RS_DISABLE, PART_EVEN);
-    }
-    RegTensor<uint32_t> magnitude, signless, lo, hi;
-    vdup(signless, uint32_t(0x7fff), full, MODE_ZEROING);
-    vand(magnitude, (RegTensor<uint32_t>&)rounded, signless, full);
-    vcmax(lo, magnitude, lower, MODE_ZEROING);
-    vcmax(hi, magnitude, upper, MODE_ZEROING);
-    auto maxima = (__ubuf__ uint16_t*)(MaxUb + channel * MaxChannelBytes);
-    uint32_t group = row * CodesPerChannel + col / 32;
-    vsts((vector_u16&)lo, maxima, group, ONEPT_B16, pset_b16(PAT_ALL));
-    vsts((vector_u16&)hi, maxima, group + 1, ONEPT_B16, pset_b16(PAT_ALL));
+    MaskReg lower = plt_b32(count, POST_UPDATE);
+    RegTensor<float> value, even, odd, real, imag, cross, unused;
+    vcvt(value, rounded, full, PART_EVEN);
+    vdintlv(even, odd, value, value);
+    vmul(real, even, a.cosine, lower, MODE_ZEROING);
+    vmul(cross, odd, a.sine, lower, MODE_ZEROING);
+    vadd(real, real, cross, lower, MODE_ZEROING);
+    vmul(imag, odd, a.cosine, lower, MODE_ZEROING);
+    vmul(cross, even, a.sine, lower, MODE_ZEROING);
+    vsub(imag, imag, cross, lower);
+    vintlv(value, unused, real, imag);
+    vcvt(rounded, value, full, ROUND_R, RS_DISABLE, PART_EVEN);
+}
+
+// Four 64-lane BF16 conversion results hold one 256-element channel.
+// Pack their even halfwords before the unsigned per-32 reduction.
+PTO_INTERNAL void publish_maxima(RegTensor<bfloat16_t>& a, RegTensor<bfloat16_t>& b,
+                                 RegTensor<bfloat16_t>& c, RegTensor<bfloat16_t>& d,
+                                 uint32_t row, uint32_t channel) {
+    RegTensor<uint16_t> ab, cd, discard, evens, odds, magnitude, group, signless;
+    MaskReg full = pset_b16(PAT_ALL);
+    vdintlv(ab, discard, (vector_u16&)a, (vector_u16&)b);
+    vdintlv(cd, discard, (vector_u16&)c, (vector_u16&)d);
+    vdintlv(evens, odds, ab, cd);
+    vdup(signless, uint16_t(0x7fff), full, MODE_ZEROING);
+    vand(evens, evens, signless, full);
+    vand(odds, odds, signless, full);
+    vmax(magnitude, evens, odds, full, MODE_ZEROING);
+    vcgmax(group, magnitude, full, MODE_ZEROING);
+    auto dst = (__ubuf__ uint16_t*)(MaxUb + channel * MaxChannelBytes) + row * CodesPerChannel;
+    vector_align align;
+    vstus(align, CodesPerChannel, group, dst, POST_UPDATE);
+    vstas(align, dst, 0, POST_UPDATE);
 }
 
 // Reuse PTO's OCP exponent/reciprocal calculation. Pack each head once;

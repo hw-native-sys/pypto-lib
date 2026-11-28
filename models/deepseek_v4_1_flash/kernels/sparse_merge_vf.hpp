@@ -68,6 +68,17 @@ __tf__ __aicore__ inline void merge_factors(
     }
 }
 
+PTO_INTERNAL void rounded_merge(RegTensor<bfloat16_t>& rounded, __ubuf__ float* left, __ubuf__ float* right,
+                                uint32_t offset, RegTensor<float>& alpha, RegTensor<float>& beta, MaskReg& all) {
+    RegTensor<float> x, y;
+    vlds(x, left, offset, NORM);
+    vlds(y, right, offset, NORM);
+    vmul(x, x, alpha, all, MODE_ZEROING);
+    vmul(y, y, beta, all, MODE_ZEROING);
+    vadd(x, x, y, all, MODE_ZEROING);
+    vcvt(rounded, x, all, ROUND_R, RS_DISABLE, PART_EVEN);
+}
+
 __tf__ __aicore__ inline void merge_values(
     Result::TileDType __out__ result, Values::TileDType __in__ left, Values::TileDType __in__ right,
     State::TileDType __in__ left_weight, State::TileDType __in__ right_weight) {
@@ -86,20 +97,30 @@ __tf__ __aicore__ inline void merge_values(
             RegTensor<float> alpha, beta;
             vlds(alpha, wa, row, BRC_B32);
             vlds(beta, wb, row, BRC_B32);
-            for (uint16_t col = 0; col < DIM; col += 64) {
-                RegTensor<float> x, y;
-                RegTensor<bfloat16_t> out;
-                vlds(x, a, row * DIM + col, NORM);
-                vlds(y, b, row * DIM + col, NORM);
-                vmul(x, x, alpha, all, MODE_ZEROING);
-                vmul(y, y, beta, all, MODE_ZEROING);
-                vadd(x, x, y, all, MODE_ZEROING);
-                vcvt(out, x, all, ROUND_R, RS_DISABLE, PART_EVEN);
 #if defined(SPARSE_GATHER_MXFP8)
-                sparse_quant::finish_fragment(out, angles, row, col % 256, col / 256);
-#endif
+            for (uint16_t band = 0; band < DIM / 256; ++band) {
+                RegTensor<bfloat16_t> a0, a1, a2, a3;
+#pragma unroll
+                for (uint16_t piece = 0; piece < 4; ++piece) {
+                    const uint16_t col = band * 256 + piece * 64;
+                    RegTensor<bfloat16_t> out;
+                    rounded_merge(out, a, b, row * DIM + col, alpha, beta, all);
+                    if (band == 1 && piece == 3) sparse_quant::rotate_tail(out, angles);
+                    if (piece == 0) a0 = out;
+                    if (piece == 1) a1 = out;
+                    if (piece == 2) a2 = out;
+                    if (piece == 3) a3 = out;
+                    vsts(out, dst, row * DIM + col, PK_B32, all);
+                }
+                sparse_quant::publish_maxima(a0, a1, a2, a3, row, band);
+            }
+#else
+            for (uint16_t col = 0; col < DIM; col += 64) {
+                RegTensor<bfloat16_t> out;
+                rounded_merge(out, a, b, row * DIM + col, alpha, beta, all);
                 vsts(out, dst, row * DIM + col, PK_B32, all);
             }
+#endif
         }
     }
 }
