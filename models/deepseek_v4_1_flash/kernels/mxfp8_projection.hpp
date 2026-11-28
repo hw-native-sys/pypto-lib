@@ -18,7 +18,6 @@ namespace mxfp8_projection {
 
 using namespace pto;
 
-constexpr int L1_BUFFERS = 4;
 constexpr int L0_BUFFERS = 2;
 template <int K, int NT, int MT>
 constexpr int L1Slots = (MT + NT) * (512 + K / 32) <= 262144 ? 4 : 2;
@@ -151,29 +150,6 @@ __aicore__ inline void project_emit(
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
     emit(acc);
     pipe_barrier(PIPE_ALL);
-}
-
-template <int NT, int MT = 80>
-struct StoreOutput {
-    __gm__ bfloat16_t* output;
-    int rows, output_width, n;
-
-    __aicore__ inline void operator()(AC<NT, MT>& acc) {
-        acc.SetValidRow(rows);
-        using OutShape = TileShape2D<bfloat16_t, DYNAMIC, NT, Layout::ND>;
-        using OutStride = BaseShape2D<bfloat16_t, DYNAMIC, DYNAMIC, Layout::ND>;
-        GlobalTensor<bfloat16_t, OutShape, OutStride, Layout::ND> cg(
-            output + n, OutShape(rows, NT), OutStride(rows, output_width));
-        TSTORE(cg, acc);
-    }
-};
-
-template <int K, int N, int NT = 256, int MT = 80, bool WeightNZ = true, int InnerK = 128>
-__aicore__ inline void project(
-    __gm__ F* a, __gm__ F* b, __gm__ S* a_scale, __gm__ S* b_scale,
-    __gm__ bfloat16_t* output, int rows, int output_width, int n) {
-    StoreOutput<NT, MT> emit{output, rows, output_width, n};
-    project_emit<K, N, NT, MT, StoreOutput<NT, MT>, WeightNZ, InnerK>(a, b, a_scale, b_scale, n, emit);
 }
 
 }  // namespace mxfp8_projection
