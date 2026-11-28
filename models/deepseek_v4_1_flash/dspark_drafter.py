@@ -593,6 +593,67 @@ def dspark_drafter(
             context_tokens,
         )
 
+    dspark_query(
+        num_sampled, anchor_ids, first_query_positions, block_tables, query_rope_cos, query_rope_sin,
+        embedding_weight, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale,
+        q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b,
+        wo_b_scale, window_cache, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_weight, gate_weight,
+        correction_bias, routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
+        shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale, draft_x_hc,
+        draft_pre_mix, moe_workspace, rank,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def dspark_query(
+    num_sampled: pl.Tensor[[B_DYN], pl.INT32],
+    anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
+    first_query_positions: pl.Tensor[[B_DYN], pl.INT32],
+    block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, B_DYN, TABLE_DYN], pl.INT32],
+    query_rope_cos: pl.Tensor[[DSPARK_QUERY_T_DYN, ROPE_DIM // 2], pl.FP32],
+    query_rope_sin: pl.Tensor[[DSPARK_QUERY_T_DYN, ROPE_DIM // 2], pl.FP32],
+    embedding_weight: pl.Tensor[[VOCAB, D], pl.BF16],
+    hc_attn_fn: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D], pl.BF16],
+    wq_a: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D // MX_GROUP, Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // MX_GROUP, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
+    window_cache: pl.InOut[pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    hc_ffn_fn: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D], pl.BF16],
+    gate_weight: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w1_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w2_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w3_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
+    shared_w2: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, MOE_INTER // MX_GROUP, D], pl.FP8E8M0],
+    shared_w3: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[DRAFT_WEIGHT_BANK_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
+    draft_x_hc: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
+    draft_pre_mix: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT], pl.FP32]],
+    moe_workspace: pld.DistributedTensor,
+    rank: pl.Scalar[pl.INT32],
+):
     # MOE_TOKENS must cover batch * DSPARK_QUERY_WIDTH query rows.
     padded_ids = pl.create_tensor([MOE_TOKENS], dtype=pl.INT64)
     padded_slots = pl.create_tensor([DSPARK_DRAFT_LAYERS, MOE_TOKENS], dtype=pl.INT64)
@@ -854,8 +915,112 @@ def l3_dspark_drafter(
         )
 
 
-def build_drafter_specs():
-    """One request on every DP rank, with nonzero embeddings and two context writes."""
+@pl.jit.inline(auto_scope=False)
+def dspark_context_kv_banked(
+    target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
+    main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
+    main_norm_weight: pl.Tensor[[D], pl.BF16],
+    num_tokens: pl.Tensor[[1], pl.INT32],
+    context_slots: pl.Tensor[[DSPARK_DRAFT_LAYERS, T_DYN], pl.INT64],
+    context_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    context_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    wkv: pl.Tensor,
+    wkv_scale: pl.Tensor,
+    kv_norm_weight: pl.Tensor,
+    window_cache: pl.InOut[pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN,
+                                       BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    weight_bank_size: pl.constexpr,
+):
+    target_hidden.bind_dynamic(0, T_DYN)
+    context_slots.bind_dynamic(1, T_DYN)
+    context_rope_cos.bind_dynamic(0, T_DYN)
+    context_rope_sin.bind_dynamic(0, T_DYN)
+    if pl.read(num_tokens, [0]) > 0:
+        context_tokens = pl.tensor.dim(target_hidden, 0)
+        projected = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
+        main_x = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
+        dspark_proj(target_hidden, main_proj_weight, main_proj_scale, projected, context_tokens)
+        rms_norm(projected, main_norm_weight, main_x, context_tokens, width=D, zero_tail=False)
+        payload, scales, _ = qkv_quant(main_x, context_tokens, row_tile=80)
+        for layer in pl.range(DSPARK_DRAFT_LAYERS):
+            weight_layer = layer % weight_bank_size
+            layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[weight_layer]
+            dspark_context_kv(
+                payload, scales, wkv[weight_layer], layer_wkv_scale, kv_norm_weight[weight_layer],
+                context_rope_cos, context_rope_sin, context_slots[layer],
+                window_cache[layer], context_tokens,
+            )
+
+
+def _dspark_prefill_context_kv_rank(
+    target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
+    main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
+    main_norm_weight: pl.Tensor[[D], pl.BF16],
+    num_tokens: pl.Tensor[[1], pl.INT32],
+    context_slots: pl.Tensor[[DSPARK_DRAFT_LAYERS, T_DYN], pl.INT64],
+    context_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    context_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    wkv: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, HEAD_DIM], pl.BF16],
+    window_cache: pl.InOut[pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN,
+                                       BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+):
+    dspark_context_kv_banked(
+        target_hidden, main_proj_weight, main_proj_scale, main_norm_weight, num_tokens, context_slots,
+        context_rope_cos, context_rope_sin, wkv, wkv_scale, kv_norm_weight, window_cache,
+        DSPARK_DRAFT_LAYERS,
+    )
+
+
+dspark_prefill_context_kv_rank = pl.jit.inline(auto_scope=False)(
+    _dspark_prefill_context_kv_rank
+)
+l2_dspark_prefill_context_kv_rank = pl.jit(auto_scope=False)(
+    _dspark_prefill_context_kv_rank
+)
+
+
+@pl.jit.host
+def l3_dspark_prefill_context_kv(
+    target_hidden: pl.Tensor[[C.EP_SIZE, T_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[C.EP_SIZE, MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_scale: pl.Tensor[[C.EP_SIZE, MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
+    main_norm_weight: pl.Tensor[[C.EP_SIZE, D], pl.BF16],
+    num_tokens: pl.Tensor[[C.EP_SIZE, 1], pl.INT32],
+    context_slots: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, T_DYN], pl.INT64],
+    context_rope_cos: pl.Tensor[[C.EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    context_rope_sin: pl.Tensor[[C.EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    wkv: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, HEAD_DIM], pl.BF16],
+    window_cache: pl.InOut[pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN,
+                                       BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+):
+    """Write draft context KV from target hidden taps without running the drafter.
+
+    This is the Lib-owned composite used by the prefill migration.  It keeps
+    projection, normalization and all three context writes in one L3 boundary,
+    leaving Serving responsible only for slots, RoPE tables and buffers.
+    """
+    target_hidden.bind_dynamic(1, T_DYN)
+    context_slots.bind_dynamic(2, T_DYN)
+    context_rope_cos.bind_dynamic(1, T_DYN)
+    context_rope_sin.bind_dynamic(1, T_DYN)
+    window_cache.bind_dynamic(2, C.ORI_BLOCKS_DYN)
+    for rank in pl.range(EP_SIZE):
+        l2_dspark_prefill_context_kv_rank(
+            target_hidden[rank], main_proj_weight[rank], main_proj_scale[rank],
+            main_norm_weight[rank], num_tokens[rank], context_slots[rank],
+            context_rope_cos[rank], context_rope_sin[rank], wkv[rank],
+            wkv_scale[rank], kv_norm_weight[rank], window_cache[rank], device=rank,
+        )
+
+
+def build_drafter_specs(entry=l3_dspark_drafter):
+    """Build bounded inputs for the drafter and context-KV validation entries."""
     from golden import ScalarSpec
     from pypto.ir.param_info import block_nz_shape
 
@@ -899,7 +1064,7 @@ def build_drafter_specs():
         return initial_values.get(name)
 
     specs = []
-    for parameter in inspect.signature(l3_dspark_drafter._func).parameters.values():
+    for parameter in inspect.signature(entry._func).parameters.values():
         annotation = parameter.annotation
         if hasattr(annotation, "shape"):
             shape = [size if isinstance(size, int) else dynamic_sizes[size.name] for size in annotation.shape]
@@ -914,6 +1079,44 @@ def build_drafter_specs():
         else:
             specs.append(ScalarSpec(parameter.name, torch.int32, 1, compile_runtime=True))
     return specs
+
+
+def build_context_kv_specs():
+    specs = build_drafter_specs(l3_dspark_prefill_context_kv)
+    params = {spec.name: spec for spec in specs}
+    rows = params["target_hidden"].shape[1]
+    counts = torch.arange(EP_SIZE, dtype=torch.int32) % rows + 1
+    if EP_SIZE > 1:
+        counts[-1] = 0
+    params["num_tokens"].init_value = counts[:, None]
+    signs = 1 - 2 * ((torch.arange(EP_SIZE)[:, None] + torch.arange(rows)) % 2)
+    hidden = signs[:, :, None].expand(-1, -1, MAIN_IN)
+    params["target_hidden"].init_value = hidden.to(torch.bfloat16).contiguous()
+    for name in ("main_proj_weight", "wkv", "kv_norm_weight"):
+        params[name].init_value = 1
+    slots = torch.full(params["context_slots"].shape, -1, dtype=torch.int64)
+    for rank, count in enumerate(counts.tolist()):
+        # Keep valid addresses on the idle rank to exercise the num_tokens guard.
+        mapped = count or rows
+        for layer in range(DSPARK_DRAFT_LAYERS):
+            slots[rank, layer, :mapped] = layer + DSPARK_DRAFT_LAYERS * torch.arange(mapped)
+    params["context_slots"].init_value = slots
+    params["window_cache"].init_value = 71
+    return specs
+
+
+def golden_context_kv(values):
+    from quant import pack_quantized_cache, quantize_mxfp8_cache
+
+    cache = values["window_cache"]
+    for rank, count in enumerate(values["num_tokens"].flatten().tolist()):
+        if count:
+            # All-one projections and unit RMS weights preserve each constant row's sign.
+            rows = values["target_hidden"][rank, :count, :1].expand(-1, HEAD_DIM)
+            packed = pack_quantized_cache(*quantize_mxfp8_cache(rows))
+            for layer in range(DSPARK_DRAFT_LAYERS):
+                slots = values["context_slots"][rank, layer, :count]
+                cache[rank, layer].view(-1, WINDOW_CACHE_BYTES)[slots] = packed
 
 
 if __name__ == "__main__":
@@ -937,20 +1140,27 @@ if __name__ == "__main__":
     if len(devices) != EP_SIZE:
         parser.error(f"drafter needs {EP_SIZE} devices")
 
-    result = run(
-        a5_default_runtime="host_build_graph",
-        fn=l3_dspark_drafter,
-        specs=build_drafter_specs(),
-        golden_fn=None,
-        config={
-            "backend_type": args.platform,
-            "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
-            "execution_mode": False,
-            "ring_heap": (2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2),
-        },
-        compile_only=args.compile_only,
-        runtime_dir=args.runtime_dir,
-    )
-    print(result)
-    if not result.passed:
-        raise SystemExit(1)
+    config = {
+        "backend_type": args.platform,
+        "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
+        "execution_mode": False,
+        "ring_heap": (2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2),
+    }
+    for entry, build_specs, golden in (
+        (l3_dspark_prefill_context_kv, build_context_kv_specs, golden_context_kv),
+        (l3_dspark_drafter, build_drafter_specs, None),
+    ):
+        result = run(
+            a5_default_runtime="host_build_graph",
+            runtime_dir=args.runtime_dir if entry is l3_dspark_drafter else None,
+            fn=entry,
+            specs=build_specs(),
+            golden_fn=golden,
+            config=config,
+            compile_only=args.compile_only,
+            rtol=0,
+            atol=0,
+        )
+        print(result)
+        if not result.passed:
+            raise SystemExit(1)
