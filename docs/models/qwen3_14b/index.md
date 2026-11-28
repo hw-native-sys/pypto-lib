@@ -157,6 +157,67 @@ with the entry points it names — registers the prefill, decode, and
 greedy-sample stages, their compile-time argument builders, and the ABI
 constants an external runtime needs.
 
+### vLLM Kernel smoke
+
+The Lib CI adapter lives under
+[`.github/scripts/qwen-vllm-kernel/`](../../../.github/scripts/qwen-vllm-kernel/).
+It owns the Qwen model, Worker/Runner subclasses, weight packing, KV allocation,
+metadata staging and eager/capture integration. PyPTO supplies the public Torch
+Kernel dispatch and tracks each graph's resources. Compilation and execution
+use the same PyPTO and pinned runtime.
+
+All four cases guard **native vLLM prefill followed by Lib decode**. The shared
+`qwen_kernel_worker.py` provides `KernelWorker` for eager and `CaptureWorker`
+for capture; both preserve the native Qwen prefill forward using the adapter's
+shared packed weights and KV views.
+
+| Lib decode runtime | Eager case | Capture case |
+| --- | --- | --- |
+| TMR | Native vLLM prefill, then Lib TMR decode | Native vLLM prefill, then graph-replayed Lib TMR decode |
+| HBG | Native vLLM prefill, then Lib HBG decode | Native vLLM prefill, then graph-replayed Lib HBG decode |
+
+`compile_decode.py` builds TMR and HBG Kernel artifacts from the Lib checkout
+under test. `run_smoke.sh` runs eager and capture against each artifact, producing
+four logs and result JSON files. Each case runs 16 requests with five input
+tokens and eight expected output tokens. Native prefill produces the first
+token and seven Lib decode steps produce the rest. Every decode step checks
+private KV pages and address ranges across all 40 layers. Capture requires one
+recording after synchronized eager warmup, seven actual graph replays, graph
+reset, and successful PyPTO and Torch calls after reset. The worker uses the
+physical device assigned by TaskQueue.
+
+The preparation step builds Kernel binaries and populates the PyPTO JIT cache
+before card allocation. Eager and capture invoke the same Lib JIT function.
+The CI preparation script uses the upstream PyPTO checkout's JIT cache internals.
+The worker uses the public Torch dispatch path and refuses a cold build.
+Preparation and playback use the same Python and library search paths. The HBG
+smoke sets a 384 MiB scratch heap for the fused B16 decode.
+
+Capture uses `FULL_DECODE_ONLY`; prefill runs outside the recorded decode graph.
+The pinned native prefill environment retains `triton-ascend==3.2.1`, including
+its download checksum and cache. The smoke uses Torch-NPU 2.10.0.post2 as
+required by the PyPTO lifecycle guard, overriding vLLM-Ascend's 2.10.0
+dependency metadata. NumPy stays at Triton's required 1.26.4. A
+Triton-free native fallback is not qualified by these cases. Lib's
+`prefill_fwd` is covered through the separate Serving integration, rather than
+being substituted into this vLLM path. The existing `qwen-vllm-eager` CI check
+and cache identities are retained for compatibility; its script directory and
+result artifacts use the Kernel name.
+
+The adapter allocates separate contiguous K/V roots shaped
+`[40, pages, 128, 8, 128]`. Native prefill receives per-layer views while Lib
+decode receives flattened views of the same storage. No per-step KV repacking
+is needed. Token IDs and page/length/slot metadata are staged into stable
+buffers. FP32 normalization weights are loaded from the checkpoint separately
+from the BF16 native model weights.
+
+This is a pinned single-device BF16, synchronous B16 smoke. It excludes prefix
+caching, chunked prefill, quantization, speculative decoding and distributed
+execution. The current execution path calls Simpler directly; migration to
+PyPTO's public eager and capture entries follows their respective mainline
+availability. This smoke does not establish long-request or Clean performance
+qualification.
+
 ## How it was optimized
 
 [Qwen3-14B optimization](optimization.md) follows the
