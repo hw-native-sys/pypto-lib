@@ -898,8 +898,12 @@ struct SymBuffer {
 
 namespace deep_gemm::mega_moe::layout {
 
-// Logical blocks keep the GM stride and task count independent of the MAD shape
-constexpr uint32_t BLOCK_M = 256, BLOCK_N = 256;
+#ifndef MOE_BLOCK_M
+// Cached specializations without a block size use the original symmetric layout.
+#define MOE_BLOCK_M 256
+#endif
+// Logical blocks keep the GM stride and task count independent of the MAD shape.
+constexpr uint32_t BLOCK_M = MOE_BLOCK_M, BLOCK_N = 256;
 
 using deep_gemm::layout::SymBuffer;
 
@@ -1561,6 +1565,16 @@ struct ExpertCursor {
         return get_m_block_range(pool_block_idx, expert_m_begin);
     }
 };
+
+// Keep shared rows in two similarly sized, 16-row-aligned blocks when the capacity
+// spans two M blocks. The intermediate retains its padded BLOCK_M stride.
+__aicore__ inline uint32_t shared_row_stride(uint32_t num_tokens) {
+    if constexpr (MOE_TOKENS > layout::BLOCK_M && MOE_TOKENS <= 2 * layout::BLOCK_M) {
+        if (num_tokens > layout::BLOCK_M)
+            return aligned(ceil_div(num_tokens, 2u), FRAC_MN);
+    }
+    return layout::BLOCK_M;
+}
 
 // Replay the same routed task order on AIC and AIVs
 // With kNone, metadata_ready distinguishes a pending schedule from an exhausted one
@@ -2560,6 +2574,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
 
     const auto num_issued_gemms_ptr = workspace.progress.num_issued_gemms.get_ptr(buffer, core_idx);
     const uint32_t num_shared_m_blocks = kHasSharedExperts ? ceil_div(num_tokens, BLOCK_M) : 0;
+    const uint32_t shared_stride = sched::shared_row_stride(num_tokens);
     const bool reuse_shared_weights = num_shared_m_blocks > 1;
     const auto routed_output = workspace.routed.output.get_ptr(buffer);
     const auto combine_input = workspace.combine_input.get_ptr(buffer);
@@ -2620,7 +2635,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
         const uint32_t pool_block_idx = task_idx / num_n_blocks;
         const uint32_t n_block_idx = task_idx % num_n_blocks;
         const uint32_t layer_idx = is_linear1 ? 0 : 1;
-        const uint32_t valid_m = is_shared ? min(num_tokens - pool_block_idx * BLOCK_M, BLOCK_M) :
+        const uint32_t valid_m = is_shared ? min(num_tokens - pool_block_idx * shared_stride, shared_stride) :
             expert_cursors[layer_idx].advance_to(buffer, pool_block_idx);
         const auto weight_sf_l2_hint = (is_shared ? reuse_shared_weights : expert_cursors[layer_idx].num_expert_tokens > BLOCK_M) ?
             asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM : asc_load_l2_cache_mode::NOTALLOC_KEEP;
@@ -2640,7 +2655,8 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
 
         // Select input data and scales
         const uint32_t input_block_idx = is_shared ? pool_block_idx : layout::get_ring_block_idx<workspace>(pool_block_idx);
-        const uint64_t input_m_idx = static_cast<uint64_t>(input_block_idx) * BLOCK_M;
+        const uint64_t input_m_idx = static_cast<uint64_t>(input_block_idx) *
+            (is_shared && is_linear1 ? shared_stride : BLOCK_M);
         const uint64_t input_offset = input_m_idx * num_k;
         const uint64_t input_sf_offset = input_m_idx * num_sf_pairs;
         const auto input = is_linear1 ?
@@ -2799,7 +2815,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                                 // Store shared output to combine; routed output to the ring
                                 const auto output_base = is_shared ? combine_input : routed_output;
                                 const uint64_t output_m_idx = is_shared ?
-                                    workspace.get_combine_m_idx(config.num_topk, static_cast<uint64_t>(pool_block_idx) * BLOCK_M) :
+                                    workspace.get_combine_m_idx(config.num_topk, static_cast<uint64_t>(pool_block_idx) * shared_stride) :
                                     layout::get_ring_m_idx<workspace>(pool_block_idx);
                                 const auto l2_output = output_base + output_m_idx * config.hidden + n_block_idx * BLOCK_N + n_mad_idx;
                                 copy_l0c_to_gm(l2_output, l0c_mad, valid_m, MAD_N, config.hidden, kWriteThroughShare);
@@ -2908,6 +2924,7 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
     // Size the reduce window from local output tokens
     const uint32_t num_reduce_window_m_blocks = max(ceil_div(num_tokens, BLOCK_M), 1u);
     const uint32_t num_shared_m_blocks = kHasSharedExperts ? ceil_div(num_tokens, BLOCK_M) : 0;
+    const uint32_t shared_stride = sched::shared_row_stride(num_tokens);
 
     static_assert(ub_push_token.offset(kNumPushStages) <= UBSizeBytes and ub_reduce_inputs.shape_n > 0, "AIV1 UB overflow");
 
@@ -3105,7 +3122,7 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
                 return false;
 
             if (epi.m_idx_in_block == 0)
-                epi.valid_m = is_shared ? min(num_tokens - pool_block_idx * BLOCK_M, BLOCK_M) :
+                epi.valid_m = is_shared ? min(num_tokens - pool_block_idx * shared_stride, shared_stride) :
                     epi.expert.advance_to(buffer, pool_block_idx);
             const uint32_t stage_idx = epi.m_idx_in_block / STORE_BLOCK_M;
             const uint32_t m_idx_in_stage = epi.m_idx_in_block % STORE_BLOCK_M;
@@ -3458,10 +3475,16 @@ __aicore__ inline deep_gemm::layout::SymBuffer<> bind_pypto_sym_buffer(
     auto* tensor = reinterpret_cast<__gm__ Tensor*>(args[tensor_index]);
     auto* context = reinterpret_cast<__gm__ CommContext*>(args[context_index]);
     dcci(tensor, SINGLE_CACHE_LINE);
-    dcci(context, SINGLE_CACHE_LINE);
+    // The context header and the peer window addresses occupy consecutive cache lines.
+    static_assert(offsetof(CommContext, rankId) < offsetof(CommContext, windowsIn));
+    static_assert(offsetof(CommContext, rankNum) < offsetof(CommContext, windowsIn));
+    static_assert(offsetof(CommContext, winSize) < offsetof(CommContext, windowsIn));
+    const uintptr_t context_begin = reinterpret_cast<uintptr_t>(context);
+    const uintptr_t window_end = reinterpret_cast<uintptr_t>(&context->windowsIn[NumRanks]);
+    for (uintptr_t line = context_begin & ~(uintptr_t{63}); line < window_end; line += 64)
+        dcci(reinterpret_cast<__gm__ uint8_t*>(line), SINGLE_CACHE_LINE);
     if (context->rankNum != NumRanks || context->rankId >= NumRanks) trap();
     const uint32_t rank = context->rankId;
-    dcci(context->windowsIn + rank, SINGLE_CACHE_LINE);
     const uint64_t local_window = context->windowsIn[rank];
     const uint64_t local_tensor = tensor->buffer.addr + tensor->start_offset;
     if (local_tensor < local_window || RequiredBytes > context->winSize ||
@@ -3470,7 +3493,6 @@ __aicore__ inline deep_gemm::layout::SymBuffer<> bind_pypto_sym_buffer(
     result.base = static_cast<int64_t>(local_tensor);
     result.rank_idx = rank;
     for (uint32_t peer = 0; peer < NumRanks; ++peer) {
-        dcci(context->windowsIn + peer, SINGLE_CACHE_LINE);
         result.offsets[peer] = static_cast<int64_t>(context->windowsIn[peer] - local_window);
     }
     return result;
@@ -3579,10 +3601,10 @@ __tf__ __aicore__ inline void quantize_panel(
 #endif
 
 // All scratch is dead before the official persistent pipeline initializes its UB.
-template <const auto& workspace, bool kFullTopology>
+template <const auto& workspace>
 __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
                                __gm__ bfloat16_t* output,
-                               uint32_t active, uint32_t aiv_idx, deep_gemm::CoreTopology<kFullTopology> topology)
+                               uint32_t active, uint32_t aiv_idx, uint32_t workers)
 {
 #ifdef __DAV_VEC__
     constexpr auto& config = workspace.config;
@@ -3599,7 +3621,7 @@ __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID7);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID7);
     for (uint32_t offset = aiv_idx * 512; offset < workspace.num_progress_bytes;
-         offset += topology.vectors() * 512) {
+         offset += workers * 512) {
         auto target = global(reinterpret_cast<__gm__ uint32_t*>(
             buffer + workspace.progress.blocks.offset + offset), 1, 128, 128);
         TSTORE(target, zero_words);
@@ -3609,7 +3631,11 @@ __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
 
     constexpr uint32_t chunks = width / 1024;
     static_assert(width % 1024 == 0);
-    for (uint32_t task = aiv_idx; task < (config.num_max_tokens_per_rank / rows) * chunks; task += topology.vectors()) {
+    // The M128 drafter can skip complete panels beyond the active token count.
+    // Keep the last partial input panel aligned for payload and scale transfers.
+    constexpr bool kSkipInactivePanels = deep_gemm::mega_moe::layout::BLOCK_M == 128;
+    const uint32_t panels = kSkipInactivePanels ? deep_gemm::ceil_div(active, rows) : config.num_max_tokens_per_rank / rows;
+    for (uint32_t task = aiv_idx; task < panels * chunks; task += workers) {
         const uint32_t first = (task / chunks) * rows;
         const uint32_t col = (task % chunks) * 1024;
         // Pack four adjacent 256-column groups so each scale row is a full DMA block.
@@ -3650,8 +3676,9 @@ __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
         TSTORE(sf,scales);
         pipe_barrier(PIPE_ALL);
     }
-    for (uint32_t first = aiv_idx * rows; first < config.num_max_tokens_per_rank;
-         first += topology.vectors() * rows) {
+    const uint32_t first_tail_panel = kSkipInactivePanels ? active / rows : 0;
+    for (uint32_t first = (first_tail_panel + aiv_idx) * rows; first < config.num_max_tokens_per_rank;
+         first += workers * rows) {
         pipe_barrier(PIPE_ALL);
         dsb(DSB_DDR);
         const uint32_t tail_begin = first > active ? first : active;
@@ -3700,18 +3727,12 @@ template <typename T>
 __aicore__ inline __gm__ T* data(__gm__ int64_t* args, uint32_t index)
 {
     auto* tensor = reinterpret_cast<__gm__ Tensor*>(args[index]);
-    if constexpr (MOE_TOKENS > 80)
-        dcci(tensor, SINGLE_CACHE_LINE);
     return reinterpret_cast<__gm__ T*>(tensor->buffer.addr) + tensor->start_offset;
 }
 
 __aicore__ inline int64_t dimension(__gm__ int64_t* args, uint32_t index, uint32_t axis)
 {
     auto* tensor = reinterpret_cast<__gm__ Tensor*>(args[index]);
-    if constexpr (MOE_TOKENS > 80) {
-        dcci(tensor, SINGLE_CACHE_LINE);
-        dcci(reinterpret_cast<__gm__ uint8_t*>(tensor) + 64, SINGLE_CACHE_LINE);
-    }
     return tensor->shapes[axis];
 }
 
@@ -3743,6 +3764,11 @@ __aicore__ inline void validate_shapes(__gm__ int64_t* args)
         dimension(args, 16, 0) < static_cast<int64_t>(workspace_bytes)) trap();
 }
 
+__aicore__ inline uint32_t active_tokens(int32_t requested)
+{
+    return requested < 0 ? 0 : (requested > MOE_TOKENS ? MOE_TOKENS : requested);
+}
+
 template <bool kFullTopology>
 __aicore__ inline void run(__gm__ int64_t* args, deep_gemm::CoreTopology<kFullTopology> topology)
 {
@@ -3750,33 +3776,26 @@ __aicore__ inline void run(__gm__ int64_t* args, deep_gemm::CoreTopology<kFullTo
         MOE_EP, MOE_EP * MOE_EXPERTS, 1, MOE_TOKENS,
         MOE_TOPK, MOE_HIDDEN, MOE_INTER>;
     constexpr uint64_t workspace_bytes = workspace.get_num_bytes();
-    const auto sym = [&]() __aicore__ {
-        if constexpr (MOE_TOKENS <= 80) {
-            acquire_metadata(args);
-            const auto acquired = bind_pypto_sym_buffer<MOE_EP, workspace_bytes>(args, 16, 18);
-            validate_shapes<workspace_bytes>(args);
-            return acquired;
-        } else {
-            validate_shapes<workspace_bytes>(args);
-            return bind_pypto_sym_buffer<MOE_EP, workspace_bytes>(args, 16, 18);
-        }
-    }();
+    acquire_metadata(args);
+    const auto sym = bind_pypto_sym_buffer<MOE_EP, workspace_bytes>(args, 16, 18);
+    validate_shapes<workspace_bytes>(args);
     const uint32_t core = get_block_idx(args);
 #ifdef __DAV_VEC__
     const uint32_t lane = get_sub_block_id(args);
 #else
     const uint32_t lane = 0;
 #endif
-    const int32_t requested = static_cast<int32_t>(args[17]);
-    const uint32_t active = requested < 0 ? 0 : (requested > MOE_TOKENS ? MOE_TOKENS : requested);
+    const uint32_t active = active_tokens(static_cast<int32_t>(args[17]));
     auto* output = data<bfloat16_t>(args, 15);
     // Both asc_init and the Cube MAD direction update CTRL within this call.
     const uint64_t saved_ctrl = get_ctrl();
     asc_init();
+#if !defined(MOE_INPUT_PREPARED)
     v41_official_input::publish<workspace>(
         sym.template get_base_ptr<__gm__ uint8_t*>(), data<bfloat16_t>(args, 1),
-        output, active, 2 * core + lane, topology);
+        output, active, 2 * core + lane, topology.vectors());
     v41_official_input::publication_fence(lane);
+#endif
     const auto weights = deep_gemm::mega_moe::layout::make_original_weights(
         data<uint8_t>(args, 3), data<uint8_t>(args, 4), data<uint8_t>(args, 5), data<uint8_t>(args, 6),
         data<uint8_t>(args, 7), data<uint8_t>(args, 8), data<uint8_t>(args, 9), data<uint8_t>(args, 10),
@@ -3798,6 +3817,30 @@ __aicore__ inline void run(__gm__ int64_t* args, deep_gemm::CoreTopology<kFullTo
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
+#if defined(MOE_PUBLISH_ONLY)
+    constexpr auto& workspace = deep_gemm::mega_moe::layout::kWorkspace<
+        MOE_EP, MOE_EP * MOE_EXPERTS, 1, MOE_TOKENS, MOE_TOPK, MOE_HIDDEN, MOE_INTER>;
+    const uint32_t workers = get_block_num(args);
+    if (workers == 0 || workers > 2 * deep_gemm::kNumAICores) trap();
+    using namespace v41_official_entry;
+    for (uint32_t i = 0; i < 3; ++i) {
+        auto* desc = reinterpret_cast<__gm__ uint8_t*>(args[i]);
+        dcci(desc, SINGLE_CACHE_LINE);
+        dcci(desc + 64, SINGLE_CACHE_LINE);
+    }
+    if (dimension(args, 0, 0) != MOE_TOKENS || dimension(args, 0, 1) != MOE_HIDDEN ||
+        dimension(args, 1, 0) != MOE_TOKENS || dimension(args, 1, 1) != MOE_HIDDEN ||
+        dimension(args, 2, 0) < static_cast<int64_t>(workspace.get_num_bytes())) trap();
+    // Validate the local window before publishing progress or activation data.
+    const auto sym = bind_pypto_sym_buffer<MOE_EP, workspace.get_num_bytes()>(args, 2, 4);
+    const uint32_t active = active_tokens(static_cast<int32_t>(args[3]));
+    const uint64_t ctrl = get_ctrl();
+    asc_init();
+    v41_official_input::publish<workspace>(sym.template get_base_ptr<__gm__ uint8_t*>(),
+        data<bfloat16_t>(args, 0), data<bfloat16_t>(args, 1),
+        active, get_block_idx(args), workers);
+    set_ctrl(ctrl);
+#else
     const uint32_t cores = get_block_num(args);
     if (cores == 0 || cores > deep_gemm::kNumAICores) trap();
     // Retain compile-time scheduling on a full cohort; smaller cohorts share
@@ -3806,4 +3849,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
         v41_official_entry::run(args, deep_gemm::CoreTopology<true>{cores});
     else
         v41_official_entry::run(args, deep_gemm::CoreTopology<false>{cores});
+#endif
 }

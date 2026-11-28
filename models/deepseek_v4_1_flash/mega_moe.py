@@ -164,6 +164,12 @@ def golden_weight_views(tensors):
             for name, value in tensors.items()}
 
 
+def _moe_block_m(ep, tokens, topk, local_experts):
+    """Choose the expert M tile shared by the native kernel and symmetric workspace."""
+    # Smaller blocks give four local draft experts more work to distribute across the cube cores.
+    return 128 if (ep, tokens, topk, local_experts) == (8, 384, 3, 4) else 256
+
+
 def workspace_bytes(ep, local_experts, tokens, topk, hidden, intermediate):
     """Size the symmetric workspace for the routed experts and one shared expert."""
     if ep not in (2, 4, 8) or local_experts <= 0 or tokens <= 0 or tokens % 16:
@@ -187,11 +193,12 @@ def workspace_bytes(ep, local_experts, tokens, topk, hidden, intermediate):
         allocate(rows * columns, 1, 512)
         allocate(rows * ((columns + 63) // 64), 2, 512)
 
-    max_blocks = (ep * tokens * topk + 255) // 256 + local_experts
+    block_m = _moe_block_m(ep, tokens, topk, local_experts)
+    max_blocks = (ep * tokens * topk + block_m - 1) // block_m + local_experts
     ring_blocks = min(max_blocks, 128 if hidden // 256 <= 16 else 32)
-    shared_blocks = (tokens + 255) // 256
+    shared_blocks = (tokens + block_m - 1) // block_m
     counters = shared_blocks + max_blocks
-    full_rows, ring_rows = max_blocks * 256, ring_blocks * 256
+    full_rows, ring_rows = max_blocks * block_m, ring_blocks * block_m
     src_indices = experts * tokens * topk
     allocate(3, 4, 512)  # sync.grid_sync_count
     allocate(2, 16, 512)  # sync.rank_barriers
@@ -215,18 +222,23 @@ def workspace_bytes(ep, local_experts, tokens, topk, hidden, intermediate):
     fp8(ring_rows, intermediate)  # routed.l2_acts
     allocate(ring_rows * hidden, 2, 512)  # routed.output
     allocate((topk + 1) * tokens * hidden, 2, 512)  # combine_input
-    fp8(align(tokens, 256), intermediate)  # shared_l2_acts
+    fp8(align(tokens, block_m), intermediate)  # shared_l2_acts
     allocate(tokens * topk, 4, 512)  # route_m_blocks
     return align(offset, 2 * 1024 * 1024)
 
 
-def _fused_external_kernel(local_experts, topk, packed_routed_weights=False):
+def _fused_external_kernel(local_experts, topk, packed_routed_weights=False, *, entry="fused"):
     """Prepare a content-addressed, shape-specialized native entry."""
     if packed_routed_weights and MOE_TOKENS > 80 and MOE_TOKENS not in (192, 384):
         raise ValueError("unsupported token capacity for packed routed weights")
     kernels = Path(__file__).parent / "kernels"
     values = dict(MOE_EP=EP_WORLD_SIZE, MOE_EXPERTS=local_experts, MOE_TOKENS=MOE_TOKENS,
+                  MOE_BLOCK_M=_moe_block_m(EP_WORLD_SIZE, MOE_TOKENS, topk, local_experts),
                   MOE_TOPK=topk, MOE_HIDDEN=D, MOE_INTER=MOE_INTER, MOE_PACKED_ROUTED_WEIGHTS=int(packed_routed_weights))
+    if entry == "publish":
+        values["MOE_PUBLISH_ONLY"] = 1
+    elif entry == "prepared":
+        values["MOE_INPUT_PREPARED"] = 1
     text = "".join(f"#define {name} {value}\n" for name, value in values.items())
     text += '#include "moe_fused.cpp"\n'
     digest = hashlib.sha256(text.encode())
@@ -250,14 +262,28 @@ def _fused_external_kernel(local_experts, topk, packed_routed_weights=False):
             path = (base / relative).resolve()
             if path.is_dir() and path not in include_dirs:
                 include_dirs.append(path)
+    if entry == "publish":
+        return pl.jit.extern(core_type="aiv", source=wrapper, include_dirs=tuple(include_dirs))
     return pl.jit.extern(core_type="mixed", aic_source=wrapper, aiv_source=wrapper,
                          dual_aiv_dispatch=True, include_dirs=tuple(include_dirs))
 
 
 @lru_cache(maxsize=None)
-def specialize_mega_moe(local_experts, topk, packed_routed_weights=False):
+def specialize_mega_moe(local_experts, topk, packed_routed_weights=False, *, separate_input=False):
     """Bind the model entry's local expert count and route width to its mixed-core kernel."""
-    @_fused_external_kernel(local_experts, topk, packed_routed_weights)
+    if separate_input:
+        @_fused_external_kernel(local_experts, topk, packed_routed_weights, entry="publish")
+        def _publish_moe_input(
+            normalized: pl.Tensor, output: pl.Out[pl.Tensor], workspace: pl.InOut[pld.DistributedTensor],
+            active_tokens: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor:
+            return output
+    else:
+        _publish_moe_input = None
+
+    entry = "prepared" if separate_input else "fused"
+
+    @_fused_external_kernel(local_experts, topk, packed_routed_weights, entry=entry)
     def _fused_experts(
         indices: pl.Tensor, x: pl.Tensor, weights: pl.Tensor,
         w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor,
@@ -291,6 +317,10 @@ def specialize_mega_moe(local_experts, topk, packed_routed_weights=False):
         workspace: pld.DistributedTensor,
         num_tokens: pl.Scalar[pl.INT32],
     ):
+        if separate_input:
+            with pl.spmd(pl.system.available_aiv_count(), name_hint="moe_publish_input"):
+                _publish_moe_input(normalized, output, workspace, num_tokens)
+        # The workspace InOut dependency orders the mixed kernel after local publication.
         with pl.spmd(pl.system.available_cluster_count(), sync_start=True, name_hint="moe_fused") as ready:
             output = _fused_experts(
                 indices, normalized, weights,

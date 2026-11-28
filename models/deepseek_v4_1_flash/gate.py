@@ -278,7 +278,9 @@ def _gate_select_routes(
 ):
     """Apply sqrt-softplus and bias, select routes, and clear the inactive output rows."""
     blocks = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
-    if columns == 128:
+    if T_PAD == 384 and columns == 32:
+        workers = pl.max(1, pl.min(blocks, pl.min(40, pl.system.available_aiv_count())))
+    elif columns == 128:
         workers = pl.max(1, pl.min(blocks, 64))
     else:
         workers = pl.max(1, pl.min(blocks, ROUTE_WORKER_TILE))
