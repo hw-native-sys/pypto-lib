@@ -56,7 +56,7 @@ from expert_routed import (
     ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
 )
-from hc import hc_pre_moe, hc_sinkhorn, hc_post
+from hc import PRE_NORM_STORE_T_TILE, hc_pre_moe, hc_sinkhorn, hc_post
 
 
 # model config
@@ -270,7 +270,9 @@ def split_moe(
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
-    inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn)
+    inv_rms, partials = hc_pre_moe(
+        x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn, PRE_NORM_STORE_T_TILE,
+    )
     hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
     # MoE transport and routed-result scope.
@@ -335,7 +337,9 @@ def split_moe(
 
 def make_decode_moe(local_experts, topk, packed_routed_weights=False):
     """Wire HC and routing to the fused experts specialized for this entry."""
-    fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights)
+    # On the four-local-expert EP8 drafter, six rows of HC collapse share each AIV tile.
+    collapse_row_tile = 6 if (EP_SIZE, MOE_TOKENS, topk, local_experts) == (8, 384, 3, 4) else PRE_NORM_STORE_T_TILE
+    fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights, separate_input=True)
 
     @pl.jit.inline(auto_scope=False)
     def moe(
@@ -371,7 +375,9 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
         post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
         residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
         x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
-        inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn)
+        inv_rms, partials = hc_pre_moe(
+            x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn, collapse_row_tile,
+        )
         hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
         # MoE transport and routed-result scope.

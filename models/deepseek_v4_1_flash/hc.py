@@ -47,6 +47,11 @@ MOE_LINEAR_ROW_GROUPS = 32 // LINEAR_OK
 MOE_LINEAR_T_TILE = LINEAR_T_TILE
 if MOE_TOKENS > MOE_LINEAR_ROW_GROUPS * LINEAR_T_TILE:
     MOE_LINEAR_T_TILE = 32 if MOE_TOKENS <= MOE_LINEAR_ROW_GROUPS * 32 else 64
+if MOE_TOKENS == 384:
+    MOE_LINEAR_T_TILE = 48
+MOE_LINEAR_K_TILE = 128 if MOE_LINEAR_T_TILE > LINEAR_T_TILE else HF32_LINEAR_K_L0_TILE
+if MOE_TOKENS == 80:
+    MOE_LINEAR_K_TILE = 256
 D_TILE = 2560
 PRE_T_TILE = 8
 PRE_NORM_T_TILE = 4
@@ -583,17 +588,16 @@ def hc_head_norm_store(
 def hc_pre_moe(
     x_hc: pl.Tensor, pre_mix: pl.Tensor, norm_weight: pl.Tensor, output: pl.Tensor,
     collapsed: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], function: pl.Tensor,
+    collapse_row_tile: pl.constexpr = PRE_NORM_STORE_T_TILE,
 ):
     """Collapse HC streams for routing and project their normalized coefficients."""
     tokens = pl.tensor.dim(x_hc, 0)
     active = pl.max(pl.min(pl.cast(num_tokens, pl.INDEX), tokens), 0)
     inv_rms = _hc_collapse_rows(
-        x_hc, pre_mix, output, norm_weight, collapsed, active, 64, PRE_NORM_STORE_T_TILE,
+        x_hc, pre_mix, output, norm_weight, collapsed, active, 64, collapse_row_tile,
         outputs=_NORM_COLLAPSED_AND_INV_RMS,
     )
-    partials = hc_linear(
-        x_hc, function, MOE_LINEAR_T_TILE, 128 if MOE_LINEAR_T_TILE > LINEAR_T_TILE else HF32_LINEAR_K_L0_TILE,
-    )
+    partials = hc_linear(x_hc, function, MOE_LINEAR_T_TILE, MOE_LINEAR_K_TILE)
     return inv_rms, partials
 
 
@@ -683,8 +687,12 @@ def hc_post(
     workers = pl.min(total_work * HC_MULT, POST_WORKER_TILE)
     with pl.spmd(workers, name_hint="hc_post", deps=[deps[i] for i in range(dep_count)]):
         worker = pl.tile.get_block_idx()
-        for block in pl.pipeline(worker, full_work, POST_WORKER_TILE, stage=1):
-            _hc_post_block(sublayer_rows, residual_rows, post_rows, residual_mix_flat, output_rows, block, HC_MULT)
+        if dep_count == 0:
+            for block in pl.pipeline(worker, full_work, POST_WORKER_TILE, stage=2):
+                _hc_post_block(sublayer_rows, residual_rows, post_rows, residual_mix_flat, output_rows, block, HC_MULT)
+        else:
+            for block in pl.pipeline(worker, full_work, POST_WORKER_TILE, stage=1):
+                _hc_post_block(sublayer_rows, residual_rows, post_rows, residual_mix_flat, output_rows, block, HC_MULT)
         for tail in pl.range(worker, tail_work, POST_WORKER_TILE):
             tail_chunk = full_work + tail // HC_MULT
             tail_stream = (tail_chunk // (D // D_TILE)) * HC_MULT + tail % HC_MULT

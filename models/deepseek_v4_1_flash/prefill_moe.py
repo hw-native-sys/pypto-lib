@@ -55,7 +55,7 @@ from expert_routed import (
     ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, expert_routed_scatter,
 )
 from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
-from hc import hc_pre_moe, hc_sinkhorn, hc_post
+from hc import PRE_NORM_STORE_T_TILE, hc_pre_moe, hc_sinkhorn, hc_post
 from input_pack import gather_rows
 
 
@@ -399,7 +399,9 @@ def split_prefill_moe(
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
     ffn_input = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-    inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, ffn_input, x_mixed, num_tokens, hc_ffn_fn)
+    inv_rms, partials = hc_pre_moe(
+        x_hc, pre_mix, norm_weight, ffn_input, x_mixed, num_tokens, hc_ffn_fn, PRE_NORM_STORE_T_TILE,
+    )
     mixes_ready = hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
     # MoE transport and routed-result scope.
@@ -520,7 +522,9 @@ def make_prefill_moe(local_experts):
         post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
         residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
         ffn_input = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-        inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, ffn_input, x_mixed, num_tokens, hc_ffn_fn)
+        inv_rms, partials = hc_pre_moe(
+            x_hc, pre_mix, norm_weight, ffn_input, x_mixed, num_tokens, hc_ffn_fn, PRE_NORM_STORE_T_TILE,
+        )
         mixes_ready = hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
         # MoE transport and routed-result scope.
