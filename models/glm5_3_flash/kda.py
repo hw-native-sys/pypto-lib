@@ -416,12 +416,10 @@ def kda_projection(
     t_pad = tiles * PROJECTION_T_TILE
     w_b_pad = pl.create_tensor([BETA_PAD, D], dtype=pl.BF16)
     with pl.spmd(1, name_hint="kda_projection_b_pad") as pad_tid:
-        zero = pl.tile.get_block_idx() * 0  # single task, block index zero
-        for r in pl.unroll(BETA_PAD):
-            if r < LOCAL_KDA_H + zero:
-                w_b_pad[r : r + 1, 0:D] = w_b[r:r + 1, 0:D]
-            else:
-                w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+        for r in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H):
+            w_b_pad[r : r + 1, 0:D] = w_b[r:r + 1, 0:D]
+        for r in pl.unroll(LOCAL_KDA_H, BETA_PAD):
+            w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
     qkv_n_tiles = LOCAL_KDA_QKV_DIM // PROJECTION_MM_N_TILE
     qkv_tasks = ((live_tokens + PROJECTION_T_TILE - 1) // PROJECTION_T_TILE) * qkv_n_tiles
