@@ -23,6 +23,8 @@ from quant import (
     pack_quantized_cache, unpack_quantized_cache,
 )
 
+from utils import materialize_cpp_specialization
+
 # model config
 HEAD_DIM = M.head_dim
 LOCAL_H = M.num_attention_heads
@@ -119,8 +121,45 @@ def _gather_compact_sparse_vf_rows(
     ...
 
 
+_KERNEL_DIR = Path(__file__).parent / "kernels"
+_MXFP8_GATHER_SOURCE = materialize_cpp_specialization(
+    _KERNEL_DIR / "sparse_gather_vf.cpp", {"SPARSE_GATHER_MXFP8": 1},
+)
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_MXFP8_GATHER_SOURCE,
+    aiv_source=_MXFP8_GATHER_SOURCE,
+    include_dirs=(pto_isa_include_dir(), _KERNEL_DIR),
+    dual_aiv_dispatch=True,
+)
+def _gather_sparse_mxfp8(
+    output: pl.Out[pl.Tensor],
+    query: pl.Tensor,
+    sink: pl.Tensor,
+    window: pl.Tensor,
+    compressed: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    partials: pl.InOut[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    heads: pl.Scalar[pl.INT32],
+    window_keys: pl.Scalar[pl.INT32],
+    compressed_keys: pl.Scalar[pl.INT32],
+    balanced: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+    cache_mode: pl.constexpr,
+):
+    """Finish sparse attention in row-major MXFP8 for the output projection."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
-def gather_sparse_attention(
+def _submit_sparse_attention(
     query: pl.Tensor,
     window_indices: pl.Tensor,
     window: pl.Tensor,
@@ -130,10 +169,18 @@ def gather_sparse_attention(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     compressed_keys: pl.constexpr,
+    quantized: pl.constexpr,
+    scales: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    padded_rows: pl.Scalar[pl.INDEX],
 ):
-    """Attend H=32/64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
+    """Partition attention work and submit the appropriate final-output kernel."""
     query = query[:num_tokens, :]
-    active_output = output[:num_tokens, :]
+    if quantized:
+        active_output = output
+    else:
+        active_output = output[:num_tokens, :]
     window_indices = window_indices[:num_tokens, :]
     compressed_indices = compressed_indices[:num_tokens, :]
     if compressed_keys == 0:
@@ -165,12 +212,20 @@ def gather_sparse_attention(
             flags = pl.tile.set_validshape(flags, 1, 2 * workers)
             pl.store(flags, [0, ready_offset], flat_partials)
         with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[reset]) as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
-    elif compressed_keys == INDEX_TOPK and num_tokens >= SPARSE_VF_WORKER_TILE and plan_pool:
+            if quantized:
+                _gather_sparse_mxfp8(
+                    active_output, query, sink, window, compressed,
+                    window_indices, compressed_indices, partials, scales, rope_cos, rope_sin,
+                    num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys, balanced, padded_rows,
+                    cache_mode=compressed_keys,
+                )
+            else:
+                _gather_sparse_vf_rows(
+                    active_output, query, sink, window, compressed,
+                    window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                    balanced, cache_mode=compressed_keys,
+                )
+    elif not quantized and compressed_keys == INDEX_TOPK and num_tokens >= SPARSE_VF_WORKER_TILE and plan_pool:
         tiles_per_worker = ((num_tokens + workers - 1) // workers) * parts
         plan_cols = 128 + ((tiles_per_worker + 127) // 128) * 128
         compact_plan = pl.create_tensor([workers * plan_cols], dtype=pl.INT32)
@@ -182,12 +237,62 @@ def gather_sparse_attention(
             )
     else:
         with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
+            if quantized:
+                _gather_sparse_mxfp8(
+                    active_output, query, sink, window, compressed,
+                    window_indices, compressed_indices, partials, scales, rope_cos, rope_sin,
+                    num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys, balanced, padded_rows,
+                    cache_mode=compressed_keys,
+                )
+            else:
+                _gather_sparse_vf_rows(
+                    active_output, query, sink, window, compressed,
+                    window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                    balanced, cache_mode=compressed_keys,
+                )
     return attended
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_sparse_attention(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    """Attend H=32/64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
+    return _submit_sparse_attention(
+        query, window_indices, window, compressed_indices, compressed, sink,
+        output, num_tokens, compressed_keys, False, output, output, output, 0,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_sparse_attention_mxfp8(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Tensor,
+    scales: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    padded_rows: pl.Scalar[pl.INDEX],
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    """Write the inverse-rotated quantized output and the row-major scales."""
+    return _submit_sparse_attention(
+        query, window_indices, window, compressed_indices, compressed, sink,
+        output, num_tokens, compressed_keys, True, scales, rope_cos, rope_sin, padded_rows,
+    )
 
 
 @pl.jit.inline(auto_scope=False)

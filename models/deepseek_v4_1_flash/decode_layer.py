@@ -243,6 +243,7 @@ def l2_decode_layer(
             attention_num_tokens,
         )
     elif layer_id % 4 == 0:
+        runs = pl.create_tensor([5, pl.tensor.dim(pool_block_ids, 0) + 1], dtype=pl.INT32)
         decode_c1a_reindex(
             x_hc, incoming_pre_mix,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -261,7 +262,7 @@ def l2_decode_layer(
             index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices,
             attention_hidden, attention_pre_mix,
-            attention_num_tokens,
+            attention_num_tokens, runs, True,
         )
     else:
         decode_c1a_reuse(

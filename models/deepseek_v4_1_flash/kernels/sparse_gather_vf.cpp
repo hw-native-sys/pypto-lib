@@ -28,6 +28,179 @@
 #include "sparse_dequant_vf.hpp"
 #include "sparse_softmax_vf.hpp"
 #include "sparse_merge_vf.hpp"
+#if defined(SPARSE_GATHER_MXFP8)
+namespace sparse_quant {
+using namespace pto;
+constexpr int HeadHalf = 32;
+constexpr int Heads = 64;
+constexpr int ChannelWidth = 256;
+constexpr int HeadWidth = 2 * ChannelWidth;
+constexpr int CodesPerChannel = ChannelWidth / 32;
+constexpr int CodesPerToken = 2 * Heads * CodesPerChannel;
+constexpr int RopePairs = 32;
+
+using PayloadTile = Tile<TileType::Vec, uint8_t, HeadHalf, ChannelWidth>;
+using ScaleTile = Tile<TileType::Vec, uint8_t, 1, HeadHalf * CodesPerChannel>;
+using AngleTile = Tile<TileType::Vec, float, 1, RopePairs>;
+template <typename T, int Rows, int Cols>
+using GM = GlobalTensor<T, TileShape2D<T, Rows, Cols>, BaseShape2D<T, Rows, Cols>>;
+
+constexpr uint32_t PayloadUb = 245760;
+constexpr uint32_t ScalesUb = PayloadUb + HeadHalf * ChannelWidth;
+constexpr uint32_t CosineUb = ScalesUb + HeadHalf * CodesPerChannel;
+constexpr uint32_t SineUb = CosineUb + RopePairs * sizeof(float);
+static_assert(SineUb + RopePairs * sizeof(float) <= 262144);
+
+#if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+using InputChannel = Tile<TileType::Vec, bfloat16_t, HeadHalf, ChannelWidth>;
+using QuantizedChannel = Tile<TileType::Vec, int8_t, HeadHalf, ChannelWidth>;
+using QuantScratch = Tile<TileType::Vec, bfloat16_t, 1, HeadHalf * CodesPerChannel>;
+
+constexpr uint32_t MaxUb = SineUb + RopePairs * sizeof(float);
+constexpr uint32_t ReciprocalUb = MaxUb + HeadHalf * CodesPerChannel * sizeof(bfloat16_t);
+// The balanced merge has finished using its left numerator before compaction.
+constexpr uint32_t CompactMergeUb = 8192;
+static_assert(CompactMergeUb + HeadHalf * ChannelWidth * sizeof(bfloat16_t) <= 73728);
+static_assert(ReciprocalUb + HeadHalf * CodesPerChannel * sizeof(bfloat16_t) <= 262144);
+
+template <typename SourceTile>
+__tf__ __aicore__ inline void compact_merge_channel(
+    InputChannel::TileDType __out__ destination,
+    typename SourceTile::TileDType __in__ source, int source_column) {
+    auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(destination);
+    auto src = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(source);
+    __VEC_SCOPE__ {
+        mem_bar(VST_VLD);
+        const MaskReg full = pset_b16(PAT_ALL);
+        for (uint16_t head = 0; head < uint16_t(HeadHalf); ++head) {
+            RegTensor<bfloat16_t> low, high;
+            const uint32_t input = head * SourceTile::Cols + source_column;
+            const uint32_t output = head * ChannelWidth;
+            vlds(low, src, input, NORM);
+            vlds(high, src, input + 128, NORM);
+            vsts(low, dst, output, NORM_B16, full);
+            vsts(high, dst, output + 128, NORM_B16, full);
+        }
+    }
+}
+
+__tf__ __aicore__ inline void inverse_rope(
+    InputChannel::TileDType __out__ source,
+    AngleTile::TileDType __in__ cosine, AngleTile::TileDType __in__ sine) {
+    auto input = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(source);
+    auto cosines = (__ubuf__ float*)__cce_get_tile_ptr(cosine);
+    auto sines = (__ubuf__ float*)__cce_get_tile_ptr(sine);
+    __VEC_SCOPE__ {
+        mem_bar(VST_VLD);
+        const MaskReg full = pset_b32(PAT_ALL);
+        uint32_t count = RopePairs;
+        const MaskReg lower = plt_b32(count, POST_UPDATE);
+        RegTensor<float> cosv, sinv;
+        vlds(cosv, cosines, 0, NORM);
+        vlds(sinv, sines, 0, NORM);
+        for (uint16_t head = 0; head < uint16_t(HeadHalf); ++head) {
+            const uint32_t offset = head * ChannelWidth + ChannelWidth - 64;
+            RegTensor<bfloat16_t> rounded;
+            RegTensor<float> value, even, odd, real, imag, cross, unused;
+            vlds(rounded, input, offset, UNPK_B16);
+            vcvt(value, rounded, full, PART_EVEN);
+            vdintlv(even, odd, value, value);
+            vmul(real, even, cosv, lower, MODE_ZEROING);
+            vmul(cross, odd, sinv, lower, MODE_ZEROING);
+            vadd(real, real, cross, lower, MODE_ZEROING);
+            vmul(imag, odd, cosv, lower, MODE_ZEROING);
+            vmul(cross, even, sinv, lower, MODE_ZEROING);
+            vsub(imag, imag, cross, lower);
+            vintlv(value, unused, real, imag);
+            vcvt(rounded, value, full, ROUND_R, RS_DISABLE, PART_EVEN);
+            vsts(rounded, input, offset, PK_B32, full);
+        }
+    }
+}
+
+__tf__ __aicore__ inline void clear_zero_scale_magnitudes(
+    PayloadTile::TileDType __out__ payload, ScaleTile::TileDType __in__ scales) {
+    auto words = (__ubuf__ uint32_t*)__cce_get_tile_ptr(payload);
+    auto codes = (__ubuf__ uint32_t*)__cce_get_tile_ptr(scales);
+    __VEC_SCOPE__ {
+        mem_bar(VST_VLD);
+        const MaskReg full = pset_b32(PAT_ALL);
+        uint32_t count = 32;
+        const MaskReg lower = plt_b32(count, POST_UPDATE);
+        RegTensor<uint32_t> lanes, shifts, byte_mask, word_mask, sign_mask;
+        vci((RegTensor<int32_t>&)lanes, int32_t(0), INC_ORDER);
+        vshrs(shifts, lanes, 3, full, MODE_ZEROING);
+        vdup(byte_mask, uint32_t(3), full, MODE_ZEROING);
+        vand(shifts, shifts, byte_mask, full);
+        vshls(shifts, shifts, 3, full, MODE_ZEROING);
+        vdup(byte_mask, uint32_t(0xff), full, MODE_ZEROING);
+        vdup(word_mask, uint32_t(0xffffffff), full, MODE_ZEROING);
+        vdup(sign_mask, uint32_t(0x80808080), full, MODE_ZEROING);
+        for (uint16_t head = 0; head < uint16_t(HeadHalf); ++head) {
+            RegTensor<uint32_t> low, high, selected, exponent, mask, values;
+            MaskReg zero;
+            vlds(low, codes, head * 2, BRC_B32);
+            vlds(high, codes, head * 2 + 1, BRC_B32);
+            vsel(selected, low, high, lower);
+            vshr((vector_u32&)exponent, (vector_u32&)selected, (vector_s32&)shifts, full, MODE_ZEROING);
+            vand(exponent, exponent, byte_mask, full);
+            vcmps_eq(zero, exponent, uint32_t(0), full);
+            vsel(mask, sign_mask, word_mask, zero);
+            vlds(values, words, head * (ChannelWidth / 4), NORM);
+            vand(values, values, mask, full);
+            vsts(values, words, head * (ChannelWidth / 4), NORM_B32, full);
+        }
+    }
+}
+
+__aicore__ inline void bulk_quantize(
+    PayloadTile& payload, ScaleTile& scales, InputChannel& input,
+    AngleTile& cosine, AngleTile& sine, bool rotate_tail) {
+    if (rotate_tail) inverse_rope(input.data(), cosine.data(), sine.data());
+    QuantizedChannel bytes;
+    QuantScratch maximum, reciprocal;
+    TASSIGN(bytes, PayloadUb);
+    TASSIGN(maximum, MaxUb);
+    TASSIGN(reciprocal, ReciprocalUb);
+    const uint64_t control = get_ctrl();
+    TQUANT<1, MxQuantAlg::OcpMxFp8E4M3>(bytes, input, &scales, &maximum, &reciprocal);
+    set_ctrl(control);
+    clear_zero_scale_magnitudes(payload.data(), scales.data());
+}
+
+template <typename SourceTile>
+__aicore__ inline void quantize_channel(
+    PayloadTile& payload, ScaleTile& scales, SourceTile& source,
+    AngleTile& cosine, AngleTile& sine, int source_column, bool rotate_tail) {
+    if constexpr (SourceTile::Cols == ChannelWidth) {
+        bulk_quantize(payload, scales, source, cosine, sine, rotate_tail);
+    } else {
+        InputChannel compact;
+        TASSIGN(compact, CompactMergeUb);
+        compact_merge_channel<SourceTile>(compact.data(), source.data(), source_column);
+        bulk_quantize(payload, scales, compact, cosine, sine, rotate_tail);
+    }
+}
+
+__aicore__ inline void store_channel(
+    PayloadTile& payload, ScaleTile& scales,
+    __gm__ uint8_t* output, __gm__ uint8_t* codes, int token, int head, int channel, event_t event) {
+    using Shape = TileShape2D<uint8_t, HeadHalf, ChannelWidth>;
+    using Stride = BaseShape2D<uint8_t, HeadHalf, HeadWidth>;
+    using Output = GlobalTensor<uint8_t, Shape, Stride>;
+    Output dst(output + int64_t(token) * Heads * HeadWidth + head * HeadWidth + channel * ChannelWidth);
+    GM<uint8_t, 1, HeadHalf * CodesPerChannel> code_destination(
+        codes + int64_t(token) * CodesPerToken + channel * Heads * CodesPerChannel + head * CodesPerChannel);
+    set_flag(PIPE_V, PIPE_MTE3, event);
+    wait_flag(PIPE_V, PIPE_MTE3, event);
+    TSTORE(dst, payload);
+    TSTORE(code_destination, scales);
+    set_flag(PIPE_MTE3, PIPE_V, event);
+    wait_flag(PIPE_MTE3, PIPE_V, event);
+}
+#endif
+} // namespace sparse_quant
+#endif
 
 using namespace pto;
 
@@ -51,11 +224,20 @@ constexpr int ARG_COMPRESSED = 4;
 constexpr int ARG_WINDOW_INDICES = 5;
 constexpr int ARG_COMPRESSED_INDICES = 6;
 constexpr int ARG_PARTIALS = 7;
-constexpr int ARG_TOKENS = 8;
-constexpr int ARG_HEADS = 9;
-constexpr int ARG_WINDOW_KEYS = 10;
-constexpr int ARG_COMPRESSED_KEYS = 11;
-constexpr int ARG_BALANCED = 12;
+#if defined(SPARSE_GATHER_MXFP8)
+constexpr int ARG_SCALES = 8;
+constexpr int ARG_COSINE = 9;
+constexpr int ARG_SINE = 10;
+constexpr int FIRST_SCALAR = 11;
+constexpr int ARG_PADDED_ROWS = FIRST_SCALAR + 5;
+#else
+constexpr int FIRST_SCALAR = 8;
+#endif
+constexpr int ARG_TOKENS = FIRST_SCALAR;
+constexpr int ARG_HEADS = FIRST_SCALAR + 1;
+constexpr int ARG_WINDOW_KEYS = FIRST_SCALAR + 2;
+constexpr int ARG_COMPRESSED_KEYS = FIRST_SCALAR + 3;
+constexpr int ARG_BALANCED = FIRST_SCALAR + 4;
 constexpr int PARTIAL_STRIDE = 64 * (512 + 2);
 
 #if !defined(__CPU_SIM)
@@ -860,7 +1042,63 @@ __aicore__ inline void softmax_publish(__gm__ int64_t* args, const TileTask& tas
     set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(EV_P_STAGE));
 }
 
+#if defined(SPARSE_GATHER_MXFP8)
+static_assert(UB_USED == sparse_quant::PayloadUb && VEC_HEADS == sparse_quant::HeadHalf);
+
+template <typename SourceTile>
+__aicore__ inline void emit_quantized(
+    __gm__ int64_t* args, SourceTile& src, int source_column, int token, int channel, event_t event) {
+    sparse_quant::PayloadTile payload;
+    sparse_quant::ScaleTile scales;
+    sparse_quant::AngleTile cos_tile, sin_tile;
+    TASSIGN(payload, sparse_quant::PayloadUb);
+    TASSIGN(scales, sparse_quant::ScalesUb);
+    TASSIGN(cos_tile, sparse_quant::CosineUb);
+    TASSIGN(sin_tile, sparse_quant::SineUb);
+    if (channel == 1) {
+        GM<float, 1, sparse_quant::RopePairs> cos_gm(
+            data<float>(args, ARG_COSINE) + int64_t(token) * row_stride(args, ARG_COSINE));
+        GM<float, 1, sparse_quant::RopePairs> sin_gm(
+            data<float>(args, ARG_SINE) + int64_t(token) * row_stride(args, ARG_SINE));
+        TLOAD(cos_tile, cos_gm);
+        TLOAD(sin_tile, sin_gm);
+        // P staging uses EVENT_ID7 on a separate V<->MTE3 event domain.
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID7);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID7);
+    }
+    sparse_quant::quantize_channel<SourceTile>(
+        payload, scales, src, cos_tile, sin_tile, source_column, channel == 1);
+    sparse_quant::store_channel(
+        payload, scales, data<uint8_t>(args, ARG_OUTPUT), data<uint8_t>(args, ARG_SCALES),
+        token, get_sub_block_id(args) * VEC_HEADS, channel, event);
+}
+
+__aicore__ inline void pad_quantized_rows(__gm__ int64_t* args) {
+    const int rows = args[ARG_TOKENS], padded = args[ARG_PADDED_ROWS];
+    if (rows + get_block_idx(args) >= padded) return;
+    sparse_quant::PayloadTile payload;
+    sparse_quant::ScaleTile scales;
+    TASSIGN(payload, sparse_quant::PayloadUb);
+    TASSIGN(scales, sparse_quant::ScalesUb);
+    TEXPANDS(payload, uint8_t(0));
+    TEXPANDS(scales, uint8_t(0));
+    const int head = get_sub_block_id(args) * VEC_HEADS;
+    for (int token = rows + get_block_idx(args); token < padded; token += get_block_num(args)) {
+        for (int channel = 0; channel < 2; ++channel) {
+            sparse_quant::store_channel(
+                payload, scales, data<uint8_t>(args, ARG_OUTPUT), data<uint8_t>(args, ARG_SCALES),
+                token, head, channel, EVENT_ID0);
+        }
+    }
+}
+#endif
+
 __aicore__ inline void store_channel(__gm__ int64_t* args, const TileTask& task, int channel) {
+#if defined(SPARSE_GATHER_MXFP8)
+    ResultBf16 result;
+    TASSIGN(result, channel * PV_CHANNEL_BYTES + PV_ROW_HALF_BYTES);
+    emit_quantized(args, result, 0, task.token, channel, static_cast<event_t>(channel));
+#else
     set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(channel));
     wait_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(channel));
     const int valid = valid_heads_of(args);
@@ -879,6 +1117,7 @@ __aicore__ inline void store_channel(__gm__ int64_t* args, const TileTask& task,
     }
     set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(channel));
     wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(channel));
+#endif
     set_intra_block(PIPE_V, FLAG_PV_FREE + channel);
 }
 
@@ -1188,15 +1427,28 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
                 for (int pause = 0; pause < 50; ++pause) asm volatile("nop");
             }
             // Main-loop users are drained; the reducer reuses their UB storage.
+#if defined(SPARSE_GATHER_MXFP8)
+            sparse_merge::Result result;
+            sparse_merge::combine(
+                result, data<float>(args, ARG_PARTIALS), data<float>(args, ARG_SINK),
+                row_stride(args, ARG_SINK), args[ARG_HEADS], boundary, head);
+            for (int channel = 0; channel < 2; ++channel) {
+                emit_quantized(args, result, channel * 256, cut / parts, channel, static_cast<event_t>(channel));
+            }
+#else
             sparse_merge::reduce(
                 data<float>(args, ARG_PARTIALS), data<bfloat16_t>(args, ARG_OUTPUT), data<float>(args, ARG_SINK),
                 row_stride(args, ARG_OUTPUT), row_stride(args, ARG_SINK), args[ARG_HEADS], boundary, head, cut / parts);
+#endif
         }
     } else {
         if (parts == 5) attend_vector<5, false>(args);
         else if (parts == 1) attend_vector<1, false>(args);
         else attend_vector<0, false>(args);
     }
+#if defined(SPARSE_GATHER_MXFP8)
+    pad_quantized_rows(args);
+#endif
 #endif
 #endif
 }

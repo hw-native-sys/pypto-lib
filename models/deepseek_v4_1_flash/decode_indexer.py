@@ -52,7 +52,10 @@ SCORE_SHARD_CACHE = 25600
 SCORE_MERGE_CACHE = 16384
 
 
-from lightning_indexer import ATTENTION, POOL, LI_SOURCE, LI_INCLUDES, idx_q_pypto, prepare_score_metadata, score_paged
+from lightning_indexer import (
+    ATTENTION, ATTENTION_WITH_POOL, LI_SOURCE, LI_INCLUDES,
+    idx_q_pypto, prepare_score_metadata, score_paged,
+)
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "index_score_topk.cpp",
@@ -406,6 +409,7 @@ def plan_reindex_pool(
     pool_block_counts: pl.Tensor,
     width: pl.Scalar[pl.INDEX],
     num_tokens: pl.Scalar[pl.INT32],
+    runs: pl.Tensor,
 ):
     """Check pool coverage and publish the paged run plan for identity pools."""
     capacity = pl.tensor.dim(pool_block_ids, 1)
@@ -449,11 +453,8 @@ def plan_reindex_pool(
             if pl.tile.read(sums, [0, lane]) != 0.0:
                 dense = pl.cast(0, pl.INT32)
         pl.write(flags, [worker, 0], dense)
-    tokens = pl.tensor.dim(pool_block_ids, 0)
-    stride = tokens + 1
     dense_width = pl.min(width, table_width * 128)
     # Rows 0-3 describe dense runs. Row 4 selects the path for every MIX core.
-    runs = pl.create_tensor([5, stride], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_plan_reindex"):
         dense = pl.read(flags, [0, 0])
         if dense != 0:
@@ -525,8 +526,9 @@ def score_select_reindex(
 ):
     """Plan and score an externally supplied candidate pool."""
     width = pl.tensor.dim(scores, 1)
+    runs = pl.create_tensor([5, pl.tensor.dim(pool_block_ids, 0) + 1], dtype=pl.INT32)
     runs, dense_width = plan_reindex_pool(
-        index_cache, block_table, request_ids, lengths, pool_block_ids, pool_block_counts, width, num_tokens,
+        index_cache, block_table, request_ids, lengths, pool_block_ids, pool_block_counts, width, num_tokens, runs,
     )
     return score_reindex_pool(
         query, query_scale, weights, index_cache, index_cache_scale, block_table, request_ids, lengths,
@@ -1892,18 +1894,20 @@ def _deepseek_select(
 
 
 @pl.jit.extern(core_type="aiv", source=LI_SOURCE, include_dirs=LI_INCLUDES)
-def _deepseek_select_pool(
+def _deepseek_select_with_pool(
     scores: pl.Tensor,
     lengths: pl.Tensor,
     indices: pl.Out[pl.Tensor],
     table: pl.Tensor,
     request_ids: pl.Tensor,
     pool_counts: pl.Out[pl.Tensor],
+    block_scores: pl.Tensor,
+    pool_ids: pl.Out[pl.Tensor],
     mode: pl.Scalar[pl.INT64],
     active: pl.Scalar[pl.INT64],
     sorted_index: pl.Scalar[pl.INT64],
     page_rows: pl.Scalar[pl.INT64],
-) -> pl.Tensor:
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
     ...
 
 
@@ -1924,22 +1928,6 @@ def deepseek_select_attention(
         _deepseek_select(
             scores, lengths, physical, table, request_ids, lengths,
             ATTENTION, active, native_sorted, page_rows,
-        )
-
-
-@pl.jit.inline(auto_scope=False)
-def deepseek_select_pool(
-    block_scores: pl.Tensor,
-    token_lengths: pl.Tensor,
-    pool_ids: pl.Tensor,
-    pool_counts: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    active = pl.cast(num_tokens, pl.INT64)
-    with pl.spmd(64, name_hint="qli_deepseek_pool_select"):
-        _deepseek_select_pool(
-            block_scores, token_lengths, pool_ids, block_scores, token_lengths, pool_counts,
-            POOL, active, 1, 128,
         )
 
 
@@ -1974,12 +1962,14 @@ def select_qli(
             query, query_scale, raw_weights, key, key_scale, table,
             request_ids, lengths, metadata, scores, active, block_scores, True,
         )
-        deepseek_select_attention(
-            scores, lengths, table, request_ids, output, active, page_rows, sorted_index,
-        )
-        deepseek_select_pool(
-            block_scores, lengths, pool_ids, pool_counts, active,
-        )
+        native_active = pl.cast(num_tokens, pl.INT64)
+        native_sorted = pl.cast(sorted_index, pl.INT64)
+        with pl.spmd(64, name_hint="qli_deepseek_attention_with_pool"):
+            _deepseek_select_with_pool(
+                scores, lengths, output, table, request_ids,
+                pool_counts, block_scores, pool_ids,
+                ATTENTION_WITH_POOL, native_active, native_sorted, page_rows,
+            )
     else:
         score_paged(
             query, query_scale, raw_weights, key, key_scale, table,
